@@ -35,7 +35,7 @@ else uncommitted, per the snapshot rule below — lands on the remote
 immediately instead of waiting for the daemon's next pass.
 
 If the repo has a `package.json`, accept init's offer to add
-`@projectors/sidecar` to `devDependencies` (or pass `--local-install`):
+`sidecarsync` to `devDependencies` (or pass `--local-install`):
 fresh clones then self-register with the daemon on plain install, and the
 edit rides init's ending sync to every machine. Keep `node_modules`
 gitignored — a standalone sync snapshots everything untracked, and init
@@ -92,17 +92,17 @@ daemon, and the next sync reverts them. Read-only git (log, diff, show) is
 fine.
 ````
 
-## Redaction defaults to none
+## Redaction and executed files
 
 A standalone repo's files are the artifact. You clone them onto a new machine
 and *run* them, so a redaction false positive doesn't mangle a note — it ships
 a broken script, and silently, because the machine that wrote the file still
 has the original in its working tree.
 
-So standalone `init` defaults to `redaction = "none"` where a nested sidecar
-defaults to `secrets+pii`. Turn it on if you want it, but review
-`sidecar redactions` before trusting it with content you execute. See
-[redaction.md](redaction.md).
+The default is `secrets` (credentials only — the PII rules are where most
+false positives live), same as everywhere. Review `sidecar redactions` before
+trusting any mode with content you execute, or init with `--redaction none`.
+See [redaction.md](redaction.md).
 
 ## Removing it
 

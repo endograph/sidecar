@@ -60,13 +60,20 @@ Set `redaction` in `.sidecar` (or `sidecar init --redaction <mode>`):
 
 | mode | effect |
 |---|---|
-| `secrets+pii` | everything above — credentials *and* emails, phone numbers, SSNs, card numbers (default) |
-| `secrets` | credentials only; PII passes through — most false positives live in the PII rules, so this is the pragmatic middle ground |
-| `none` | no redaction at all; files are pushed exactly as written — the default for [standalone](standalone.md) repos, whose files get executed rather than read |
+| `secrets+pii` | everything above — credentials *and* emails, phone numbers, SSNs, card numbers |
+| `secrets` | credentials only; PII passes through — most false positives live in the PII rules, so this is the default |
+| `none` | no redaction at all; files are pushed exactly as written |
 
 Changing the mode re-runs every tracked file through the filter on the next
 sync, so the whole tree converges to the new mode — `none → secrets+pii`
 re-redacts everything, `secrets+pii → none` re-commits your originals.
+
+The mode governs your files. Two things sidecar generates about itself are
+always redacted at the `secrets` level whatever the mode says: the machine-level
+log (`sidecar tail`) and the failure messages in a
+[health heartbeat](commands.md#fleet-health). Both quote git verbatim, and git
+quotes remote URLs — which carry tokens. Turning redaction off is a decision
+about your notes, not an instruction to publish your own credentials.
 
 ## Limits worth knowing
 
