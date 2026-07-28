@@ -29,6 +29,7 @@ import {
   writeConfig,
   acquireSyncLock,
   acquireSyncLockOrThrow,
+  syncLockDir,
   daemonServiceFileContents,
   daemonServicePath,
   ensureIgnoreEntry,
@@ -37,7 +38,6 @@ import {
   ignoreEntryForSidecarPath,
   removeIgnoreEntry,
   removeZedInclusion,
-  removeLegacyGitHooks,
   lastLines,
   parseGitHubRemote,
   formatLocalTimestamp,
@@ -180,47 +180,6 @@ describe("config", () => {
   });
 });
 
-describe("legacy git hooks", () => {
-  test("removal deletes sidecar-owned hooks but preserves foreign hook content", () => {
-    process.env.SIDECAR_STATE_DIR = tempDir();
-    const repo = initRepo();
-    const hooksDir = path.join(repo, ".git", "hooks");
-    fs.mkdirSync(hooksDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(hooksDir, "post-commit"),
-      '#!/bin/sh\n"$(dirname -- "$0")/sidecar-sync-hook" post-commit "$@" # sidecar-sync\n',
-      "utf8",
-    );
-    fs.writeFileSync(
-      path.join(hooksDir, "pre-push"),
-      '#!/bin/sh\necho existing\n"$(dirname -- "$0")/sidecar-sync-hook" pre-push "$@" # sidecar-sync\n',
-      "utf8",
-    );
-    fs.writeFileSync(path.join(hooksDir, "sidecar-sync-hook"), "#!/bin/sh\nexit 0\n", "utf8");
-    fs.writeFileSync(path.join(repo, ".git", "sidecar-last-sync"), "0", "utf8");
-
-    expect(removeLegacyGitHooks(repo)).toBe(true);
-
-    expect(fs.existsSync(path.join(hooksDir, "post-commit"))).toBe(false);
-    expect(fs.existsSync(path.join(hooksDir, "sidecar-sync-hook"))).toBe(false);
-    expect(fs.existsSync(path.join(repo, ".git", "sidecar-last-sync"))).toBe(false);
-    const prePush = fs.readFileSync(path.join(hooksDir, "pre-push"), "utf8");
-    expect(prePush).toContain("echo existing");
-    expect(prePush).not.toContain("sidecar-sync");
-  });
-
-  test("removal leaves unrelated hooks alone and reports nothing removed", () => {
-    const repo = initRepo();
-    const hooksDir = path.join(repo, ".git", "hooks");
-    fs.mkdirSync(hooksDir, { recursive: true });
-    fs.writeFileSync(path.join(hooksDir, "pre-push"), "#!/bin/sh\necho existing\n", "utf8");
-
-    expect(removeLegacyGitHooks(repo)).toBe(false);
-
-    expect(fs.readFileSync(path.join(hooksDir, "pre-push"), "utf8")).toContain("echo existing");
-  });
-});
-
 describe("sync lock", () => {
   test("is exclusive while held, released after, and stolen from dead holders", () => {
     const repo = initRepo();
@@ -233,7 +192,7 @@ describe("sync lock", () => {
     const second = acquireSyncLock(repo);
     expect(second).toBeDefined();
     // Simulate a crashed holder: overwrite the pid with one that cannot be running.
-    fs.writeFileSync(path.join(repo, ".git", "sidecar-sync-lock", "pid"), "999999999", "utf8");
+    fs.writeFileSync(path.join(syncLockDir(repo), "pid"), "999999999", "utf8");
     const stolen = acquireSyncLock(repo);
     expect(stolen).toBeDefined();
     stolen!();
