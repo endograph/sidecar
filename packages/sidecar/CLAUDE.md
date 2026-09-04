@@ -12,6 +12,7 @@ automatically by `export *`.
 - `git.ts` — every spawn of the git binary; ref/worktree predicates; repo-family election (which working copy owns a shared VCS store).
 - `install.ts` — package identity/version, global-vs-project-local detection, finding the global executable.
 - `config.ts` — the committed `.sidecar` TOML: read/write/validate, project discovery, standalone detection, inbox branch naming.
+- `rules.ts` — per-peer `.sidecar-rules` TOML: strict validation, checkout-relative glob matching, ordered policy overrides, fingerprints.
 - `state.ts` — machine-local state dir: settings.json, instances.json registry, event log, per-family sync lock.
 - `service.ts` — OS service wrapper for the daemon (launchd/systemd/Startup), pid liveness. The loop itself is `daemon.ts`.
 - `ui.ts` — label/value output rows, human timestamps, blocking TTY prompts.
@@ -36,17 +37,34 @@ automatically by `export *`.
   it. The working tree keeps unredacted originals; only committed blobs are
   redacted — never switch a standalone repo's branch under redaction (it would
   overwrite local files with redacted content).
+- **Policy authority.** Rules sit beside the host peer config, outside a nested
+  sidecar's synced checkout. Standalone shares policy with its writers. Never
+  discover a nested peer's rules from synced content. Git filter commands are
+  shared by worktrees, but their policy bindings live beside each checkout's
+  index; never embed one checkout's mode or host rules path in the shared command.
+  Reprocess tracked files when effective policy changes, and only mark that
+  policy applied after a successful snapshot. Missing bindings fail closed.
 - **Standalone vs nested.** `path = "."` means the user's repo IS the sidecar.
   Standalone changes nearly every code path: no gitignore wiring, origin is the
   remote, and sidecar must never rewrite the user's working tree.
-- **Sync lock.** Per repo family, in the state dir. `withSyncLock(root,
-  "throw", ...)` for user-demanded commands, `"skip"` for daemon soft requests
-  that will fire again anyway. Never stamp lastSyncAt without holding it.
+- **Sync lock.** Per repo family and peer, in the state dir.
+  `withSyncLock(root, peer, "throw", ...)` for user-demanded commands,
+  `"skip"` for daemon soft requests that will fire again anyway. Never stamp
+  lastSyncAt without holding it.
+- **Peers never interact.** `.sidecar` and each `.sidecar.<name>` are
+  separate sidecars: the registry, the lock, the daemon's bookkeeping, and
+  family linking are all keyed by config path (`instance.configPath`), never
+  by root alone. `config.peer` is derived from the file name in `readConfig`
+  and is how a `(root, config)` pair knows which file it came from. A command
+  fans out over `loadPeers(selectedPeer(parsed))`; the daemon names the peer
+  through `SIDECAR_PEER`, an env var like every other request it makes.
 
 ## Build & test
 
 - `bun run build` bundles `src/bin.ts` into the single committed `dist/cli.js`;
   `import.meta.url` tricks (`redactCliPath`, `packageVersion`) resolve against
   that bundle at runtime, so keep the one-file output.
-- `bun run check` typechecks; `bun run test` rebuilds dist then runs vitest —
-  integration tests spawn the real `dist/cli.js`, so a stale build fails them.
+- `bun run check` typechecks. `bun run test` is the fast suite and does not
+  build or spawn the real CLI. `bun run test:integration` rebuilds `dist` and
+  runs the full suite, including real Git repositories, CLI processes, and
+  daemon behavior.
