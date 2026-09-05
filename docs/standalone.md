@@ -30,6 +30,12 @@ sidecar init --path .
 The remote is the repo's own `origin` — sidecar doesn't create or ask for a
 second repo. If the repo has no origin yet, `init` says so and stops.
 
+A directory that is not a repository yet can become its own sidecar in one
+step by naming the remote: `sidecar init <remote> --path .` initializes the
+repository, adds the origin, and syncs. That holds even when the directory
+sits inside another project's repository, ignored by it — `--path .` means
+the directory you are in, not the repository enclosing it.
+
 `init` finishes with a first sync: the committed `.sidecar` — and anything
 else uncommitted, per the snapshot rule below — lands on the remote
 immediately instead of waiting for the daemon's next pass.
@@ -80,7 +86,8 @@ git for-each-ref refs/sidecar-discarded/
 ## Tell your agents
 
 Coding agents reach for git by habit — committing, branching, pushing to
-"save" work. In a standalone repo that fights the daemon. Recommended
+"save" work. In a standalone repo that fights the daemon. See the
+[agent guide and Sidecar skill](agents.md) for the full workflow. Recommended
 AGENTS.md snippet:
 
 ````markdown
@@ -88,11 +95,19 @@ This repo is auto-synced by sidecar: every change is committed, merged
 across machines, and pushed automatically. Saving a file is the whole job —
 do not commit, push, or switch branches. The checkout lives on a
 sidecar-owned `sidecar-inbox/*` branch; manual git mutations race the
-daemon, and the next sync reverts them. Read-only git (log, diff, show) is
-fine.
+daemon. Read-only git (log, diff, show) is fine. Use the Sidecar skill when
+available, and keep real secret values outside this repo.
 ````
 
 ## Redaction and executed files
+
+Standalone mode shares configuration as well as content. Anyone whose changes
+sync into this repo can change `.sidecar` and its [rules](rules.md), including
+redaction policy. Trust
+those writers to control sync policy: disabling redaction can publish local
+originals on a subsequent sync, without another edit to those files. A private
+remote limits who can read the result; it does not make every writer safe to
+trust with this authority.
 
 A standalone repo's files are the artifact. You clone them onto a new machine
 and *run* them, so a redaction false positive doesn't mangle a note — it ships
@@ -115,6 +130,8 @@ redaction git filter, unregisters the repo from the daemon, and switches back
 to `main`. If redaction was on, it leaves the branch alone and tells you why:
 switching would replace your local files with their redacted pushed contents.
 
+Deinit asks for confirmation before making changes. Scripts can pass `--yes`.
+
 You're left with a normal git repo holding a `.sidecar` deletion to commit.
 
 ## Known rough edges
@@ -122,7 +139,9 @@ You're left with a normal git repo holding a `.sidecar` deletion to commit.
 - The repo sits on a `sidecar-inbox/...` branch, so GitHub's default-branch
   view, `gh`, and editor branch indicators show something unfamiliar.
 - Conflicts fork into files like `install.conflict.main.abc1234.sh` alongside a
-  `.sidecar-conflicts/` manifest, in a repo you actually use.
+  `.sidecar-conflicts/` manifest, in a repo you actually use. A repo that has
+  one writer at a time can init with `--resolve lww` instead, so the newer
+  write wins and no fork files appear — see [Conflicts](sync.md#conflicts).
 - Sync pushes to `main` automatically. Don't point standalone at a repo with
   branch protection or a CI trigger you care about.
 - The daemon's watch filter reads only the top-level `.gitignore`, so a repo

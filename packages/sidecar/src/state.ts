@@ -9,7 +9,7 @@ import path from "node:path";
 import { SidecarError, nowIso, realpathOr, slug } from "./util.js";
 import { familyPrimaryRoot, git, hasGitMetadata } from "./git.js";
 import { INSTALL_SOURCES, type InstallSource, shouldUseGlobalRegistry } from "./install.js";
-import { type SidecarConfig, expandInbox, readConfig, resolveSidecarPath } from "./config.js";
+import { DEFAULT_PEER, type SidecarConfig, expandInbox, peerConfigPath, peerNameOf, readConfig, resolveSidecarPath } from "./config.js";
 import { redactText } from "./redaction.js";
 
 const STATE_DIR_ENV = "SIDECAR_STATE_DIR";
@@ -83,6 +83,11 @@ export function writeSettings(settings: SidecarSettings): void {
   fs.writeFileSync(settingsPath(), `${JSON.stringify(record, null, 2)}\n`, "utf8");
 }
 
+/**
+ * One registered peer. `configPath` is the identity: a repo with several peers
+ * has one entry per peer, all sharing a root, and the peer's name is the
+ * config file's — `peerNameOf(path.basename(configPath))`.
+ */
 export type SidecarInstance = {
   root: string;
   configPath: string;
@@ -133,15 +138,116 @@ export function readInstances(): SidecarInstance[] {
   }
 }
 
-export function writeInstances(instances: SidecarInstance[]): void {
-  ensureStateDir();
-  fs.writeFileSync(instancesPath(), `${JSON.stringify(instances, null, 2)}\n`, "utf8");
+// Registry writes are transactions: atomic replacement alone protects readers,
+// but would still let two processes overwrite each other's registrations.
+function updateInstances(update: (instances: SidecarInstance[]) => SidecarInstance[]): void {
+  const release = acquireRegistryLock();
+  try {
+    const instances = readInstances();
+    const next = update(instances);
+    if (next === instances) return;
+    const temporary = `${instancesPath()}.${crypto.randomUUID()}.tmp`;
+    try {
+      fs.writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+      fs.renameSync(temporary, instancesPath());
+    } finally {
+      fs.rmSync(temporary, { force: true });
+    }
+  } finally {
+    release();
+  }
 }
 
-export function unregisterInstance(root: string): void {
-  const instances = readInstances();
-  const remaining = instances.filter((instance) => realpathOr(instance.root) !== realpathOr(root));
-  if (remaining.length !== instances.length) writeInstances(remaining);
+function acquireRegistryLock(): () => void {
+  ensureStateDir();
+  const lockDir = path.join(sidecarStateDir(), "instances.lock");
+  const prepared = fs.mkdtempSync(path.join(sidecarStateDir(), ".instances-lock-"));
+  const owner = `${process.pid}-${crypto.randomUUID()}`;
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + 10_000;
+  let acquired = false;
+  try {
+    // Publish a nonempty directory atomically. There is no acquisition window
+    // with a missing owner, and rename cannot replace another nonempty lock.
+    fs.writeFileSync(path.join(prepared, owner), "", "utf8");
+    while (true) {
+      try {
+        fs.renameSync(prepared, lockDir);
+        acquired = true;
+        return () => removeRegistryLockOwner(lockDir, owner);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES") throw error;
+      }
+      reapRegistryLock(lockDir);
+      if (Date.now() >= deadline) {
+        throw new SidecarError(`timed out waiting for the instance registry lock: ${lockDir}`);
+      }
+      Atomics.wait(sleeper, 0, 0, 10);
+    }
+  } finally {
+    if (!acquired) fs.rmSync(prepared, { recursive: true, force: true });
+  }
+}
+
+function removeRegistryLockOwner(lockDir: string, owner: string): void {
+  // Remove only the observed owner's unique entry, never a replacement lock.
+  // Concurrent reapers can race with acquisition safely: rmdir refuses a new
+  // holder's nonempty directory, unlike recursive removal.
+  try {
+    fs.unlinkSync(path.join(lockDir, owner));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  removeEmptyRegistryLock(lockDir);
+}
+
+function removeEmptyRegistryLock(lockDir: string): void {
+  try {
+    fs.rmdirSync(lockDir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") throw error;
+  }
+}
+
+function reapRegistryLock(lockDir: string): void {
+  let owners: string[];
+  try {
+    owners = fs.readdirSync(lockDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (owners.length === 0) removeEmptyRegistryLock(lockDir);
+  for (const owner of owners) {
+    const pid = Number(owner.split("-", 1)[0]);
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") removeRegistryLockOwner(lockDir, owner);
+    }
+  }
+}
+
+/** The peer an instance belongs to. Entries written before peers existed are all the default. */
+export function instancePeer(instance: Pick<SidecarInstance, "configPath">): string {
+  return peerNameOf(path.basename(instance.configPath)) ?? DEFAULT_PEER;
+}
+
+function sameConfigPath(left: string, right: string): boolean {
+  return (
+    path.basename(left) === path.basename(right) &&
+    realpathOr(path.dirname(left)) === realpathOr(path.dirname(right))
+  );
+}
+
+export function unregisterInstance(configPath: string): void {
+  updateInstances((instances) => {
+    const remaining = instances.filter((instance) => !sameConfigPath(instance.configPath, configPath));
+    return remaining.length === instances.length ? instances : remaining;
+  });
 }
 
 export function registerCurrentInstance(
@@ -152,30 +258,32 @@ export function registerCurrentInstance(
   if (!shouldUseGlobalRegistry()) return;
 
   const sidecarPath = resolveSidecarPath(root, config);
-  const existing = readInstances();
-  const previous = existing.find((instance) => instance.root === root);
-  const timestamp = nowIso();
-  const instance: SidecarInstance = {
+  const configPath = peerConfigPath(root, config.peer);
+  const inbox = hasGitMetadata(sidecarPath) ? expandInbox(config, sidecarPath) : expandInbox(config);
+  updateInstances((existing) => {
+    const previous = existing.find((instance) => sameConfigPath(instance.configPath, configPath));
+    const timestamp = nowIso();
+    const instance: SidecarInstance = {
+      root,
+      configPath,
+      sidecarPath,
+      remote: config.remote,
+      branch: config.branch,
+      inbox,
+      registeredAt: previous?.registeredAt ?? timestamp,
+      updatedAt: timestamp,
+      lastSyncAt: options.lastSyncAt ?? previous?.lastSyncAt,
+    };
+    return [instance, ...existing.filter((entry) => !sameConfigPath(entry.configPath, configPath))].sort(
+      (left, right) => left.root.localeCompare(right.root) || left.configPath.localeCompare(right.configPath),
+    );
+  });
+  logSidecarEvent(options.event, {
     root,
-    configPath: path.join(root, ".sidecar"),
+    ...(config.peer === DEFAULT_PEER ? {} : { peer: config.peer }),
     sidecarPath,
     remote: config.remote,
-    branch: config.branch,
-    inbox: hasGitMetadata(sidecarPath) ? expandInbox(config, sidecarPath) : expandInbox(config),
-    registeredAt: previous?.registeredAt ?? timestamp,
-    updatedAt: timestamp,
-    lastSyncAt: options.lastSyncAt ?? previous?.lastSyncAt,
-  };
-
-  const next = [instance, ...existing.filter((entry) => entry.root !== root)].sort((left, right) =>
-    left.root.localeCompare(right.root),
-  );
-  writeInstances(next);
-  logSidecarEvent(options.event, {
-    root: instance.root,
-    sidecarPath: instance.sidecarPath,
-    remote: instance.remote,
-    inbox: instance.inbox,
+    inbox,
   });
 }
 
@@ -266,15 +374,20 @@ export function logSidecarEvent(event: string, fields: Record<string, unknown> =
  * branch and git allows one worktree to hold a branch. The key is a hash of the
  * realpath because two spellings of one path (a symlink, /tmp vs /private/tmp)
  * have to land on the same lock, and a repo path is not a legal directory name.
+ *
+ * And by peer: peers have separate clones, so nothing one syncs can collide
+ * with what another is merging. Sharing a lock would only make one peer's
+ * round trip silently drop the other's soft sync.
  */
-export function syncLockDir(root: string): string {
+export function syncLockDir(root: string, peer: string): string {
   const family = familyPrimaryRoot(root) ?? root;
-  const key = crypto.createHash("sha256").update(realpathOr(family)).digest("hex").slice(0, 16);
-  return path.join(sidecarStateDir(), "locks", `${slug(path.basename(family))}-${key}`);
+  const key = crypto.createHash("sha256").update(`${realpathOr(family)}\0${peer}`).digest("hex").slice(0, 16);
+  const label = peer === DEFAULT_PEER ? slug(path.basename(family)) : `${slug(path.basename(family))}-${peer}`;
+  return path.join(sidecarStateDir(), "locks", `${label}-${key}`);
 }
 
-export function acquireSyncLock(root: string): (() => void) | undefined {
-  const lockDir = syncLockDir(root);
+export function acquireSyncLock(root: string, peer: string): (() => void) | undefined {
+  const lockDir = syncLockDir(root, peer);
   fs.mkdirSync(path.dirname(lockDir), { recursive: true });
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -294,8 +407,8 @@ export function acquireSyncLock(root: string): (() => void) | undefined {
 // skipping: a concurrent holder (usually the daemon) is a hard error, so the
 // command either did its work or clearly told you it didn't. In particular it
 // never stamps lastSyncAt without syncing.
-export function acquireSyncLockOrThrow(root: string): () => void {
-  const release = acquireSyncLock(root);
+export function acquireSyncLockOrThrow(root: string, peer: string): () => void {
+  const release = acquireSyncLock(root, peer);
   if (release) return release;
   throw new SidecarError("another sidecar sync is already running; try again once it finishes");
 }
@@ -303,8 +416,8 @@ export function acquireSyncLockOrThrow(root: string): () => void {
 // The one place that decides what a busy lock means: "throw" for commands the
 // user demanded, "skip" for soft requests that can no-op because their trigger
 // will fire again. Returns whether the work ran.
-export function withSyncLock(root: string, onBusy: "throw" | "skip", fn: () => void): boolean {
-  const releaseLock = onBusy === "skip" ? acquireSyncLock(root) : acquireSyncLockOrThrow(root);
+export function withSyncLock(root: string, peer: string, onBusy: "throw" | "skip", fn: () => void): boolean {
+  const releaseLock = onBusy === "skip" ? acquireSyncLock(root, peer) : acquireSyncLockOrThrow(root, peer);
   if (!releaseLock) {
     console.log("another sidecar sync is already running; skipping this soft sync");
     return false;

@@ -29,18 +29,22 @@ import {
 } from "./git.js";
 import { packageVersion } from "./install.js";
 import {
+  DEFAULT_PEER,
   type SidecarConfig,
   checkoutRandom,
   expandInbox,
   inboxPrefix,
   isStandalone,
   matchesInboxPrefix,
+  peerConfigPath,
   readConfig,
+  redactionModeConfigValue,
   remoteBranchName,
   requireSidecarCheckout,
   resolveSidecarPath,
 } from "./config.js";
 import { logSidecarEvent } from "./state.js";
+import { readRules, resolveFileRules, rulesFingerprint, type SidecarRules } from "./rules.js";
 import {
   HEALTH_FILE,
   type HealthIdentity,
@@ -57,10 +61,8 @@ import {
 } from "./health.js";
 import {
   DEFAULT_REDACTION_MODE,
-  NO_REDACT_PRAGMA,
   type RedactionMode,
   countRedactionPlaceholders,
-  hasNoRedactPragma,
   redactText,
 } from "./redaction.js";
 
@@ -93,18 +95,23 @@ export function syncProject(
   const stage = (name: string): void => options.onStage?.(name);
 
   stage("checkout");
-  const sidecarPath = ensureSidecarCheckout(root, config);
+  // Cloning, repairing through a missing family primary, and bootstrapping
+  // an unborn repo may contact origin. Local-only sync requires an already
+  // initialized checkout and leaves recovery to an explicit clone/full sync.
+  const sidecarPath = options.remote
+    ? ensureSidecarCheckout(root, config)
+    : requireSidecarCheckout(root, config);
+  if (!options.remote && !hasAnyCommit(sidecarPath)) {
+    throw new SidecarError(`local sync requires an initialized sidecar checkout at ${sidecarPath}; run \`sidecar sync\` first`);
+  }
   const inbox = expandInbox(config, sidecarPath);
   ensureCommitIdentity(sidecarPath);
+  ensureRedactionFilter(sidecarPath, config.redaction, config);
   ensureInboxBranch(sidecarPath, config, inbox);
 
   stage("snapshot");
   if (options.snapshot) {
-    snapshot(sidecarPath, root, inbox, options.message, config.redaction);
-  } else {
-    // Without a snapshot nothing else repairs a stale filter command, and
-    // required=true would fail every git status until one runs.
-    ensureRedactionFilter(sidecarPath, config.redaction);
+    snapshot(sidecarPath, root, inbox, options.message, config.redaction, config);
   }
 
   // The local phase exists to bring sibling working copies current early, before
@@ -123,7 +130,7 @@ export function syncProject(
   if (!options.remote) return;
 
   stage("push-inbox");
-  syncBranchBeforePush(sidecarPath, inbox);
+  syncBranchBeforePush(sidecarPath, inbox, config);
   pushBranch(sidecarPath, inbox);
   stage("merge");
   mergeInboxBranches(sidecarPath, config, { forkFiles: true, push: true, remote: true });
@@ -144,7 +151,7 @@ export function syncProject(
  * watcher reconciles it moments later — and no sibling may fail the sync that
  * is only doing it a favour.
  */
-function settleCheckouts(
+export function settleCheckouts(
   sidecarPath: string,
   config: SidecarConfig,
   inbox: string,
@@ -154,11 +161,17 @@ function settleCheckouts(
 
   let settled = 0;
   for (const sibling of siblings) {
-    // Dirty is the only reason left to pass one over: siblingCheckouts already
-    // narrowed these to checkouts sidecar owns. An edit in flight is transient,
-    // so leave it for that checkout's own next sync.
-    if (isDirty(sibling)) continue;
-    if (git(sibling, ["merge", "--ff-only", config.branch], { check: false }).status === 0) settled += 1;
+    try {
+      // A dirty checkout or its failing required filter belongs to that
+      // sibling's next sync. Never rebind its policy to get this sync through.
+      if (isDirty(sibling)) continue;
+      if (git(sibling, ["merge", "--ff-only", config.branch], { check: false }).status === 0) settled += 1;
+    } catch (error) {
+      logSidecarEvent("settle-skip", {
+        sidecarPath: sibling,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
   if (settled) logSidecarEvent("settle", { sidecarPath, siblings: settled });
 }
@@ -239,6 +252,7 @@ export function reportSyncHealth(root: string, config: SidecarConfig, outcome: H
     const identity: HealthIdentity = {
       machine: `${currentUser()}@${currentHost()}`,
       root,
+      peer: config.peer === DEFAULT_PEER ? undefined : config.peer,
       inbox: expandInbox(config, sidecarPath),
       version: packageVersion(),
     };
@@ -399,6 +413,7 @@ export function mergeInboxBranches(
   git(sidecarPath, ["worktree", "prune", "--expire", "now"], { check: false });
   try {
     git(sidecarPath, ["worktree", "add", "--detach", worktree]);
+    ensureRedactionFilter(worktree, config.redaction, config);
     return mergeInboxBranchesAt(worktree, config, options);
   } finally {
     git(sidecarPath, ["worktree", "remove", "--force", worktree], { check: false });
@@ -407,10 +422,17 @@ export function mergeInboxBranches(
 }
 
 function mainMatchesRemote(repo: string, config: SidecarConfig): boolean {
-  if (!branchExists(repo, config.branch) || !remoteRefExists(repo, config.branch)) return false;
-  const local = git(repo, ["rev-parse", `refs/heads/${config.branch}`]).stdout.trim();
-  const remote = git(repo, ["rev-parse", `refs/remotes/origin/${config.branch}`]).stdout.trim();
-  return local === remote;
+  const localRef = `refs/heads/${config.branch}`;
+  const remoteRef = `refs/remotes/origin/${config.branch}`;
+  const refs = new Map(
+    git(repo, ["for-each-ref", "--format=%(refname) %(objectname)", localRef, remoteRef])
+      .stdout.split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => line.split(" ", 2) as [string, string]),
+  );
+  const local = refs.get(localRef);
+  const remote = refs.get(remoteRef);
+  return local !== undefined && local === remote;
 }
 
 /** Whether any inbox branch still sits outside the local main branch. */
@@ -450,28 +472,7 @@ function mergeInboxBranchesAt(
     const merged: string[] = [];
     for (const remoteBranch of inboxBranches) {
       console.log(`merging ${paint("brand", remoteBranch)}`);
-      const result = git(
-        sidecarPath,
-        ["merge", "--no-ff", "-m", `Merge ${remoteBranch}`, remoteBranch],
-        { check: false },
-      );
-      if (result.status === 0) {
-        merged.push(remoteBranch);
-        continue;
-      }
-
-      if (!hasUnmergedPaths(sidecarPath)) {
-        throw new SidecarError(result.stderr.trim() || `merge failed for ${remoteBranch}`);
-      }
-
-      if (!options.forkFiles) {
-        git(sidecarPath, ["merge", "--abort"], { check: false });
-        throw new SidecarError(`merge conflict in ${remoteBranch}; rerun with --fork-files`);
-      }
-
-      forkConflicts(sidecarPath, remoteBranch);
-      git(sidecarPath, ["commit", "-m", `Merge ${remoteBranch} with forked conflict files`]);
-      merged.push(remoteBranch);
+      if (mergeInboxBranch(sidecarPath, config, remoteBranch, options)) merged.push(remoteBranch);
     }
 
     if (options.push) {
@@ -495,6 +496,73 @@ function mergeInboxBranchesAt(
   }
 }
 
+/** Merge into the current branch, applying path policy before any commit. */
+export function mergeInboxBranch(
+  repo: string,
+  config: SidecarConfig,
+  remoteBranch: string,
+  options: { forkFiles: boolean },
+): boolean {
+  if (isAncestor(repo, remoteBranch, "HEAD")) return false;
+  // --no-ff prevents a fast-forward from bypassing --no-commit. Disabling
+  // rename detection makes path rules apply consistently to delete/add pairs.
+  try {
+    const result = git(repo, ["merge", "--no-ff", "--no-commit", "-Xno-renames", remoteBranch], { check: false });
+    if (result.status !== 0 && !hasUnmergedPaths(repo)) {
+      throw new SidecarError(result.stderr.trim() || `merge failed for ${remoteBranch}`);
+    }
+    resolveMergeConflicts(repo, config, remoteBranch, options);
+    return true;
+  } catch (error) {
+    // Inbox reconciliation can run in the live checkout. Never leave Git's
+    // provisional content merge for a later snapshot to commit accidentally.
+    try { git(repo, ["merge", "--abort"], { check: false }); } catch { /* preserve the original failure */ }
+    throw error;
+  }
+}
+
+/** Apply whole-file LWW even to Git-clean merges, resolve forks, and commit once. */
+export function resolveMergeConflicts(
+  repo: string,
+  config: SidecarConfig,
+  remoteBranch: string,
+  options: { forkFiles: boolean },
+): void {
+  const paths = Object.keys(unmergedPaths(repo));
+  const forkPaths = paths.filter((filePath) => resolveFileRules(config.rules, filePath, {
+    resolve: config.resolve, redaction: config.redaction,
+  }).resolve === "fork");
+
+  // Refuse before modifying any path when a fork needs explicit permission.
+  if (forkPaths.length && !options.forkFiles) {
+    git(repo, ["merge", "--abort"], { check: false });
+    throw new SidecarError(`merge conflict in ${remoteBranch}; rerun with --fork-files`);
+  }
+  const lwwEnabled = config.resolve === "lww" || config.rules?.some((rule) => rule.resolve === "lww");
+  const writes = lwwEnabled ? mergeWrittenPaths(repo, remoteBranch) : undefined;
+  const lwwPaths = writes ? [...new Set([...paths, ...writes.ours, ...writes.theirs])].filter((filePath) =>
+    resolveFileRules(config.rules, filePath, { resolve: config.resolve, redaction: config.redaction }).resolve === "lww",
+  ) : [];
+  const written = lwwPaths.length ? resolveLastWriterWins(repo, config.branch, remoteBranch, lwwPaths, writes) : [];
+  if (forkPaths.length) forkConflicts(repo, remoteBranch, forkPaths);
+  if (hasUnmergedPaths(repo)) throw new SidecarError("per-path resolution did not clear all unmerged paths");
+
+  const suffix = forkPaths.length ? " with forked conflict files" : lwwPaths.length ? ", last writer wins" : "";
+  git(repo, ["commit", "-m", [`Merge ${remoteBranch}${suffix}`, ...written].join("\n\n")]);
+}
+
+// Net tree differences miss explicit revert writes and newer writes that
+// happen to produce identical blobs. Include paths written anywhere in both
+// histories since the common ancestor, including deletions and merge edits.
+type MergeWrites = { base: string; ours: Set<string>; theirs: Set<string> };
+function mergeWrittenPaths(repo: string, remoteBranch: string): MergeWrites {
+  const base = git(repo, ["merge-base", "HEAD", remoteBranch]).stdout.trim();
+  if (!base) throw new SidecarError(`could not find common history with ${remoteBranch}`);
+  const paths = (ref: string): Set<string> => new Set(git(repo, ["log", "--format=", "--name-only", "-z", "--no-renames", "--diff-merges=first-parent", `${base}..${ref}`])
+    .stdout.split("\0").filter(Boolean));
+  return { base, ours: paths("HEAD"), theirs: paths(remoteBranch) };
+}
+
 /**
  * The family primary's own sidecar checkout, created if it does not exist yet.
  *
@@ -507,9 +575,11 @@ export function familySidecarCheckout(root: string, config: SidecarConfig): stri
   const primary = familyPrimaryRoot(root);
   if (!primary) return undefined;
 
+  // The same peer at the primary: a family shares one clone per peer, and a
+  // primary that declares this peer with another remote is not ours to populate.
   let primaryConfig: SidecarConfig;
   try {
-    primaryConfig = readConfig(path.join(primary, ".sidecar"));
+    primaryConfig = readConfig(peerConfigPath(primary, config.peer));
   } catch {
     return undefined;
   }
@@ -570,7 +640,7 @@ export function checkoutIsUnlinkedFromFamily(
   const primary = familyPrimaryRoot(root);
   if (!primary) return false;
   try {
-    const primaryConfig = readConfig(path.join(primary, ".sidecar"));
+    const primaryConfig = readConfig(peerConfigPath(primary, config.peer));
     return primaryConfig.remote === config.remote;
   } catch {
     return false;
@@ -630,7 +700,7 @@ export function cloneOrUpdate(
   }
 
   ensureCommitIdentity(sidecarPath);
-  ensureRedactionFilter(sidecarPath, config.redaction);
+  ensureRedactionFilter(sidecarPath, config.redaction, config);
   if (bootstrapMain) bootstrapMainBranch(sidecarPath, config);
 
   const inbox = expandInbox(config, sidecarPath);
@@ -692,8 +762,15 @@ export function ensureMainBranch(repo: string, config: SidecarConfig): void {
 
   if (!remoteRefExists(repo, config.branch)) return;
   const remoteBranch = `origin/${config.branch}`;
-  if (isAncestor(repo, remoteBranch, "HEAD")) return;
-  if (isAncestor(repo, "HEAD", remoteBranch)) {
+  // One symmetric-difference walk tells us both ancestry directions. The
+  // left count is commits unique to HEAD; the right count is commits unique
+  // to the remote branch.
+  const [localOnly, remoteOnly] = git(repo, ["rev-list", "--left-right", "--count", `HEAD...${remoteBranch}`])
+    .stdout.trim()
+    .split(/\s+/)
+    .map(Number);
+  if (remoteOnly === 0) return;
+  if (localOnly === 0) {
     git(repo, ["merge", "--ff-only", remoteBranch]);
     return;
   }
@@ -774,20 +851,38 @@ export function snapshot(
   inbox: string,
   message = "sidecar snapshot",
   redactionMode: RedactionMode = DEFAULT_REDACTION_MODE,
+  policy?: RedactionPolicy,
 ): boolean {
+  // A failed or manual merge can leave cleanly merged content in the index.
+  // Never turn that partial operation into an automatic snapshot, even if a
+  // previous attempt to abort it failed.
+  if (fs.existsSync(path.join(gitDir(repo), "MERGE_HEAD"))) {
+    throw new SidecarError("cannot snapshot an unfinished merge; resolve or abort it before syncing");
+  }
   // A filter change (new mode, moved node/CLI) doesn't invalidate git's stat
   // cache, so already-committed files would keep their old redaction state
   // forever; renormalize forces every tracked file back through the filter.
-  if (ensureRedactionFilter(repo, redactionMode) && hasAnyCommit(repo)) {
+  // Deletions are staged first: renormalize stats every path still in the
+  // index, and a tracked file gone from the working tree would fail it.
+  const rewired = ensureRedactionFilter(repo, redactionMode, policy);
+  // Filter config is shared by linked worktrees and may be repaired by merge
+  // or init before this snapshot. Record the applied semantics beside each
+  // checkout's index, only after it has staged and committed successfully.
+  const revisionPath = path.join(gitDir(repo), "sidecar-redaction-revision");
+  const revision = `${REDACTION_FILTER_REVISION}:${redactionMode}:${rulesFingerprint(policy?.rules)}`;
+  let appliedRevision = "";
+  try { appliedRevision = fs.readFileSync(revisionPath, "utf8"); } catch { /* first snapshot */ }
+  git(repo, ["add", "-A"]);
+  if ((rewired || appliedRevision !== revision) && hasAnyCommit(repo)) {
     git(repo, ["add", "--renormalize", "."]);
   }
-  git(repo, ["add", "-A"]);
   if (git(repo, ["diff", "--cached", "--quiet"], { check: false }).status === 0) {
+    fs.writeFileSync(revisionPath, revision, "utf8");
     console.log("no sidecar changes to snapshot");
     return false;
   }
-  const staged = git(repo, ["-c", "core.quotePath=false", "diff", "--cached", "--name-only", "--diff-filter=d"])
-    .stdout.split("\n")
+  const staged = git(repo, ["diff", "--cached", "--name-only", "-z", "--diff-filter=d"])
+    .stdout.split("\0")
     .filter(Boolean);
 
   const source = `${currentUser()}@${currentHost()}`;
@@ -800,37 +895,69 @@ export function snapshot(
     body.push(`main-head: ${mainHead.status === 0 ? mainHead.stdout.trim() : "unborn"}`);
   }
   body.push(`inbox: ${inbox}`);
+  // When each file last changed, for last-writer-wins: a snapshot commits a
+  // whole debounce window of edits at once, so its own time can run minutes
+  // late for any one of them, and the merge needs the write, not the commit.
+  body.push(...writtenTrailers(repo, staged));
   git(repo, ["commit", "-m", body.join("\n")]);
+  fs.writeFileSync(revisionPath, revision, "utf8");
   console.log(`committed sidecar snapshot to ${paint("brand", inbox)}`);
-  reportRedactions(repo, staged, redactionMode);
+  reportRedactions(repo, staged, redactionMode, policy?.rules);
   return true;
+}
+
+const WRITTEN_TRAILER = "written:";
+// Past this many paths the trailers stop and the commit time stands in: a
+// build cache's snapshot can touch thousands, and a message that long serves
+// nobody.
+const WRITTEN_TRAILER_LIMIT = 500;
+
+/**
+ * One `written: <unix seconds> <path>` line per staged file, from its mtime.
+ * Deleted paths are not in `staged` — there is no file left to ask — and a
+ * path with a newline could not be read back, so both fall back to the
+ * commit time at the merge.
+ */
+function writtenTrailers(repo: string, staged: string[]): string[] {
+  if (staged.length > WRITTEN_TRAILER_LIMIT) return [];
+  const trailers: string[] = [];
+  for (const relPath of staged) {
+    if (relPath.includes("\n")) continue;
+    try {
+      const seconds = Math.floor(fs.lstatSync(path.join(repo, relPath)).mtimeMs / 1000);
+      if (seconds > 0) trailers.push(`${WRITTEN_TRAILER} ${seconds} ${relPath}`);
+    } catch {
+      // Gone between staging and now; the commit time stands in.
+    }
+  }
+  return trailers;
 }
 
 // Surfaces what the clean filter changed in this snapshot, so redaction is
 // never silent: false positives are only reviewable if the user knows they
 // happened.
-function reportRedactions(repo: string, staged: string[], mode: RedactionMode): void {
-  if (mode === "none") return;
+function reportRedactions(repo: string, staged: string[], mode: RedactionMode, rules?: SidecarRules): void {
   let files = 0;
   let items = 0;
   for (const relPath of staged) {
-    const delta = fileRedactionDelta(path.join(repo, relPath), mode);
+    const delta = fileRedactionDelta(path.join(repo, relPath), mode, { rules, relativePath: relPath });
     if (!delta) continue;
     files += 1;
     items += delta.items;
   }
   if (!files) return;
   console.log(
-    `redacted ${items} item(s) in ${files} file(s); review with \`sidecar redactions\`, or add "${NO_REDACT_PRAGMA}" to a file's first lines to opt it out`,
+    `redacted ${items} item(s) in ${files} file(s); review with \`sidecar redactions\``,
   );
   logSidecarEvent("redaction", { files, items });
 }
 
 // What redaction changes for one file, or undefined when it leaves the file
-// alone (binary, pragma opt-out, or nothing matched).
+// alone (binary, non-UTF-8, or nothing matched).
 export function fileRedactionDelta(
   filePath: string,
   mode: RedactionMode,
+  policy?: { rules?: SidecarRules; relativePath: string },
 ): { text: string; redacted: string; items: number } | undefined {
   let data: Buffer;
   try {
@@ -839,8 +966,11 @@ export function fileRedactionDelta(
     return undefined;
   }
   const text = decodeUtf8Text(data);
-  if (text === undefined || hasNoRedactPragma(text)) return undefined;
-  const redacted = redactText(text, mode);
+  if (text === undefined) return undefined;
+  const effectiveMode = policy
+    ? resolveFileRules(policy.rules, policy.relativePath, { resolve: "fork", redaction: mode }).redaction
+    : mode;
+  const redacted = redactText(text, effectiveMode);
   if (redacted === text) return undefined;
   const items = Math.max(
     1,
@@ -850,21 +980,74 @@ export function fileRedactionDelta(
 }
 
 const REDACTION_FILTER_NAME = "sidecar-redact";
+// Bump when filter semantics change without changing the command, so Git's
+// cached blobs are reprocessed too. Revision 2 adds per-path peer rules.
+const REDACTION_FILTER_REVISION = "2";
+const REDACTION_POLICY_FILE = "sidecar-redaction-policy";
+export type RedactionPolicy = { rules?: SidecarRules; rulesPath?: string };
+
+type BoundRedactionPolicy = {
+  mode: RedactionMode;
+  rulesPath?: string;
+  fingerprint: string;
+};
+
+// The shared Git config cannot embed a host rules path or mode: sibling
+// worktrees may have different policies. Bind each index to its own explicit
+// host path in Git metadata; the filter never searches the synced content.
+export function checkoutRedactionPolicy(repo: string): { mode: RedactionMode; rules: SidecarRules } {
+  const policyPath = path.join(gitDir(repo), REDACTION_POLICY_FILE);
+  let bound: BoundRedactionPolicy;
+  try {
+    bound = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+  } catch {
+    throw new SidecarError("missing or invalid checkout redaction policy; run `sidecar sync`");
+  }
+  if (!bound || typeof bound !== "object" || typeof bound.fingerprint !== "string" ||
+      (bound.rulesPath !== undefined && (typeof bound.rulesPath !== "string" || !path.isAbsolute(bound.rulesPath)))) {
+    throw new SidecarError("invalid checkout redaction policy; run `sidecar sync`");
+  }
+  const mode = redactionModeConfigValue(bound.mode, "checkout redaction mode");
+  const rules = bound.rulesPath ? readRules(bound.rulesPath) : [];
+  if (rulesFingerprint(rules) !== bound.fingerprint) {
+    throw new SidecarError("sidecar rules changed during this operation; run `sidecar sync` to apply them");
+  }
+  return { mode, rules };
+}
 
 // Redaction happens in a git clean filter, so secrets never reach committed
 // blobs while the working tree keeps the user's original text. `required`
 // makes staging fail closed if the filter command can't run.
 // Returns true when it had to (re)write any part of the wiring — the signal
 // that staged content may predate the current filter and needs renormalizing.
-export function ensureRedactionFilter(repo: string, mode: RedactionMode = DEFAULT_REDACTION_MODE): boolean {
-  // Mode "none" keeps the filter wiring in place (so switching back needs no
-  // attribute changes) but stages content untouched without a node spawn.
-  const command =
-    mode === "none"
-      ? "cat"
-      : `${filterCommandQuote(process.execPath)} ${filterCommandQuote(redactCliPath())} redact --mode=${mode}`;
+export function ensureRedactionFilter(
+  repo: string,
+  mode: RedactionMode = DEFAULT_REDACTION_MODE,
+  policy?: RedactionPolicy,
+): boolean {
+  const fingerprint = rulesFingerprint(policy?.rules);
+  if (policy?.rules?.length && !policy.rulesPath) {
+    throw new SidecarError("path redaction rules require an explicit host rules file");
+  }
+  const rulesPath = policy?.rulesPath ? path.resolve(policy.rulesPath) : undefined;
+  // Validate even for default none and before replacing the binding. A host
+  // edit after config loading cannot silently weaken this operation's policy.
+  if (rulesPath && rulesFingerprint(readRules(rulesPath)) !== fingerprint) {
+    throw new SidecarError("sidecar rules changed during this operation; run `sidecar sync` to apply them");
+  }
+  const policyPath = path.join(gitDir(repo), REDACTION_POLICY_FILE);
+  const bound = JSON.stringify({ mode, rulesPath, fingerprint } satisfies BoundRedactionPolicy);
+  let previous = "";
+  try { previous = fs.readFileSync(policyPath, "utf8"); } catch { /* first binding */ }
+  const policyChanged = previous !== bound;
+  if (policyChanged) fs.writeFileSync(policyPath, bound, { encoding: "utf8", mode: 0o600 });
+  // %f is shell-quoted by Git itself, including whitespace and metacharacters.
+  // Always run the filter: another checkout or a path rule can require
+  // redaction even when this peer's default is none.
+  const command = `${filterCommandQuote(process.execPath)} ${filterCommandQuote(redactCliPath())} redact --checkout-policy --path %f`;
   const wanted: Array<[string, string]> = [
     [`filter.${REDACTION_FILTER_NAME}.clean`, command],
+    [`filter.${REDACTION_FILTER_NAME}.revision`, REDACTION_FILTER_REVISION],
     // `required` applies to both directions, so checkout needs an identity
     // smudge command to succeed.
     [`filter.${REDACTION_FILTER_NAME}.smudge`, "cat"],
@@ -899,7 +1082,7 @@ export function ensureRedactionFilter(repo: string, mode: RedactionMode = DEFAUL
     // Missing attributes file: created by the append below.
   }
   const attributesOk = attributes.split(/\r?\n/).includes(line);
-  if (configOk && attributesOk) return false;
+  if (configOk && attributesOk) return policyChanged;
 
   for (const [key, value] of wanted) {
     git(repo, ["config", key, value]);
@@ -919,6 +1102,8 @@ export function ensureRedactionFilter(repo: string, mode: RedactionMode = DEFAUL
 // outlives sidecar's interest in it.
 export function removeRedactionFilter(repo: string): void {
   git(repo, ["config", "--remove-section", `filter.${REDACTION_FILTER_NAME}`], { check: false });
+  fs.rmSync(path.join(gitDir(repo), "sidecar-redaction-revision"), { force: true });
+  fs.rmSync(path.join(gitDir(repo), REDACTION_POLICY_FILE), { force: true });
 
   const attributesPath = path.join(gitCommonDir(repo), "info", "attributes");
   const line = `* filter=${REDACTION_FILTER_NAME}`;
@@ -954,7 +1139,7 @@ function filterCommandQuote(value: string): string {
 
 export function redactBuffer(data: Buffer, mode: RedactionMode): Buffer {
   const text = decodeUtf8Text(data);
-  if (text === undefined || hasNoRedactPragma(text)) return data;
+  if (text === undefined) return data;
   const redacted = redactText(text, mode);
   return redacted === text ? data : Buffer.from(redacted, "utf8");
 }
@@ -968,7 +1153,7 @@ function decodeUtf8Text(data: Buffer): string | undefined {
   }
 }
 
-export function syncBranchBeforePush(repo: string, branch: string): void {
+export function syncBranchBeforePush(repo: string, branch: string, config: SidecarConfig): void {
   fetch(repo, true, false);
   if (!remoteRefExists(repo, branch)) return;
 
@@ -986,11 +1171,10 @@ export function syncBranchBeforePush(repo: string, branch: string): void {
     return;
   }
 
-  const result = git(repo, ["rebase", remoteBranch], { check: false });
-  if (result.status !== 0) {
-    git(repo, ["rebase", "--abort"], { check: false });
-    throw new SidecarError(result.stderr.trim() || `could not rebase ${branch} onto ${remoteBranch}`);
-  }
+  // Rebasing can combine clean hunks before canonical merging ever sees the
+  // file. Reconcile divergent inbox tips with the same whole-file policy.
+  mergeInboxBranch(repo, { ...config, branch }, remoteBranch, { forkFiles: true });
+
 }
 
 function refreshInboxFromMain(repo: string, config: SidecarConfig, inbox: string): void {
@@ -1008,8 +1192,8 @@ export function pushBranch(repo: string, branch: string): void {
   console.log(`pushed ${paint("brand", branch)}`);
 }
 
-export function forkConflicts(repo: string, remoteBranch: string): void {
-  const conflicts = unmergedPaths(repo);
+export function forkConflicts(repo: string, remoteBranch: string, selectedPaths?: string[]): void {
+  const conflicts = selectConflictPaths(unmergedEntries(repo), selectedPaths);
   if (!Object.keys(conflicts).length) {
     throw new SidecarError("merge reported conflicts, but no unmerged paths were found");
   }
@@ -1025,21 +1209,46 @@ export function forkConflicts(repo: string, remoteBranch: string): void {
     paths: [],
   };
 
-  for (const [conflictPath, stages] of Object.entries(conflicts).sort(([left], [right]) =>
-    left.localeCompare(right),
-  )) {
+  // Read every expected version before removing any original. A deleted side
+  // has no index entry; an unreadable existing entry is an error, never a
+  // deletion that can be silently skipped.
+  const prepared = Object.entries(conflicts).sort(([left], [right]) => left.localeCompare(right)).map(
+    ([conflictPath, stages]) => ({
+      conflictPath,
+      stages,
+      blobs: Object.fromEntries([2, 3].filter((stage) => stages[stage]).map((stage) => {
+        const entry = stages[stage];
+        if (!["100644", "100755", "120000"].includes(entry.mode)) {
+          throw new SidecarError(`cannot fork unsupported mode ${entry.mode} for ${conflictPath}`);
+        }
+        const blob = showStage(repo, stage, conflictPath);
+        if (blob === undefined) throw new SidecarError(`could not read conflict stage ${stage} for ${conflictPath}`);
+        return [stage, blob];
+      })),
+    }),
+  );
+
+  for (const { conflictPath, stages, blobs } of prepared) {
     const versions: ConflictVersion[] = [];
     for (const [stage, label] of [
       [2, "main"],
       [3, branchLabel],
     ] as const) {
-      const blob = showStage(repo, stage, conflictPath);
-      if (!blob) continue;
-      const oid = stages[stage] ?? "";
+      const blob = blobs[stage];
+      if (blob === undefined) continue;
+      const { oid, mode } = stages[stage];
       const outPath = forkPath(conflictPath, label, oid);
       const fullOut = path.join(repo, outPath);
       fs.mkdirSync(path.dirname(fullOut), { recursive: true });
-      fs.writeFileSync(fullOut, blob);
+      // Replace an old fork without following a symlink, and preserve the
+      // index mode so executable files and symlink versions stay usable.
+      fs.rmSync(fullOut, { force: true });
+      if (mode === "120000") fs.symlinkSync(blob.toString("utf8"), fullOut);
+      else {
+        fs.writeFileSync(fullOut, blob);
+        fs.chmodSync(fullOut, mode === "100755" ? 0o755 : 0o644);
+      }
+      git(repo, ["add", "--", `:(literal)${outPath}`]);
       versions.push({
         stage,
         label,
@@ -1049,19 +1258,17 @@ export function forkConflicts(repo: string, remoteBranch: string): void {
       });
     }
 
-    git(repo, ["rm", "-f", "--ignore-unmatch", "--", conflictPath], { check: false });
-    const original = path.join(repo, conflictPath);
-    if (fs.existsSync(original) && fs.statSync(original).isFile()) fs.unlinkSync(original);
+    git(repo, ["rm", "-f", "--", `:(literal)${conflictPath}`]);
 
     manifest.paths.push({ path: conflictPath, versions });
   }
 
   const manifestDir = path.join(repo, ".sidecar-conflicts");
   fs.mkdirSync(manifestDir, { recursive: true });
-  const manifestPath = path.join(manifestDir, `${timestamp}-${manifestLabel}.json`);
+  const manifestPath = path.join(manifestDir, `${timestamp}-${manifestLabel}-fork-files.json`);
   fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  git(repo, ["add", "-A"]);
-  if (hasUnmergedPaths(repo)) {
+  git(repo, ["add", "--", `:(literal)${path.relative(repo, manifestPath)}`]);
+  if (Object.keys(selectConflictPaths(unmergedPaths(repo), selectedPaths)).length) {
     throw new SidecarError("fork-files did not clear all unmerged paths");
   }
 }
@@ -1072,6 +1279,168 @@ type ConflictManifest = {
   source_branch: string;
   paths: Array<{ path: string; versions: ConflictVersion[] }>;
 };
+
+/** Select an entire parent entry for every LWW path; never keep merged content. */
+export function resolveLastWriterWins(
+  repo: string,
+  canonicalBranch: string,
+  remoteBranch: string,
+  selectedPaths = Object.keys(unmergedPaths(repo)),
+  writes = mergeWrittenPaths(repo, remoteBranch),
+): string[] {
+  const timestamp = utcTimestamp();
+  const branch = remoteBranchName(remoteBranch) || remoteBranch;
+  const manifest: LastWriterManifest = { timestamp, resolved_by: "lww", source_branch: branch, paths: [] };
+  const selections = [...new Set(selectedPaths)].sort().map((filePath) => {
+    const ours = treeEntry(repo, "HEAD", filePath);
+    const theirs = treeEntry(repo, remoteBranch, filePath);
+    const oursWrite = lastWriteEvent(repo, "HEAD", filePath);
+    const theirsWrite = lastWriteEvent(repo, remoteBranch, filePath);
+    const baseWrite = lastWriteEvent(repo, writes.base, filePath);
+    const oursAt = oursWrite.time;
+    const theirsAt = theirsWrite.time;
+    // A stable entry tie-break converges independently of inbox enumeration.
+    // Deletion wins a same-time tie; otherwise compare mode and object id.
+    // A one-sided write is a causal update, even when its file mtime was
+    // copied from an older source. Clocks arbitrate only concurrent writes.
+    // Compare the accepted source event, not every historical edit: a merge
+    // may have discarded a write while keeping the base version unchanged.
+    const oursChanged = oursWrite.source !== baseWrite.source;
+    const theirsChanged = theirsWrite.source !== baseWrite.source;
+    const incoming = oursChanged !== theirsChanged ? theirsChanged
+      : theirsAt > oursAt || (theirsAt === oursAt && entryKey(theirs) > entryKey(ours));
+    return { filePath, ours, theirs, incoming, winner: incoming ? theirs : ours, write: incoming ? theirsWrite : oursWrite };
+  });
+  // Independently selected files cannot occupy both an ancestor path and its
+  // descendant. Fail before changing the index rather than erase a winner.
+  const selected = new Set(selections.map((entry) => entry.filePath));
+  const indexed = new Set(git(repo, ["ls-files", "-z"]).stdout.split("\0").filter(Boolean));
+  const present = new Set([
+    ...[...indexed].filter((filePath) => !selected.has(filePath)),
+    ...selections.filter((entry) => entry.winner).map((entry) => entry.filePath),
+  ]);
+  for (const filePath of present) {
+    for (let parent = path.posix.dirname(filePath); parent !== "."; parent = path.posix.dirname(parent)) {
+      if (present.has(parent)) throw new SidecarError(`last-writer-wins selected incompatible file and directory paths: ${parent}, ${filePath}`);
+    }
+  }
+  // Remove winning deletions before restoring files, so directory/file
+  // transitions can be materialized without following old symlinks.
+  for (const selection of selections.filter((entry) => !entry.winner)) {
+    // A clean file-to-directory merge may already have removed this leaf.
+    // Even a literal parent pathspec would match its indexed descendants;
+    // remove only a leaf that is actually present as an exact index entry.
+    if (indexed.has(selection.filePath)) {
+      git(repo, ["rm", "-f", "--ignore-unmatch", "--", `:(literal)${selection.filePath}`]);
+    }
+  }
+  const written: string[] = [];
+  for (const { filePath, ours, theirs, incoming, winner, write } of selections) {
+    if (winner) {
+      git(repo, ["restore", `--source=${incoming ? remoteBranch : "HEAD"}`, "--staged", "--worktree", "--", `:(literal)${filePath}`]);
+      // Reapply this checkout's configured redaction to the selected complete
+      // version; restoring an index entry alone bypasses Git's clean filter.
+      git(repo, ["add", "--renormalize", "--", `:(literal)${filePath}`]);
+    }
+    manifest.paths.push({ path: filePath, kept: incoming ? branch : canonicalBranch, kept_at: write.time,
+      dropped: incoming ? canonicalBranch : branch, dropped_oid: (incoming ? ours : theirs)?.oid ?? null });
+    written.push(lwwWrittenTrailer(filePath, write));
+  }
+  const manifestDir = path.join(repo, ".sidecar-conflicts");
+  fs.mkdirSync(manifestDir, { recursive: true });
+  const manifestPath = path.join(manifestDir, `${timestamp}-${fileLabel(branch)}-lww.json`);
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  git(repo, ["add", "--", `:(literal)${path.relative(repo, manifestPath)}`]);
+  if (Object.keys(selectConflictPaths(unmergedPaths(repo), selectedPaths)).length) {
+    throw new SidecarError("last-writer-wins did not clear all unmerged paths");
+  }
+  console.log(`selected ${manifest.paths.length} complete file version(s) by last writer`);
+  return written;
+}
+
+type TreeEntry = { mode: string; oid: string };
+function entryKey(entry: TreeEntry | undefined): string {
+  return entry ? `${entry.mode}:${entry.oid}` : "~deleted";
+}
+function treeEntry(repo: string, ref: string, filePath: string): TreeEntry | undefined {
+  const records = gitBytes(repo, ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", ref, "--", filePath]).stdout.toString("utf8").split("\0");
+  for (const record of records) {
+    const separator = record.indexOf("\t");
+    if (separator < 0 || record.slice(separator + 1) !== filePath) continue;
+    const [mode, type, oid] = record.slice(0, separator).split(" ");
+    if (type === "tree") return undefined;
+    if (type !== "blob" || !["100644", "100755", "120000"].includes(mode)) {
+      throw new SidecarError(`cannot select unsupported Git entry ${mode} for ${filePath}`);
+    }
+    return { mode, oid };
+  }
+  return undefined;
+}
+
+function lwwTrailerPrefix(filePath: string): string {
+  return `sidecar-lww-${crypto.createHash("sha256").update(filePath).digest("hex")}:`;
+}
+type WriteEvent = { time: number; source: string };
+function lwwWrittenTrailer(filePath: string, write: WriteEvent): string {
+  return `${lwwTrailerPrefix(filePath)} ${write.time} ${write.source || "-"}`;
+}
+
+function selectConflictPaths<T>(conflicts: Record<string, T>, selectedPaths?: string[]): Record<string, T> {
+  if (!selectedPaths) return conflicts;
+  const selected = new Set(selectedPaths);
+  return Object.fromEntries(Object.entries(conflicts).filter(([filePath]) => selected.has(filePath)));
+}
+
+type LastWriterManifest = {
+  timestamp: string;
+  resolved_by: "lww";
+  source_branch: string;
+  paths: Array<{ path: string; kept: string; kept_at: number; dropped: string; dropped_oid: string | null }>;
+};
+
+/**
+ * When the path was last written on `ref`: the change time its snapshot
+ * recorded, or the time of the last commit touching it when that commit
+ * recorded none — a deletion, a snapshot too large for trailers, a commit
+ * made by hand. 0 when no commit on the ref touched the path.
+ */
+export function lastWriteAt(repo: string, ref: string, filePath: string): number {
+  return lastWriteEvent(repo, ref, filePath).time;
+}
+function lastWriteEvent(repo: string, ref: string, filePath: string): WriteEvent {
+  // First-parent history follows the selected tree rather than a discarded
+  // incoming version. Merge trailers carry the original clock, not the time
+  // at which Sidecar happened to synthesize the merge commit.
+  const format = "--format=%H%n%ct%n%B";
+  const result = git(repo, ["log", "--first-parent", "-1", format, ref, "--", `:(literal)${filePath}`]);
+  const [writeCommit = "", committed = "", ...body] = result.stdout.split("\n");
+  const prefix = lwwTrailerPrefix(filePath);
+  // Git can omit a merge from path history when it kept our identical blob.
+  // Search its explicit clock separately, then compare ancestry instead of
+  // commit dates (which can be skewed or intentionally backdated).
+  const metadata = git(repo, ["log", "--first-parent", "-1", "--fixed-strings", `--grep=${prefix}`, format, ref]);
+  const [metadataCommit = "", , ...metadataBody] = metadata.stdout.split("\n");
+  if (metadataCommit && (!writeCommit || isAncestor(repo, writeCommit, metadataCommit))) {
+    const carried = recordedLwwEvent(metadataBody, prefix);
+    if (carried !== undefined) return carried;
+  }
+  const carried = recordedLwwEvent(body, prefix);
+  if (carried !== undefined) return carried;
+  const suffix = ` ${filePath}`;
+  for (const line of body) {
+    if (!line.startsWith(WRITTEN_TRAILER) || !line.endsWith(suffix)) continue;
+    const seconds = Number(line.slice(WRITTEN_TRAILER.length, -suffix.length).trim());
+    if (Number.isInteger(seconds) && seconds > 0) return { time: seconds, source: writeCommit };
+  }
+  return { time: Number(committed.trim()) || 0, source: writeCommit };
+}
+function recordedLwwEvent(body: string[], prefix: string): WriteEvent | undefined {
+  const line = body.find((entry) => entry.startsWith(`${prefix} `));
+  if (!line) return undefined;
+  const [timestamp, source] = line.slice(prefix.length).trim().split(/\s+/);
+  const time = Number(timestamp);
+  return Number.isInteger(time) && time >= 0 && source ? { time, source: source === "-" ? "" : source } : undefined;
+}
 
 type ConflictVersion = {
   stage: number;
@@ -1095,21 +1464,40 @@ export function fileLabel(value: string): string {
   return slug(value).replaceAll("/", "-");
 }
 
-export function unmergedPaths(repo: string): Record<string, Record<number, string>> {
+type UnmergedEntry = { mode: string; oid: string };
+
+function unmergedEntries(repo: string): Record<string, Record<number, UnmergedEntry>> {
   const result = gitBytes(repo, ["ls-files", "-u", "-z"]);
-  const paths: Record<string, Record<number, string>> = {};
-  for (const record of result.stdout.toString("binary").split("\0")) {
+  // Git emits literal pathname bytes with -z. Reject invalid UTF-8 rather
+  // than resolve a different path after lossy decoding.
+  let output: string;
+  try {
+    output = new TextDecoder("utf-8", { fatal: true }).decode(result.stdout);
+  } catch {
+    throw new SidecarError("cannot resolve conflict paths that are not valid UTF-8");
+  }
+  const paths: Record<string, Record<number, UnmergedEntry>> = Object.create(null);
+  for (const record of output.split("\0")) {
     if (!record) continue;
     const separator = record.indexOf("\t");
     const meta = record.slice(0, separator);
     const rawPath = record.slice(separator + 1);
-    const parts = meta.split(/\s+/);
-    const oid = parts[1] ?? "";
-    const stage = Number(parts[2]);
+    const [mode, oid, stageText] = meta.split(" ");
+    const stage = Number(stageText);
+    if (separator < 0 || !rawPath || !mode || !oid || ![1, 2, 3].includes(stage)) {
+      throw new SidecarError("invalid unmerged index entry");
+    }
     paths[rawPath] ??= {};
-    paths[rawPath][stage] = oid;
+    paths[rawPath][stage] = { mode, oid };
   }
   return paths;
+}
+
+export function unmergedPaths(repo: string): Record<string, Record<number, string>> {
+  return Object.fromEntries(Object.entries(unmergedEntries(repo)).map(([filePath, stages]) => [
+    filePath,
+    Object.fromEntries(Object.entries(stages).map(([stage, entry]) => [stage, entry.oid])),
+  ]));
 }
 
 export function hasUnmergedPaths(repo: string): boolean {
@@ -1133,18 +1521,26 @@ export function showStage(repo: string, stage: number, conflictPath: string): Bu
  */
 export function pendingInboxBranches(repo: string, config: SidecarConfig): string[] {
   const prefix = inboxPrefix(config);
-  const local = refNames(repo, "refs/heads/").filter((branch) => matchesInboxPrefix(prefix, branch));
-  const claimed = new Set(local);
-  const remote = refNames(repo, "refs/remotes/origin/").filter((ref) => {
-    const branch = remoteBranchName(ref);
-    return ref !== "origin/HEAD" && matchesInboxPrefix(prefix, branch) && !claimed.has(branch);
-  });
-  return [...local, ...remote].sort();
-}
-
-function refNames(repo: string, namespace: string): string[] {
-  return git(repo, ["for-each-ref", "--format=%(refname:short)", namespace])
+  const refs = git(repo, [
+    "for-each-ref",
+    "--format=%(refname)",
+    "refs/heads/",
+    "refs/remotes/origin/",
+  ])
     .stdout.split(/\r?\n/)
     .map((ref) => ref.trim())
     .filter(Boolean);
+  const local = refs
+    .filter((ref) => ref.startsWith("refs/heads/"))
+    .map((ref) => ref.slice("refs/heads/".length))
+    .filter((branch) => matchesInboxPrefix(prefix, branch));
+  const claimed = new Set(local);
+  const remote = refs
+    .filter((ref) => ref.startsWith("refs/remotes/origin/"))
+    .map((ref) => ref.slice("refs/remotes/".length))
+    .filter((ref) => {
+      const branch = remoteBranchName(ref);
+      return ref !== "origin/HEAD" && matchesInboxPrefix(prefix, branch) && !claimed.has(branch);
+    });
+  return [...local, ...remote].sort();
 }

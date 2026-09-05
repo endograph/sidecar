@@ -1,6 +1,6 @@
 {
   "name": "sidecarsync",
-  "version": "1.4.0",
+  "version": "2.0.0",
   "description": "A Git-backed sidecar inbox for repo-local development metadata.",
   "license": "MIT",
   "repository": {
@@ -28,18 +28,22 @@
     "postinstall": "node scripts/postinstall.js",
     "prepack": "cp ../../README.md README.md && cp ../../LICENSE LICENSE && bun run build",
     "prepublishOnly": "bun run check",
-    "test": "bun run build && vitest run"
+    "test": "vitest run",
+    "test:integration": "bun run build && SIDECAR_INTEGRATION=1 vitest run"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
+    "@types/picomatch": "^4",
     "typescript": "^5.8.2",
     "vitest": "^3.0.8"
   },
   "dependencies": {
     "chokidar": "^4.0.3",
+    "ignore": "^7.0.8",
+    "picomatch": "^4.0.5",
     "smol-toml": "^1.7.0"
   }
 }
