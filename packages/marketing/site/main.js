@@ -114,7 +114,7 @@
     /* unreadable cache — fall through to the fetch */
   }
 
-  fetch('https://api.github.com/repos/anteprojector/sidecar')
+  fetch('https://api.github.com/repos/endograph/sidecar')
     .then(function (response) {
       return response.ok ? response.json() : Promise.reject(new Error(String(response.status)));
     })

@@ -159,7 +159,7 @@ async function draw() {
   ctx.fillText('sidecar', PAD, H - 52);
   ctx.fillStyle = MUTED;
   ctx.font = `400 22px ${MONO}`;
-  const url = 'anteprojector.github.io/sidecar';
+  const url = 'endograph.github.io/sidecar';
   ctx.fillText(url, W - PAD - ctx.measureText(url).width, H - 52);
 
   const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));

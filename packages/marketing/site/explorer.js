@@ -41,7 +41,7 @@
   var FONT_KEY = 'font-cycler-2';
   // Feedback on the shipped defaults lands as an issue, prefilled so the
   // reporter only has to name the combination they liked.
-  var ISSUE_URL = 'https://github.com/anteprojector/sidecar/issues/new?' +
+  var ISSUE_URL = 'https://github.com/endograph/sidecar/issues/new?' +
     'title=' + encodeURIComponent('Theme explorer: feedback') +
     '&labels=' + encodeURIComponent('feedback') +
     '&body=' + encodeURIComponent(

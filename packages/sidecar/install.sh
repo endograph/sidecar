@@ -1,6 +1,6 @@
 #!/bin/sh
 # sidecar installer
-#   curl -fsSL https://raw.githubusercontent.com/anteprojector/sidecar/main/packages/sidecar/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/endograph/sidecar/main/packages/sidecar/install.sh | sh
 #
 # Installs the global sidecar via npm today, and records "curl" as the install
 # source so future versions can switch distribution channels without breaking

@@ -5,7 +5,7 @@ Sidecar supports macOS and Linux. Windows is coming soon.
 The recommended setup is a single global install (`npm install -g sidecarsync`);
 it owns the background daemon that keeps every registered repo in sync (see
 [how syncing works](sync.md)). The install
-script (`curl -fsSL https://raw.githubusercontent.com/anteprojector/sidecar/main/packages/sidecar/install.sh | sh`)
+script (`curl -fsSL https://raw.githubusercontent.com/endograph/sidecar/main/packages/sidecar/install.sh | sh`)
 is equivalent — it runs the npm install for you after checking prerequisites.
 
 Each install path records its source (`npm`, `bun`, or `curl`) in sidecar's

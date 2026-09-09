@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const REPO = "anteprojector/sidecar";
+const REPO = "endograph/sidecar";
 const indexPath = path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), "site", "index.html");
 
 function format(count) {

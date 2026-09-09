@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/anteprojector/sidecar.git",
+    "url": "git+https://github.com/endograph/sidecar.git",
     "directory": "packages/sidecar"
   },
   "publishConfig": {
@@ -45,5 +45,9 @@
     "ignore": "^7.0.8",
     "picomatch": "^4.0.5",
     "smol-toml": "^1.7.0"
+  },
+  "homepage": "https://github.com/endograph/sidecar/tree/main/packages/sidecar#readme",
+  "bugs": {
+    "url": "https://github.com/endograph/sidecar/issues"
   }
 }

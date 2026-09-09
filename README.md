@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/anteprojector/sidecar/main/packages/marketing/branding/readme-hero.svg" alt="sidecar" width="420" />
+  <img src="https://raw.githubusercontent.com/endograph/sidecar/main/packages/marketing/branding/readme-hero.svg" alt="sidecar" width="420" />
 </p>
 
 <p align="center">
-  <a href="https://anteprojector.github.io/sidecar/">Website</a> ·
+  <a href="https://endograph.github.io/sidecar/">Website</a> ·
   <a href="#quickstart">Quickstart</a> ·
   <a href="docs/commands.md">Commands</a> ·
   <a href="https://www.npmjs.com/package/sidecarsync">npm</a>
@@ -11,7 +11,7 @@
 
 # sidecar
 
-[![CI](https://github.com/anteprojector/sidecar/actions/workflows/ci.yml/badge.svg)](https://github.com/anteprojector/sidecar/actions/workflows/ci.yml)
+[![CI](https://github.com/endograph/sidecar/actions/workflows/ci.yml/badge.svg)](https://github.com/endograph/sidecar/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/sidecarsync)](https://www.npmjs.com/package/sidecarsync)
 [![license](https://img.shields.io/npm/l/sidecarsync)](LICENSE)
 [![node](https://img.shields.io/node/v/sidecarsync)](https://nodejs.org)

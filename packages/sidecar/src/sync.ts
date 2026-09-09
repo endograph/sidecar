@@ -739,7 +739,7 @@ export function bootstrapMainBranch(repo: string, config: SidecarConfig): void {
 
 Scratch space for a code repository: plans, notes, and agent context.
 This is a plain git repo you own — read it, edit it, clone it anywhere.
-Kept in sync by [sidecar](https://github.com/anteprojector/sidecar).
+Kept in sync by [sidecar](https://github.com/endograph/sidecar).
 `,
     "utf8",
   );

@@ -11,7 +11,7 @@ export const EndCard: React.FC<{
 }> = ({
   title,
   install = 'npm i -g sidecarsync',
-  url = 'anteprojector.github.io/sidecar',
+  url = 'endograph.github.io/sidecar',
 }) => (
   <AbsoluteFill
     style={{
