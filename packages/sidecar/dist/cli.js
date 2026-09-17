@@ -5209,7 +5209,8 @@ function resolveLastWriterWins(repo, canonicalBranch, remoteBranch, selectedPath
     const oursChanged = oursWrite.source !== baseWrite.source;
     const theirsChanged = theirsWrite.source !== baseWrite.source;
     const incoming = oursChanged !== theirsChanged ? theirsChanged : theirsAt > oursAt || theirsAt === oursAt && entryKey(theirs) > entryKey(ours);
-    return { filePath, ours, theirs, incoming, winner: incoming ? theirs : ours, write: incoming ? theirsWrite : oursWrite };
+    const conflict = oursChanged && theirsChanged && entryKey(ours) !== entryKey(theirs);
+    return { filePath, ours, theirs, incoming, conflict, winner: incoming ? theirs : ours, write: incoming ? theirsWrite : oursWrite };
   });
   const selected = new Set(selections.map((entry) => entry.filePath));
   const indexed = new Set(git(repo, ["ls-files", "-z"]).stdout.split("\x00").filter(Boolean));
@@ -5229,30 +5230,33 @@ function resolveLastWriterWins(repo, canonicalBranch, remoteBranch, selectedPath
     }
   }
   const written = [];
-  for (const { filePath, ours, theirs, incoming, winner, write } of selections) {
+  for (const { filePath, ours, theirs, incoming, conflict, winner, write } of selections) {
     if (winner) {
       git(repo, ["restore", `--source=${incoming ? remoteBranch : "HEAD"}`, "--staged", "--worktree", "--", `:(literal)${filePath}`]);
       git(repo, ["add", "--renormalize", "--", `:(literal)${filePath}`]);
     }
-    manifest.paths.push({
-      path: filePath,
-      kept: incoming ? branch : canonicalBranch,
-      kept_at: write.time,
-      dropped: incoming ? canonicalBranch : branch,
-      dropped_oid: (incoming ? ours : theirs)?.oid ?? null
-    });
+    if (conflict)
+      manifest.paths.push({
+        path: filePath,
+        kept: incoming ? branch : canonicalBranch,
+        kept_at: write.time,
+        dropped: incoming ? canonicalBranch : branch,
+        dropped_oid: (incoming ? ours : theirs)?.oid ?? null
+      });
     written.push(lwwWrittenTrailer(filePath, write));
   }
-  const manifestDir = path8.join(repo, ".sidecar-conflicts");
-  fs8.mkdirSync(manifestDir, { recursive: true });
-  const manifestPath = path8.join(manifestDir, `${timestamp}-${fileLabel(branch)}-lww.json`);
-  fs8.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}
+  if (manifest.paths.length) {
+    const manifestDir = path8.join(repo, ".sidecar-conflicts");
+    fs8.mkdirSync(manifestDir, { recursive: true });
+    const manifestPath = path8.join(manifestDir, `${timestamp}-${fileLabel(branch)}-lww.json`);
+    fs8.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}
 `, "utf8");
-  git(repo, ["add", "--", `:(literal)${path8.relative(repo, manifestPath)}`]);
+    git(repo, ["add", "--", `:(literal)${path8.relative(repo, manifestPath)}`]);
+  }
   if (Object.keys(selectConflictPaths(unmergedPaths(repo), selectedPaths)).length) {
     throw new SidecarError("last-writer-wins did not clear all unmerged paths");
   }
-  console.log(`selected ${manifest.paths.length} complete file version(s) by last writer`);
+  console.log(`selected ${selections.length} complete file version(s) by last writer`);
   return written;
 }
 function entryKey(entry) {

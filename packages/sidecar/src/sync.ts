@@ -1309,7 +1309,10 @@ export function resolveLastWriterWins(
     const theirsChanged = theirsWrite.source !== baseWrite.source;
     const incoming = oursChanged !== theirsChanged ? theirsChanged
       : theirsAt > oursAt || (theirsAt === oursAt && entryKey(theirs) > entryKey(ours));
-    return { filePath, ours, theirs, incoming, winner: incoming ? theirs : ours, write: incoming ? theirsWrite : oursWrite };
+    // Reverts still compete: compare source events to the base, and complete
+    // parent entries to each other (including modes and absence).
+    const conflict = oursChanged && theirsChanged && entryKey(ours) !== entryKey(theirs);
+    return { filePath, ours, theirs, incoming, conflict, winner: incoming ? theirs : ours, write: incoming ? theirsWrite : oursWrite };
   });
   // Independently selected files cannot occupy both an ancestor path and its
   // descendant. Fail before changing the index rather than erase a winner.
@@ -1335,26 +1338,30 @@ export function resolveLastWriterWins(
     }
   }
   const written: string[] = [];
-  for (const { filePath, ours, theirs, incoming, winner, write } of selections) {
+  for (const { filePath, ours, theirs, incoming, conflict, winner, write } of selections) {
     if (winner) {
       git(repo, ["restore", `--source=${incoming ? remoteBranch : "HEAD"}`, "--staged", "--worktree", "--", `:(literal)${filePath}`]);
       // Reapply this checkout's configured redaction to the selected complete
       // version; restoring an index entry alone bypasses Git's clean filter.
       git(repo, ["add", "--renormalize", "--", `:(literal)${filePath}`]);
     }
-    manifest.paths.push({ path: filePath, kept: incoming ? branch : canonicalBranch, kept_at: write.time,
+    // Applying a causal update (or accepting identical versions) loses no
+    // competing content. Keep its write provenance, but don't report a conflict.
+    if (conflict) manifest.paths.push({ path: filePath, kept: incoming ? branch : canonicalBranch, kept_at: write.time,
       dropped: incoming ? canonicalBranch : branch, dropped_oid: (incoming ? ours : theirs)?.oid ?? null });
     written.push(lwwWrittenTrailer(filePath, write));
   }
-  const manifestDir = path.join(repo, ".sidecar-conflicts");
-  fs.mkdirSync(manifestDir, { recursive: true });
-  const manifestPath = path.join(manifestDir, `${timestamp}-${fileLabel(branch)}-lww.json`);
-  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  git(repo, ["add", "--", `:(literal)${path.relative(repo, manifestPath)}`]);
+  if (manifest.paths.length) {
+    const manifestDir = path.join(repo, ".sidecar-conflicts");
+    fs.mkdirSync(manifestDir, { recursive: true });
+    const manifestPath = path.join(manifestDir, `${timestamp}-${fileLabel(branch)}-lww.json`);
+    fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    git(repo, ["add", "--", `:(literal)${path.relative(repo, manifestPath)}`]);
+  }
   if (Object.keys(selectConflictPaths(unmergedPaths(repo), selectedPaths)).length) {
     throw new SidecarError("last-writer-wins did not clear all unmerged paths");
   }
-  console.log(`selected ${manifest.paths.length} complete file version(s) by last writer`);
+  console.log(`selected ${selections.length} complete file version(s) by last writer`);
   return written;
 }
 

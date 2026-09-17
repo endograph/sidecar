@@ -38,6 +38,10 @@ function clock(name: string, time: number, source = "selected-source"): string {
   return `sidecar-lww-${crypto.createHash("sha256").update(name).digest("hex")}: ${time} ${source}`;
 }
 function commits(): string[] { return vi.mocked(git).mock.calls.filter(([, args]) => args[0] === "commit").map(([, args]) => args[2]); }
+function reports(): Array<{ paths: Array<{ path: string; kept: string; kept_at: number; dropped: string; dropped_oid: string | null }> }> {
+  const dir = path.join(root, ".sidecar-conflicts");
+  return fs.existsSync(dir) ? fs.readdirSync(dir).map((name) => JSON.parse(fs.readFileSync(path.join(dir, name), "utf8"))) : [];
+}
 beforeEach(() => {
   vi.resetAllMocks();
   root = fs.mkdtempSync(path.join(os.tmpdir(), "sidecar-lww-unit-"));
@@ -84,6 +88,7 @@ describe("whole-file last writer wins", () => {
     expect(commits()).toHaveLength(1);
     expect(commits()[0]).toContain(clock("state.json", 200, "origin/inbox-write"));
     expect(git).toHaveBeenCalledWith(root, ["add", "--renormalize", "--", ":(literal)state.json"]);
+    expect(reports()[0].paths.map(({ path }) => path)).toEqual(["state.json"]);
   });
 
   test("preserves a one-sided causal update despite an older copied mtime", () => {
@@ -92,27 +97,92 @@ describe("whole-file last writer wins", () => {
     mergeInboxBranch(root, config, incoming, { forkFiles: false });
     expect(index.get("state.json")).toEqual(entry("new-update-old-mtime"));
     expect(commits()[0]).toContain(clock("state.json", 100, "origin/inbox-write"));
+    expect(reports()).toEqual([]);
+  });
+
+  test.each(["HEAD", incoming])("one-sided additions, edits, deletions and modes on %s do not create conflict reports", (writer) => {
+    const unchanged = writer === "HEAD" ? incoming : "HEAD";
+    for (const [name, before, after] of [
+      ["added", undefined, entry("new")],
+      ["edited", entry("old"), entry("new")],
+      ["deleted", entry("old"), undefined],
+      ["mode", entry("script"), entry("script", "100755")],
+    ] as const) {
+      write(unchanged, name, before, before ? 300 : 0, false);
+      if (!before) {
+        times.get(unchanged)!.delete(name);
+        times.get("base")!.delete(name);
+      }
+      write(writer, name, after, 100);
+    }
+    mergeInboxBranch(root, config, incoming, { forkFiles: false });
+    expect(index.get("added")).toEqual(entry("new"));
+    expect(index.get("edited")).toEqual(entry("new"));
+    expect(index.has("deleted")).toBe(false);
+    expect(index.get("mode")).toEqual(entry("script", "100755"));
+    expect(fs.existsSync(path.join(root, ".sidecar-conflicts"))).toBe(false);
+    expect(vi.mocked(git).mock.calls.some(([, args]) => args[0] === "add" && args.at(-1)!.includes(".sidecar-conflicts/"))).toBe(false);
+    for (const name of ["added", "edited", "deleted", "mode"]) expect(commits()[0]).toContain(clock(name, 100, `${writer}-write`));
+  });
+
+  test("identical concurrent versions retain the newer clock without a conflict report", () => {
+    for (const [name, value] of [["same", entry("identical")], ["executable", entry("script", "100755")], ["link", entry("target", "120000")], ["gone", undefined]] as const) {
+      write("HEAD", name, value, 100);
+      write(incoming, name, value, 200);
+    }
+    mergeInboxBranch(root, config, incoming, { forkFiles: false });
+    expect(reports()).toEqual([]);
+    expect(index.get("same")).toEqual(entry("identical"));
+    expect(index.has("gone")).toBe(false);
+    for (const name of ["same", "executable", "link", "gone"]) expect(commits()[0]).toContain(clock(name, 200, "origin/inbox-write"));
   });
 
   test("an explicit revert counts as a newer concurrent write", () => {
+    write("base", "state.json", entry("same-as-base-after-revert"), 50);
     write("HEAD", "state.json", entry("same-as-base-after-revert"), 200);
     write(incoming, "state.json", entry("other-change"), 150);
     mergeInboxBranch(root, config, incoming, { forkFiles: false });
     expect(index.get("state.json")).toEqual(entry("same-as-base-after-revert"));
+    expect(reports()[0].paths).toEqual([{
+      path: "state.json", kept: "main", kept_at: 200, dropped: "inbox", dropped_oid: "other-change",
+    }]);
+    expect(commits()[0]).toContain(clock("state.json", 200, "HEAD-write"));
   });
 
-  test("selects complete additions and winning deletions", () => {
+  test("a mixed merge reports only competing versions and preserves every selected clock", () => {
     write("HEAD", "added", undefined, 0, false);
     write(incoming, "added", entry("new"), 100);
     write("HEAD", "deleted", entry("old"), 100);
     write(incoming, "deleted", undefined, 200);
     write("HEAD", "keep", entry("newer"), 300);
     write(incoming, "keep", undefined, 200);
+    write("HEAD", "same", entry("identical"), 100);
+    write(incoming, "same", entry("identical"), 200);
     mergeInboxBranch(root, config, incoming, { forkFiles: false });
     expect(index.get("added")).toEqual(entry("new"));
     expect(index.has("deleted")).toBe(false);
     expect(index.get("keep")).toEqual(entry("newer"));
     expect(git).toHaveBeenCalledWith(root, ["rm", "-f", "--ignore-unmatch", "--", ":(literal)deleted"]);
+    expect(reports()).toHaveLength(1);
+    expect(reports()[0].paths).toEqual([
+      { path: "deleted", kept: "inbox", kept_at: 200, dropped: "main", dropped_oid: "old" },
+      { path: "keep", kept: "main", kept_at: 300, dropped: "inbox", dropped_oid: null },
+    ]);
+    for (const [name, time, source] of [["added", 100, "origin/inbox-write"], ["deleted", 200, "origin/inbox-write"],
+      ["keep", 300, "HEAD-write"], ["same", 200, "origin/inbox-write"]] as const) {
+      expect(commits()[0]).toContain(clock(name, time, source));
+    }
+  });
+
+  test.each(["100755", "120000"])("reports competing modes even when both parents have the same blob (%s)", (mode) => {
+    write("HEAD", "file", entry("same-blob"), 100);
+    write(incoming, "file", entry("same-blob", mode), 200);
+    mergeInboxBranch(root, config, incoming, { forkFiles: false });
+    expect(index.get("file")).toEqual(entry("same-blob", mode));
+    expect(reports()[0].paths).toEqual([{
+      path: "file", kept: "inbox", kept_at: 200, dropped: "main", dropped_oid: "same-blob",
+    }]);
+    expect(commits()[0]).toContain(clock("file", 200, "origin/inbox-write"));
   });
 
   test("uses deterministic entry ties and deletion wins an equal-time tie", () => {
@@ -158,6 +228,7 @@ describe("whole-file last writer wins", () => {
     mergeInboxBranch(root, config, incoming, { forkFiles: false });
     expect(index.has("item")).toBe(false);
     expect(index.get("item/child")).toEqual(entry("child"));
+    expect(reports()).toEqual([]);
     expect(git).not.toHaveBeenCalledWith(root, ["rm", "-f", "--ignore-unmatch", "--", ":(literal)item"]);
   });
 
@@ -218,16 +289,46 @@ describe("write-time provenance", () => {
     expect(lastWriteAt(root, "HEAD", "state.json")).toBe(50);
   });
 
-  test("discarded historical writes do not turn a causal update into a timestamp contest", () => {
-    write("HEAD", "state.json", entry("base-version"), 200);
-    write(incoming, "state.json", entry("causal-update-old-mtime"), 100);
+  test.each(["HEAD", incoming])("discarded historical writes on %s do not turn a causal update into a conflict", (unchanged) => {
+    const writer = unchanged === "HEAD" ? incoming : "HEAD";
+    write(unchanged, "state.json", entry("base-version"), 200);
+    write(writer, "state.json", entry("causal-update-old-mtime"), 100);
     times.get("base")!.set("state.json", "base-write\n200\nwritten: 200 state.json\n");
-    times.get("HEAD")!.set("state.json", "base-write\n200\nwritten: 200 state.json\n");
-    metadata.set("HEAD", `discarded-old-write-merge\n900\n${clock("state.json", 200, "base-write")}\n`);
+    times.get(unchanged)!.set("state.json", "base-write\n200\nwritten: 200 state.json\n");
+    metadata.set(unchanged, `discarded-old-write-merge\n900\n${clock("state.json", 200, "base-write")}\n`);
     ancestors.add("base-write:discarded-old-write-merge");
     mergeInboxBranch(root, config, incoming, { forkFiles: false });
     expect(index.get("state.json")).toEqual(entry("causal-update-old-mtime"));
-    expect(commits()[0]).toContain(clock("state.json", 100, "origin/inbox-write"));
+    expect(commits()[0]).toContain(clock("state.json", 100, `${writer}-write`));
+    expect(reports()).toEqual([]);
+  });
+
+  test.each(["HEAD", incoming])("compares %s with the merge base's carried event, not its merge commit", (writer) => {
+    const unchanged = writer === "HEAD" ? incoming : "HEAD";
+    write(unchanged, "state.json", entry("accepted-base"), 200, false);
+    for (const ref of ["base", unchanged]) {
+      metadata.set(ref, `base-merge\n900\n${clock("state.json", 200, "accepted-write")}\n`);
+    }
+    ancestors.add("base-write:base-merge");
+    write(writer, "state.json", entry("causal-update"), 100);
+    mergeInboxBranch(root, config, incoming, { forkFiles: false });
+    expect(index.get("state.json")).toEqual(entry("causal-update"));
+    expect(commits()[0]).toContain(clock("state.json", 100, `${writer}-write`));
+    expect(reports()).toEqual([]);
+  });
+
+  test("discarded edits on both sides keep the base event without reporting a conflict", () => {
+    times.get("base")!.set("state.json", "base-write\n200\nwritten: 200 state.json\n");
+    for (const ref of ["HEAD", incoming]) {
+      write(ref, "state.json", entry("accepted-base"), 100);
+      times.get(ref)!.set("state.json", "base-write\n200\nwritten: 200 state.json\n");
+      metadata.set(ref, `${ref}-merge\n900\n${clock("state.json", 200, "base-write")}\n`);
+      ancestors.add(`base-write:${ref}-merge`);
+    }
+    mergeInboxBranch(root, config, incoming, { forkFiles: false });
+    expect(index.get("state.json")).toEqual(entry("accepted-base"));
+    expect(commits()[0]).toContain(clock("state.json", 200, "base-write"));
+    expect(reports()).toEqual([]);
   });
 
   test("a carried deletion clock survives merges whose first parent already lacked the file", () => {
