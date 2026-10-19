@@ -48,9 +48,12 @@ import {
   peerFileName,
   readConfig,
   resolveSidecarPath,
+  configText,
   durationConfigValue,
+  notePeerPolicy,
   redactionModeConfigValue,
   resolveModeConfigValue,
+  reviewModeConfigValue,
   selectedPeer,
   validateBranch,
   validateInboxTemplate,
@@ -64,6 +67,7 @@ import { cloneOrUpdate, removeRedactionFilter, syncProject } from "./sync.js";
 import { announcePeer, promptLine, promptYesNo, promptYesNoDefaultNo } from "./ui.js";
 import { DEFAULT_REDACTION_MODE, REDACTION_MODES, type RedactionMode } from "./redaction.js";
 import { peerRulesFileName, peerRulesPath, readRules, rulesMayRedact } from "./rules.js";
+import { peerReviewGuidelinesFileName, peerReviewGuidelinesPath, pruneOrphanedReviews } from "./review.js";
 
 export function cmdDeinit(args: string[]): number {
   const parsed = parseOptions(args, { boolean: new Set(["--yes", "-y"]), value: new Set(["--peer"]) });
@@ -148,6 +152,8 @@ export function cmdDeinit(args: string[]): number {
     }
     fs.rmSync(configPath, { force: true });
     fs.rmSync(peerRulesPath(root, name), { force: true });
+    fs.rmSync(peerReviewGuidelinesPath(root, name), { force: true });
+    pruneOrphanedReviews();
     unregisterInstance(configPath);
   });
 
@@ -221,11 +227,11 @@ function removeCheckout(checkoutPath: string): void {
 export function cmdInit(args: string[]): number {
   const parsed = parseOptions(args, {
     boolean: new Set(["--no-clone", "--no-bootstrap-main", "--local-install", "--ignored"]),
-    value: new Set(["--path", "--branch", "--inbox", "--redaction", "--resolve", "--debounce", "--interval", "--peer"]),
+    value: new Set(["--path", "--branch", "--inbox", "--redaction", "--resolve", "--review", "--review-timeout", "--debounce", "--interval", "--peer"]),
   });
   if (parsed.positional.length > 1) {
     throw new SidecarError(
-      "usage: sidecar init [remote] [--peer name] [--path sidecar] [--branch main] [--inbox template] [--redaction mode] [--resolve fork|lww] [--debounce 10m] [--interval 1h] [--ignored]",
+      "usage: sidecar init [remote] [--peer name] [--path sidecar] [--branch main] [--inbox template] [--redaction mode] [--resolve fork|lww] [--review off|required] [--review-timeout 1h] [--debounce 10m] [--interval 1h] [--ignored]",
     );
   }
 
@@ -284,23 +290,17 @@ export function cmdInit(args: string[]): number {
 function configurePeer(root: string, name: string, remote: string | undefined, parsed: ParsedOptions): Peer {
   const configPath = peerConfigPath(root, name);
   let reuse = !remote && fs.existsSync(configPath);
+  let built: SidecarConfig | undefined;
   if (remote && fs.existsSync(configPath)) {
     const existing = readConfig(configPath);
-    // Omitted flags fall back to the EXISTING values, not the defaults — a
-    // plain re-init must not read as a request to reset settings (a non-TTY
-    // re-init would fail, and a prompted "y" would silently flip redaction).
-    const unchanged =
-      existing.remote === remote &&
-      existing.path === getValue(parsed, "--path", existing.path) &&
-      existing.branch === getValue(parsed, "--branch", existing.branch) &&
-      existing.inbox === getValue(parsed, "--inbox", existing.inbox) &&
-      existing.redaction === getValue(parsed, "--redaction", existing.redaction) &&
-      existing.resolve === getValue(parsed, "--resolve", existing.resolve) &&
-      existing.debounce === durationConfigValue(parsed.values.get("--debounce") ?? existing.debounce, "--debounce") &&
-      existing.interval === durationConfigValue(parsed.values.get("--interval") ?? existing.interval, "--interval");
-    reuse = unchanged || !promptOverwriteConfig(configPath, existing.remote, remote);
+    // Omitted flags keep the EXISTING values, not the defaults: a re-init
+    // changes only what it names. Anything else would silently flip
+    // redaction, or drop a review gate, on a prompted "y".
+    built = buildInitConfig(root, name, remote, parsed, existing);
+    reuse = configText(built) === configText(existing) || !promptOverwriteConfig(configPath, existing.remote, remote);
   }
-  const config = reuse ? readConfig(configPath) : buildInitConfig(root, name, remote, parsed);
+  const config = reuse ? readConfig(configPath) : built ?? buildInitConfig(root, name, remote, parsed);
+  notePeerPolicy(config);
   if (!reuse) {
     config.rulesPath = peerRulesPath(root, name);
     config.rules = readRules(config.rulesPath);
@@ -312,7 +312,7 @@ function configurePeer(root: string, name: string, remote: string | undefined, p
     if (isStandalone(config)) {
       throw new SidecarError("--ignored cannot apply to a standalone sidecar: its .sidecar is part of the tree it syncs");
     }
-    for (const file of [peerFileName(name), peerRulesFileName(name)]) {
+    for (const file of [peerFileName(name), peerRulesFileName(name), peerReviewGuidelinesFileName(name)]) {
       if (isGitTracked(root, file)) {
         throw new SidecarError(`${file} is tracked by git; \`git rm --cached ${file}\` before ignoring it`);
       }
@@ -355,9 +355,11 @@ function excludePeerFile(root: string, name: string): void {
     throw new SidecarError(`--ignored needs a git exclude file, and ${root} has none; ignore ${configFile} in your own VCS config`);
   }
   const rulesFile = peerRulesFileName(name);
+  const guidelinesFile = peerReviewGuidelinesFileName(name);
   ensureIgnoreLine(exclude, `/${configFile}`);
   ensureIgnoreLine(exclude, `/${rulesFile}`);
-  console.log(`ignored ${configFile} and ${rulesFile} via .git/info/exclude`);
+  ensureIgnoreLine(exclude, `/${guidelinesFile}`);
+  console.log(`ignored ${configFile}, ${rulesFile}, and ${guidelinesFile} via .git/info/exclude`);
 }
 
 /**
@@ -386,13 +388,19 @@ function initRoot(remote: string | undefined, parsed: ParsedOptions): string {
 // Question order matters: the checkout path decides whether this is a
 // standalone sidecar, and that in turn changes the default answer to both of
 // the questions after it.
-function buildInitConfig(root: string, name: string, remote: string | undefined, parsed: ParsedOptions): SidecarConfig {
+function buildInitConfig(
+  root: string,
+  name: string,
+  remote: string | undefined,
+  parsed: ParsedOptions,
+  existing?: SidecarConfig,
+): SidecarConfig {
   // A named peer's checkout is named after it by default: `--peer research`
   // lives in `research/`, beside the default peer's `sidecar/`.
   const defaultPath = name === DEFAULT_PEER ? DEFAULT_PATH : name;
   const rawPath = parsed.values.has("--path")
     ? getValue(parsed, "--path", defaultPath)
-    : promptSidecarPath(root, name, defaultPath);
+    : existing?.path ?? promptSidecarPath(root, name, defaultPath);
   // `--path $PWD` and `--path foo/..` mean the same thing as `--path .`;
   // store them as "." so standalone detection — a string check on the config
   // — can't be dodged by spelling the root differently and land the repo in
@@ -410,16 +418,18 @@ function buildInitConfig(root: string, name: string, remote: string | undefined,
     remote: remote ?? (standalone ? standaloneRemote(root) : promptRemote(root)),
     version: 1,
     path: sidecarPath,
-    branch: getValue(parsed, "--branch", DEFAULT_BRANCH),
-    inbox: getValue(parsed, "--inbox", DEFAULT_INBOX),
+    branch: getValue(parsed, "--branch", existing?.branch ?? DEFAULT_BRANCH),
+    inbox: getValue(parsed, "--inbox", existing?.inbox ?? DEFAULT_INBOX),
     redaction: parsed.values.has("--redaction")
       ? redactionModeConfigValue(getValue(parsed, "--redaction", DEFAULT_REDACTION_MODE), "--redaction")
-      : promptRedactionMode(),
+      : existing?.redaction ?? promptRedactionMode(),
     resolve: parsed.values.has("--resolve")
       ? resolveModeConfigValue(getValue(parsed, "--resolve", DEFAULT_RESOLVE), "--resolve")
-      : DEFAULT_RESOLVE,
-    debounce: durationConfigValue(parsed.values.get("--debounce"), "--debounce"),
-    interval: durationConfigValue(parsed.values.get("--interval"), "--interval"),
+      : existing?.resolve ?? DEFAULT_RESOLVE,
+    debounce: durationConfigValue(parsed.values.get("--debounce"), "--debounce") ?? existing?.debounce,
+    interval: durationConfigValue(parsed.values.get("--interval"), "--interval") ?? existing?.interval,
+    review: reviewModeConfigValue(getValue(parsed, "--review", existing?.review ?? "off"), "--review"),
+    reviewTimeout: durationConfigValue(parsed.values.get("--review-timeout"), "--review-timeout") ?? existing?.reviewTimeout,
   };
 }
 

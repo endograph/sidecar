@@ -6,12 +6,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { paint } from "./color.js";
-import { SidecarError, currentHost, currentUser, nowIso, realpathOr, slug, utcTimestamp } from "./util.js";
+import { SidecarError, currentMachine, currentUser, nowIso, realpathOr, slug, utcTimestamp } from "./util.js";
 import {
   branchExists,
+  emptyTree,
   ensureClean,
   ensureCommitIdentity,
   familyPrimaryRoot,
@@ -26,24 +26,42 @@ import {
   isAncestor,
   isDirty,
   remoteRefExists,
+  sidecarIdentity,
+  treeOf,
 } from "./git.js";
-import { packageVersion } from "./install.js";
+import { packageVersion, sidecarCliPath } from "./install.js";
 import {
   DEFAULT_PEER,
+  PUBLIC_REFS,
   type SidecarConfig,
   checkoutRandom,
   expandInbox,
   inboxPrefix,
   isStandalone,
+  loadPeer,
   matchesInboxPrefix,
   peerConfigPath,
+  peerFileName,
   readConfig,
   redactionModeConfigValue,
   remoteBranchName,
   requireSidecarCheckout,
   resolveSidecarPath,
+  reviewRequired,
 } from "./config.js";
-import { logSidecarEvent } from "./state.js";
+import { logSidecarEvent, readSettings } from "./state.js";
+import {
+  type Review,
+  type ReviewRecord,
+  createReview,
+  isOpen,
+  launchReviewer,
+  markPublished,
+  markPublishing,
+  markSuperseded,
+  openReview,
+  reviewAttention,
+} from "./review.js";
 import { readRules, resolveFileRules, rulesFingerprint, type SidecarRules } from "./rules.js";
 import {
   HEALTH_FILE,
@@ -66,14 +84,12 @@ import {
   redactText,
 } from "./redaction.js";
 
-// An env var rather than a flag so the daemon can request soft syncs from
-// older pinned project-local CLIs, which ignore it instead of rejecting an
-// unknown option.
-export const SOFT_SYNC_ENV = "SIDECAR_SYNC_SOFT";
-// Likewise a variable rather than a flag: the daemon settles this machine far
-// more often than it talks to the remote, and a pinned older CLI has to be able
-// to ignore the request instead of rejecting an option it never heard of.
-export const LOCAL_SYNC_ENV = "SIDECAR_SYNC_LOCAL";
+/**
+ * What a sync left undone on purpose. `held` is a review-gated peer whose
+ * unpublished work is waiting on a review; `attention` says why a person is
+ * needed, when one is.
+ */
+export type SyncOutcome = { held?: { review: Review; attention?: string } };
 
 /**
  * A sync in two phases, local first. Runs inside the repo's sync lock —
@@ -91,7 +107,7 @@ export function syncProject(
   root: string,
   config: SidecarConfig,
   options: { snapshot: boolean; remote: boolean; message?: string; onStage?: (stage: string) => void },
-): void {
+): SyncOutcome {
   const stage = (name: string): void => options.onStage?.(name);
 
   stage("checkout");
@@ -104,6 +120,7 @@ export function syncProject(
   if (!options.remote && !hasAnyCommit(sidecarPath)) {
     throw new SidecarError(`local sync requires an initialized sidecar checkout at ${sidecarPath}; run \`sidecar sync\` first`);
   }
+  bindReviewPolicy(sidecarPath, config);
   const inbox = expandInbox(config, sidecarPath);
   ensureCommitIdentity(sidecarPath);
   ensureRedactionFilter(sidecarPath, config.redaction, config);
@@ -127,7 +144,8 @@ export function syncProject(
     stage("settle");
     settleCheckouts(sidecarPath, config, inbox, siblings);
   }
-  if (!options.remote) return;
+  if (!options.remote) return {};
+  if (reviewRequired(config)) return publishReviewed(root, sidecarPath, config, inbox, siblings, stage);
 
   stage("push-inbox");
   syncBranchBeforePush(sidecarPath, inbox, config);
@@ -136,6 +154,456 @@ export function syncProject(
   mergeInboxBranches(sidecarPath, config, { forkFiles: true, push: true, remote: true });
   stage("settle-remote");
   settleCheckouts(sidecarPath, config, inbox, siblings);
+  return {};
+}
+
+// ---------------------------------------------------------------------------
+// Review-gated publishing
+//
+// A peer with `review = "required"` never pushes its own history: snapshots
+// stay on this machine, and so does every intermediate state they recorded,
+// including one a reviewer rejected. What leaves is one commit per approved
+// review, whose tree is the tree the reviewer saw, on top of the public
+// commit the review measured from. Everything the canonical merge combines is
+// already public, so its push can carry nothing unreviewed either.
+//
+// The unit of review is the repo family's local main, not one checkout:
+// sibling checkouts share it, settle onto it within seconds, unreviewed, and
+// so publish exactly what it holds. Reviewing it once means a rejection holds
+// every sibling, and two siblings never race the same content to the remote.
+// Local main is never reset for a gated peer (see ensureMainBranch), and each
+// publish is joined to it by a link merge (see linkPublished), which is what
+// keeps later merges free of conflicts the edits never had.
+//
+// "Already public" means PUBLIC_REFS: the remote's branches as fetchPublic
+// last saw them, inside withPublicGit. remotes/origin/* is local state any
+// hook or tool can write, so a gated peer's public base, publish parents, and
+// canonical merge inputs never come from it.
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs `fn` with git confined to what a reviewer saw. Anything this checkout's
+ * own git setup can add to a published commit or push is switched off for the
+ * duration, because none of it is in the packet:
+ *
+ * - identity: author and committer are sidecar's own, whatever config or
+ *   environment says, and commits are never signed and always UTF-8;
+ * - replacement objects: a `git replace` would make the packet show one blob
+ *   while the published tree holds another;
+ * - hooks, which can add files or message text to a commit, or forge refs;
+ * - rerere, which can replay a recorded local resolution into a merge;
+ * - configured push options, which reach the remote's hooks;
+ * - attributes: they are read from the empty tree, so no `.gitattributes` —
+ *   public, or pulled in by any include — selects a merge driver, filter, or
+ *   line-ending conversion. Only sidecar's own `info/attributes` applies,
+ *   whose redaction filter is pinned to its known command; drivers and
+ *   filters defined in config are neutralized as well, in case.
+ *
+ * Settings travel as environment config, replacing any the caller had in
+ * force (which would otherwise outrank them); sync is synchronous, so the
+ * environment is this call's alone.
+ */
+function withPublicGit<T>(repo: string, fn: () => T): T {
+  assertRedactionFilterIntact(repo);
+  const { name, email } = sidecarIdentity();
+  const overrides: Array<[string, string]> = [
+    ["core.hooksPath", os.devNull],
+    ["core.attributesFile", os.devNull],
+    ["core.autocrlf", "false"],
+    ["commit.gpgSign", "false"],
+    ["tag.gpgSign", "false"],
+    ["i18n.commitEncoding", "UTF-8"],
+    ["rerere.enabled", "false"],
+    ["rerere.autoUpdate", "false"],
+    ["merge.renormalize", "false"],
+    ["merge.default", "text"],
+    ["push.pushOption", ""],
+    ["push.followTags", "false"],
+    ...neutralizedDrivers(repo),
+  ];
+  const env: Record<string, string | undefined> = {
+    GIT_AUTHOR_NAME: name,
+    GIT_AUTHOR_EMAIL: email,
+    GIT_COMMITTER_NAME: name,
+    GIT_COMMITTER_EMAIL: email,
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_ATTR_SOURCE: emptyTree(repo),
+    GIT_CONFIG_PARAMETERS: undefined,
+    GIT_CONFIG_COUNT: String(overrides.length),
+  };
+  overrides.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${index}`] = key;
+    env[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
+
+  const saved = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  const apply = (values: Record<string, string | undefined>): void => {
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  apply(env);
+  try {
+    return fn();
+  } finally {
+    apply(saved);
+  }
+}
+
+/** Overrides that turn every merge driver and filter in config, except redaction, into git's own no-ops. */
+function neutralizedDrivers(repo: string): Array<[string, string]> {
+  const keys = git(repo, ["config", "--name-only", "--get-regexp", "^(merge|filter)\\..+\\.(driver|clean|smudge|process)$"], { check: false })
+    .stdout.split("\n").filter(Boolean);
+  return keys.flatMap((key): Array<[string, string]> => {
+    const [section, ...rest] = key.split(".");
+    const driver = rest.slice(0, -1).join(".");
+    if (section === "merge") return [[`merge.${driver}.driver`, "git merge-file --marker-size=%L %A %O %B"]];
+    if (driver === REDACTION_FILTER_NAME) return [];
+    return [[`filter.${driver}.clean`, "cat"], [`filter.${driver}.smudge`, "cat"], [`filter.${driver}.process`, ""], [`filter.${driver}.required`, "false"]];
+  });
+}
+
+/**
+ * Fails closed when a process filter is in force under the redaction filter's
+ * name: git would run it instead of the pinned clean command, and environment
+ * config cannot unset a key. ensureRedactionFilter removes one from repo
+ * config, so one still visible came from somewhere else — an include.
+ */
+function assertRedactionFilterIntact(repo: string): void {
+  if (git(repo, ["config", "--get-all", `filter.${REDACTION_FILTER_NAME}.process`], { check: false }).status === 0) {
+    throw new SidecarError(`filter.${REDACTION_FILTER_NAME}.process is configured; remove it — a review-gated peer publishes only through sidecar's own redaction filter`);
+  }
+}
+
+/**
+ * Refuses a push that `remote.origin.pushurl` would send somewhere other than
+ * the remote's own URL. URL rewrites (`url.*.insteadOf`) stay honored: they
+ * are how people route a host through the transport that authenticates.
+ */
+function assertPublishDestination(repo: string): void {
+  const pushUrl = git(repo, ["config", "--get-all", "remote.origin.pushurl"], { check: false }).stdout.trim();
+  if (!pushUrl) return;
+  const url = git(repo, ["config", "--get", "remote.origin.url"], { check: false }).stdout.trim();
+  if (pushUrl !== url) {
+    throw new SidecarError("remote.origin.pushurl sends this sidecar's pushes somewhere other than its remote; a review-gated peer publishes only to its remote — unset it");
+  }
+}
+
+/** Refreshes the remote's branches, into origin/* for local use and PUBLIC_REFS. Call inside withPublicGit. */
+function fetchPublic(repo: string): void {
+  git(repo, ["fetch", "--quiet", "--prune", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*", `+refs/heads/*:${PUBLIC_REFS}*`]);
+}
+
+function publicRef(branch: string): string {
+  return `${PUBLIC_REFS}${branch}`;
+}
+
+/**
+ * Brings the public refs current for a caller outside the publish path —
+ * refresh, deciding what deleting a checkout would lose.
+ */
+export function refreshPublicRefs(repo: string): void {
+  withPublicGit(repo, () => fetchPublic(repo));
+}
+
+/** The remote's tip of `branch` as last fetched, if it has one. */
+function publicTip(repo: string, branch: string): string | undefined {
+  return git(repo, ["rev-parse", "--verify", "--quiet", publicRef(branch)], { check: false }).stdout.trim() || undefined;
+}
+
+/** Whether the remote, as last fetched, has `commit` on any branch. */
+function isPublic(repo: string, commit: string): boolean {
+  return Boolean(git(repo, ["for-each-ref", "--contains", commit, "--format=%(refname)", PUBLIC_REFS]).stdout.trim());
+}
+
+function publishReviewed(
+  root: string,
+  sidecarPath: string,
+  config: SidecarConfig,
+  inbox: string,
+  siblings: string[],
+  stage: (name: string) => void,
+): SyncOutcome {
+  stage("fetch");
+  withPublicGit(sidecarPath, () => {
+    fetchPublic(sidecarPath);
+    // An emptied remote, or one this existing checkout predates: start main
+    // there the gated way, so reviews have a public base to measure from.
+    if (!publicTip(sidecarPath, config.branch)) bootstrapReviewedMain(sidecarPath, config);
+    stage("publish");
+    const open = openReview(sidecarPath);
+    if (open?.state === "approved") publishApprovedReview(sidecarPath, config, inbox, open);
+  });
+  stage("merge");
+  withPublicGit(sidecarPath, () => mergeFetchedInboxes(sidecarPath, config, { forkFiles: true }));
+  // Takes the remote's new main into local main, and this checkout's latest
+  // snapshot with it, so the review below sees the whole family.
+  stage("merge-local");
+  mergeInboxBranches(sidecarPath, config, { forkFiles: true, push: false, remote: false });
+  stage("settle-remote");
+  settleCheckouts(sidecarPath, config, inbox, siblings);
+  stage("review");
+  // Inside withPublicGit so the packet shows the blobs an approval would
+  // publish; the reviewer starts outside it, in the caller's environment.
+  const gate = withPublicGit(sidecarPath, () => gateUnpublished(root, sidecarPath, config));
+  if (gate?.launch) launchReviewer(gate.review);
+  return gate ? { held: { review: gate.review, attention: reviewAttention(gate.review) } } : {};
+}
+
+/**
+ * Opens, keeps, or retires the family's review so that it covers what local
+ * main holds and the remote does not. One review is open at a time: work that
+ * lands while one is undecided waits for the next, which batches review the
+ * way the debounce batches pushes. Returns the review holding publication, if
+ * any, and whether its reviewer should be launched.
+ */
+function gateUnpublished(root: string, sidecarPath: string, config: SidecarConfig): { review: Review; launch: boolean } | undefined {
+  const head = git(sidecarPath, ["rev-parse", `refs/heads/${config.branch}`]).stdout.trim();
+  const headTree = treeOf(sidecarPath, head);
+  const publicMain = publicTip(sidecarPath, config.branch);
+  // ensureMainBranch joins local main to the remote's, so this always finds
+  // one. Failing that, nothing here has a public base to publish onto.
+  const base = publicMain && git(sidecarPath, ["merge-base", head, publicMain], { check: false }).stdout.trim();
+  if (!base) throw new SidecarError(`local ${config.branch} shares no history with the remote's; nothing is reviewed or published until it does`);
+  const open = openReview(sidecarPath);
+  const hasReviewer = Boolean(readSettings().reviewer);
+
+  if (treeOf(sidecarPath, base) === headTree) {
+    // Whatever an undecided review was waiting to publish is gone or already
+    // public. An approval still publishes: it was given, and its tree is safe.
+    if (open && open.state !== "approved") markSuperseded(open);
+    return undefined;
+  }
+  if (open?.state === "pending" || open?.state === "approved") {
+    // Each review launches its reviewer once. One configured after the review
+    // opened takes it from here.
+    return { review: open, launch: open.state === "pending" && !open.record.launchedAt && hasReviewer };
+  }
+  if (open) {
+    // Rejected or failed: it holds until the content changes, and the change
+    // is what the next review sees.
+    if (open.record.tree === headTree) return { review: open, launch: false };
+    markSuperseded(open);
+  }
+  const review = createReview({ root, config, sidecarPath, base, head });
+  console.log(`opened review ${paint("brand", review.record.id)} for ${review.record.files.length} changed file(s)`);
+  return { review, launch: hasReviewer };
+}
+
+/**
+ * Publishes an approved review as one new commit on this checkout's inbox
+ * branch, then joins it to local main. Call inside withPublicGit.
+ */
+function publishApprovedReview(sidecarPath: string, config: SidecarConfig, inbox: string, review: Review): void {
+  const { record } = review;
+  // A sync that recorded its commit and then died — in this checkout or a
+  // sibling — left the one commit this review may publish. Push that again,
+  // to the inbox it was cut for, rather than cutting a second one.
+  const target = record.publishing ?? { inbox, commit: cutPublishCommit(sidecarPath, config, inbox, record) };
+  const protectRef = publishingRef(record.id);
+  if (!isPublic(sidecarPath, target.commit)) {
+    // The commit's parents must already be on the remote: anything else would
+    // push their history along with it. A remote rewritten since the commit
+    // was cut can drop one, so this holds for a resumed publish too.
+    const parents = git(sidecarPath, ["rev-list", "--parents", "-n", "1", target.commit]).stdout.trim().split(" ").slice(1);
+    if (!parents.every((parent) => isPublic(sidecarPath, parent))) {
+      markSuperseded(review);
+      git(sidecarPath, ["update-ref", "-d", protectRef], { check: false });
+      console.log(`review ${paint("brand", record.id)} was measured from a commit the remote does not have; reviewing again`);
+      return;
+    }
+    assertPublishDestination(sidecarPath);
+    if (!record.publishing) {
+      // Reachable from a ref before it is recorded, so gc cannot prune the
+      // one commit a resumed publish would push.
+      git(sidecarPath, ["update-ref", protectRef, target.commit]);
+      markPublishing(review, target.inbox, target.commit);
+    }
+    // Never forced: the family is the inbox's only writer, so a rejection
+    // means something is wrong, and overwriting would hide it.
+    const push = git(sidecarPath, ["push", "--no-follow-tags", "origin", `${target.commit}:refs/heads/${target.inbox}`], { check: false });
+    if (push.status !== 0) {
+      throw new SidecarError(push.stderr.trim() || `could not publish review ${record.id} to ${target.inbox}`);
+    }
+    fetchPublic(sidecarPath);
+    console.log(`published review ${paint("brand", record.id)} to ${paint("brand", target.inbox)}`);
+  }
+  linkPublished(sidecarPath, config, review, target.commit);
+  markPublished(review, target.commit);
+  git(sidecarPath, ["update-ref", "-d", protectRef], { check: false });
+}
+
+/** Keeps a review's prepared publish commit reachable until it is published or retired. Never pushed or fetched. */
+function publishingRef(id: string): string {
+  return `refs/sidecar-publishing/${id}`;
+}
+
+/**
+ * Retires a review and opens a new one of the same change, with its own
+ * reviewer launch. The retired review is closed, so its reviewer — still
+ * running, perhaps — can no longer decide anything. Call under the peer's
+ * sync lock.
+ */
+export function retryReview(review: Review): Review {
+  const { record } = review;
+  if (!isOpen(review)) throw new SidecarError(`review ${record.id} is already ${review.state}`);
+  if (record.publishing) throw new SidecarError(`review ${record.id} is already being published`);
+  // An approval is a decision, not a reviewer that broke; retrying would
+  // quietly withdraw it.
+  if (review.state === "approved") throw new SidecarError(`review ${record.id} is approved and publishes on the next sync`);
+  const config = loadPeer(record.root, record.peer).config;
+  const sidecarPath = requireSidecarCheckout(record.root, config);
+  // Retired first: a retry that dies partway leaves no review open, and the
+  // next sync opens one of whatever local main holds — never two.
+  markSuperseded(review);
+  const fresh = withPublicGit(sidecarPath, () =>
+    createReview({ root: record.root, config, sidecarPath, base: record.base, head: record.head }));
+  launchReviewer(fresh);
+  return fresh;
+}
+
+/**
+ * The reviewed tree as a commit: first parent the public commit the review
+ * was measured from, second the inbox's previously published tip (unless the
+ * base already contains it) so the push is a fast-forward. Write times for
+ * last-writer-wins travel as carried trailers, since the snapshots that
+ * recorded them stay behind.
+ */
+function cutPublishCommit(sidecarPath: string, config: SidecarConfig, inbox: string, record: ReviewRecord): string {
+  const previous = publicTip(sidecarPath, inbox);
+  const parents = [record.base, ...(previous && !isAncestor(sidecarPath, previous, record.base) ? [previous] : [])];
+  const body = [
+    "sidecar publish",
+    "",
+    `source: ${currentMachine()}`,
+    `inbox: ${inbox}`,
+    `review: ${record.id}`,
+    ...publishedWriteTrailers(sidecarPath, config, record),
+  ];
+  return git(sidecarPath, [
+    "commit-tree",
+    record.tree,
+    ...parents.flatMap((parent) => ["-p", parent]),
+    "-m",
+    body.join("\n"),
+  ]).stdout.trim();
+}
+
+/**
+ * Carried last-writer-wins clocks for the reviewed paths that resolve by lww.
+ * The write events live in local snapshot trailers the remote never sees;
+ * without these every published path would read as written at publish time.
+ */
+function publishedWriteTrailers(repo: string, config: SidecarConfig, record: ReviewRecord): string[] {
+  const defaults = { resolve: config.resolve, redaction: config.redaction };
+  const paths = record.files
+    .map((file) => file.path)
+    .filter((filePath) => resolveFileRules(config.rules, filePath, defaults).resolve === "lww");
+  if (paths.length > WRITTEN_TRAILER_LIMIT) return [];
+  // Nothing read out of a local commit message passes into a published one:
+  // those messages are unreviewed, and a source or a clock can carry any text
+  // shaped like one. Each path's write is this review's own, a token no other
+  // write shares; its time is the recorded one, bounded to a plausible clock.
+  const now = Math.floor(Date.now() / 1000);
+  return paths.map((filePath) => {
+    const { time } = lastWriteEvent(repo, record.head, filePath);
+    return lwwWrittenTrailer(filePath, { time: Math.min(Math.max(0, time), now), source: `review-${record.id}` });
+  });
+}
+
+/**
+ * Joins the published commit to the local history it was cut from.
+ *
+ * The publish commit's parent is the public base, so on its own git would see
+ * no relation between it and the local main it reproduces — and merging the
+ * remote's main back in would measure every edit made since from that base,
+ * turning each file touched after the approval into a conflict. A merge with
+ * the "ours" strategy records that local main already contains the published
+ * state without changing a file. Local main only grows, so the reviewed head
+ * is in it; the link is never pushed, and every sibling inherits it when it
+ * settles onto main.
+ */
+function linkPublished(sidecarPath: string, config: SidecarConfig, review: Review, published: string): void {
+  const main = `refs/heads/${config.branch}`;
+  if (isAncestor(sidecarPath, published, main)) return;
+  // A main rebuilt from scratch no longer holds what was reviewed; claiming it
+  // contains the published state would be a false merge that drops content.
+  if (!isAncestor(sidecarPath, review.record.head, main)) {
+    logSidecarEvent("review-link-skip", { sidecarPath, id: review.record.id });
+    return;
+  }
+  withScratchWorktree(sidecarPath, config, "HEAD", (worktree) => {
+    git(worktree, ["switch", config.branch]);
+    git(worktree, ["merge", "--no-ff", "-s", "ours", "-m", `sidecar: link published review ${review.record.id}`, published]);
+  });
+}
+
+/**
+ * The canonical merge for a review-gated peer: the remote's main plus every
+ * inbox as the remote has it. Local inbox branches never enter it — they hold
+ * unpublished snapshots — so the merge result, and the push of it, is built
+ * from public commits alone.
+ */
+export function mergePublishedInboxes(sidecarPath: string, config: SidecarConfig, options: { forkFiles: boolean }): number {
+  return withPublicGit(sidecarPath, () => {
+    fetchPublic(sidecarPath);
+    return mergeFetchedInboxes(sidecarPath, config, options);
+  });
+}
+
+/** mergePublishedInboxes over the public refs as already fetched. Call inside withPublicGit. */
+function mergeFetchedInboxes(sidecarPath: string, config: SidecarConfig, options: { forkFiles: boolean }): number {
+  if (!publicTip(sidecarPath, config.branch)) return 0;
+  const publicMain = publicRef(config.branch);
+  if (publishedInboxBranches(sidecarPath, config).every((ref) => isAncestor(sidecarPath, ref, publicMain))) {
+    console.log("no published inbox branches to merge");
+    return 0;
+  }
+  assertPublishDestination(sidecarPath);
+  return withScratchWorktree(sidecarPath, config, publicMain, (worktree) => {
+    // Config can differ by worktree (includeIf gitdir), so check here too.
+    assertRedactionFilterIntact(worktree);
+    const maxAttempts = 3;
+    for (let attempt = 1; ; attempt += 1) {
+      if (attempt > 1) {
+        fetchPublic(sidecarPath);
+        git(worktree, ["reset", "--hard", publicMain]);
+      }
+      const pending = publishedInboxBranches(worktree, config).filter((ref) => !isAncestor(worktree, ref, "HEAD"));
+      if (!pending.length) {
+        console.log("no published inbox branches to merge");
+        return 0;
+      }
+      const merged: string[] = [];
+      for (const ref of pending) {
+        console.log(`merging ${paint("brand", remoteBranchName(ref))}`);
+        if (mergeInboxBranch(worktree, config, ref, options)) merged.push(ref);
+      }
+      const push = git(worktree, ["push", "--no-follow-tags", "origin", `HEAD:refs/heads/${config.branch}`], { check: false });
+      if (push.status !== 0) {
+        if (attempt >= maxAttempts) throw new SidecarError(push.stderr.trim() || `could not push ${config.branch}`);
+        console.log(`push of ${config.branch} was rejected; refetching and retrying`);
+        continue;
+      }
+      // A push does not move the public refs, and the gate measures from
+      // them: without this, it would see what was just merged as unpublished.
+      fetchPublic(sidecarPath);
+      console.log(`pushed ${config.branch}`);
+      console.log(`merged ${merged.length} inbox branch(es)`);
+      return merged.length;
+    }
+  });
+}
+
+/** Every inbox branch as the remote has it, including this checkout's own, as public refs. */
+function publishedInboxBranches(repo: string, config: SidecarConfig): string[] {
+  const prefix = inboxPrefix(config);
+  return git(repo, ["for-each-ref", "--format=%(refname)", PUBLIC_REFS])
+    .stdout.split(/\r?\n/)
+    .map((ref) => ref.trim())
+    .filter((ref) => ref && matchesInboxPrefix(prefix, ref.slice(PUBLIC_REFS.length)))
+    .sort();
 }
 
 /**
@@ -169,7 +637,8 @@ export function settleCheckouts(
     } catch (error) {
       logSidecarEvent("settle-skip", {
         sidecarPath: sibling,
-        message: error instanceof Error ? error.message : String(error),
+        // Git's message can quote a path nobody has reviewed yet.
+        ...(reviewRequired(config) ? {} : { message: error instanceof Error ? error.message : String(error) }),
       });
     }
   }
@@ -247,31 +716,48 @@ export function reportSyncHealth(root: string, config: SidecarConfig, outcome: H
     // it's in the local log and there is nowhere to say so from.
     if (!hasGitMetadata(sidecarPath)) return;
 
-    const branch = healthBranchFor(sidecarPath);
-    const previous = readHealthRecordAt(sidecarPath, `origin/${branch}`);
-    const identity: HealthIdentity = {
-      machine: `${currentUser()}@${currentHost()}`,
-      root,
-      peer: config.peer === DEFAULT_PEER ? undefined : config.peer,
-      inbox: expandInbox(config, sidecarPath),
-      version: packageVersion(),
-    };
-    const record = nextHealthRecord(previous, identity, outcome, nowIso());
-    if (!shouldPublishHealth(previous, record)) return;
-    publishHealthRecord(sidecarPath, branch, record);
-    logSidecarEvent("health", {
-      branch,
-      status: record.status,
-      stage: record.stage,
-      consecutiveFailures: record.consecutiveFailures,
-    });
+    // The previous record is read inside withPublicGit too: what it carries
+    // forward must be the blob the remote has, not a local replacement.
+    withPublicGit(sidecarPath, () => publishHealth(root, config, sidecarPath, outcome));
   } catch (error) {
     logSidecarEvent("failure", {
       command: "health",
       root,
-      message: `could not publish health: ${error instanceof Error ? error.message : String(error)}`,
+      message: reviewRequired(config)
+        ? "could not publish health"
+        : `could not publish health: ${error instanceof Error ? error.message : String(error)}`,
     });
   }
+}
+
+function publishHealth(root: string, config: SidecarConfig, sidecarPath: string, outcome: HealthOutcome): void {
+  const branch = healthBranchFor(sidecarPath);
+  const gated = reviewRequired(config);
+  // A gated peer reads the remote's own record, as fetchPublic saw it. A
+  // completed sync fetched after its last push; a failed one may not have
+  // fetched at all, so it does here — and when it cannot, the push below
+  // most likely cannot either.
+  if (gated && outcome.status === "failed") {
+    try { fetchPublic(sidecarPath); } catch { /* offline: as last fetched */ }
+  }
+  const previous = readHealthRecordAt(sidecarPath, gated ? publicRef(branch) : `origin/${branch}`);
+  const identity: HealthIdentity = {
+    machine: currentMachine(),
+    root,
+    peer: config.peer === DEFAULT_PEER ? undefined : config.peer,
+    inbox: expandInbox(config, sidecarPath),
+    version: packageVersion(),
+  };
+  const record = nextHealthRecord(previous, identity, outcome, nowIso());
+  if (!shouldPublishHealth(previous, record)) return;
+  if (gated) assertPublishDestination(sidecarPath);
+  publishHealthRecord(sidecarPath, branch, record);
+  logSidecarEvent("health", {
+    branch,
+    status: record.status,
+    stage: record.stage,
+    consecutiveFailures: record.consecutiveFailures,
+  });
 }
 
 /**
@@ -291,19 +777,10 @@ function publishHealthRecord(sidecarPath: string, branch: string, record: Health
   const tree = git(sidecarPath, ["mktree"], {
     input: `100644 blob ${blob}\t${HEALTH_FILE}\n`,
   }).stdout.trim();
-  // Identity comes in on the command line rather than from repo config, so
-  // publishing doesn't depend on a config write having succeeded first.
-  const commit = git(sidecarPath, [
-    "-c",
-    `user.name=${currentUser()}`,
-    "-c",
-    `user.email=${slug(currentUser())}@${slug(currentHost())}.local`,
-    "commit-tree",
-    tree,
-    "-m",
-    `health: ${record.status} — ${record.machine}`,
-  ]).stdout.trim();
-  git(sidecarPath, ["push", "--force", "origin", `${commit}:refs/heads/${branch}`]);
+  // Identity comes from withPublicGit's environment rather than repo config,
+  // so publishing doesn't depend on a config write having succeeded first.
+  const commit = git(sidecarPath, ["commit-tree", tree, "-m", `health: ${record.status} — ${record.machine}`]).stdout.trim();
+  git(sidecarPath, ["push", "--no-follow-tags", "--force", "origin", `${commit}:refs/heads/${branch}`]);
 }
 
 /** Reads a heartbeat straight out of a ref; `git show` on a blob is unfiltered. */
@@ -362,14 +839,16 @@ export function mergeInboxBranches(
   // local merge sees only what this machine holds and does not fetch; a remote
   // one fetches first, so the same question also covers the other machines.
   if (options.remote) fetch(sidecarPath, false);
-  if (!hasPendingInboxWork(sidecarPath, config)) {
+  // A main that lacks the remote's latest is work too, merge or not: bringing
+  // it current is ensureMainBranch's job, inside the worktree below.
+  if (!hasPendingInboxWork(sidecarPath, config) && mainContainsRemote(sidecarPath, config)) {
     // Nothing to merge, but the local phase advances main before the remote
     // phase runs, so main is routinely owed to the remote with no merge behind
     // it. Sending a branch needs no checkout — and so needs no worktree. A
     // rejected push means another machine moved main and this is a real
     // reconcile after all, so fall through and do it properly.
     if (options.push && !mainMatchesRemote(sidecarPath, config)) {
-      const push = git(sidecarPath, ["push", "origin", `refs/heads/${config.branch}:refs/heads/${config.branch}`], {
+      const push = git(sidecarPath, ["push", "--no-follow-tags", "origin", `refs/heads/${config.branch}:refs/heads/${config.branch}`], {
         check: false,
       });
       if (push.status === 0) {
@@ -399,6 +878,15 @@ export function mergeInboxBranches(
   if (git(sidecarPath, ["branch", "--show-current"]).stdout.trim() === config.branch) {
     ensureInboxBranch(sidecarPath, config, expandInbox(config, sidecarPath));
   }
+  return withScratchWorktree(sidecarPath, config, "HEAD", (worktree) => mergeInboxBranchesAt(worktree, config, options));
+}
+
+/**
+ * Runs `fn` in a throwaway linked worktree detached at `start`, with this
+ * checkout's redaction policy bound to it. Merges happen there so the user's
+ * checkout never switches branches.
+ */
+function withScratchWorktree<T>(sidecarPath: string, config: SidecarConfig, start: string, fn: (worktree: string) => T): T {
   // A deterministic path (rather than mkdtemp) lets a new sync reclaim the
   // worktree a killed sync left behind; a stale registration would otherwise
   // block `git switch <main>` in every future merge. The sync lock prevents
@@ -412,9 +900,9 @@ export function mergeInboxBranches(
   fs.rmSync(scratch, { recursive: true, force: true });
   git(sidecarPath, ["worktree", "prune", "--expire", "now"], { check: false });
   try {
-    git(sidecarPath, ["worktree", "add", "--detach", worktree]);
+    git(sidecarPath, ["worktree", "add", "--detach", worktree, start]);
     ensureRedactionFilter(worktree, config.redaction, config);
-    return mergeInboxBranchesAt(worktree, config, options);
+    return fn(worktree);
   } finally {
     git(sidecarPath, ["worktree", "remove", "--force", worktree], { check: false });
     fs.rmSync(scratch, { recursive: true, force: true });
@@ -433,6 +921,12 @@ function mainMatchesRemote(repo: string, config: SidecarConfig): boolean {
   const local = refs.get(localRef);
   const remote = refs.get(remoteRef);
   return local !== undefined && local === remote;
+}
+
+/** Whether local main already holds everything the remote's main does. */
+function mainContainsRemote(repo: string, config: SidecarConfig): boolean {
+  if (!remoteRefExists(repo, config.branch) || !branchExists(repo, config.branch)) return true;
+  return isAncestor(repo, `origin/${config.branch}`, `refs/heads/${config.branch}`);
 }
 
 /** Whether any inbox branch still sits outside the local main branch. */
@@ -478,7 +972,7 @@ function mergeInboxBranchesAt(
     if (options.push) {
       const push = git(
         sidecarPath,
-        ["push", "-u", "origin", `HEAD:refs/heads/${config.branch}`],
+        ["push", "--no-follow-tags", "-u", "origin", `HEAD:refs/heads/${config.branch}`],
         { check: false },
       );
       if (push.status !== 0) {
@@ -583,7 +1077,7 @@ export function familySidecarCheckout(root: string, config: SidecarConfig): stri
   } catch {
     return undefined;
   }
-  if (primaryConfig.remote !== config.remote) return undefined;
+  if (!sharesFamilyCheckout(primaryConfig, config)) return undefined;
 
   const primaryPath = resolveSidecarPath(primary, primaryConfig);
   if (path.resolve(primaryPath) === path.resolve(primary)) return undefined;
@@ -640,10 +1134,42 @@ export function checkoutIsUnlinkedFromFamily(
   const primary = familyPrimaryRoot(root);
   if (!primary) return false;
   try {
-    const primaryConfig = readConfig(peerConfigPath(primary, config.peer));
-    return primaryConfig.remote === config.remote;
+    return sharesFamilyCheckout(readConfig(peerConfigPath(primary, config.peer)), config);
   } catch {
     return false;
+  }
+}
+
+/**
+ * Whether a working copy may share the family primary's checkout. A shared
+ * store's local history is every sharer's to publish, so a peer that requires
+ * review never shares one with a peer that does not: see bindReviewPolicy.
+ */
+function sharesFamilyCheckout(primaryConfig: SidecarConfig, config: SidecarConfig): boolean {
+  return primaryConfig.remote === config.remote && reviewRequired(primaryConfig) === reviewRequired(config);
+}
+
+const REVIEW_POLICY_KEY = "sidecar.review";
+
+/**
+ * Binds a checkout's shared store to review, or refuses a peer that would
+ * publish it unreviewed. Sibling checkouts share one store, local inbox
+ * branches and local main included, and an ungated sync merges and pushes
+ * all of it — so once a gated peer has used a store, the store says so, and
+ * every peer that writes through it must be gated too. A family whose
+ * policies drift apart after linking fails closed here, on whichever side
+ * syncs first. Call before anything is snapshotted, merged, or pushed.
+ */
+export function bindReviewPolicy(sidecarPath: string, config: SidecarConfig): void {
+  const bound = git(sidecarPath, ["config", "--local", "--get", REVIEW_POLICY_KEY], { check: false }).stdout.trim();
+  if (reviewRequired(config)) {
+    if (bound !== "required") git(sidecarPath, ["config", "--local", REVIEW_POLICY_KEY, "required"]);
+    return;
+  }
+  if (bound === "required") {
+    throw new SidecarError(
+      `${sidecarPath} holds work from a peer that requires review, and this peer would publish it unreviewed; set review = "required" in this repo's ${peerFileName(config.peer)} too — or, to publish that work without review, \`git -C ${sidecarPath} config --unset ${REVIEW_POLICY_KEY}\``,
+    );
   }
 }
 
@@ -701,6 +1227,7 @@ export function cloneOrUpdate(
 
   ensureCommitIdentity(sidecarPath);
   ensureRedactionFilter(sidecarPath, config.redaction, config);
+  bindReviewPolicy(sidecarPath, config);
   if (bootstrapMain) bootstrapMainBranch(sidecarPath, config);
 
   const inbox = expandInbox(config, sidecarPath);
@@ -711,6 +1238,10 @@ export function cloneOrUpdate(
 export function bootstrapMainBranch(repo: string, config: SidecarConfig): void {
   if (remoteRefExists(repo, config.branch)) return;
 
+  if (reviewRequired(config)) {
+    withPublicGit(repo, () => bootstrapReviewedMain(repo, config));
+    return;
+  }
   if (hasAnyCommit(repo)) {
     const current = git(repo, ["branch", "--show-current"]).stdout.trim();
     if (current !== config.branch) {
@@ -748,6 +1279,36 @@ Kept in sync by [sidecar](https://github.com/endograph/sidecar).
   pushBranch(repo, config.branch);
 }
 
+/**
+ * Starts the remote's main for a review-gated peer. Whatever the checkout
+ * holds — history, or files staged in an unborn repo — would publish
+ * unreviewed through an ordinary first commit, so the remote gets a root
+ * commit of the empty tree, made with plumbing that reads neither HEAD nor the
+ * index. Existing local history is linked to it the way a publish is (see
+ * linkPublished); the next sync then reviews everything the checkout holds as
+ * one change from nothing. Call inside withPublicGit.
+ */
+function bootstrapReviewedMain(repo: string, config: SidecarConfig): void {
+  assertPublishDestination(repo);
+  const root = git(repo, ["commit-tree", emptyTree(repo), "-m", "Initialize sidecar"]).stdout.trim();
+  git(repo, ["push", "--no-follow-tags", "origin", `${root}:refs/heads/${config.branch}`]);
+  fetchPublic(repo);
+  console.log(`started ${config.branch} on the remote empty; this checkout's content is published through review`);
+  const ref = `refs/heads/${config.branch}`;
+  // Unborn: local main starts at the public root. Nothing staged is touched;
+  // it reaches the inbox at the next snapshot and is reviewed from there.
+  if (!hasAnyCommit(repo)) {
+    git(repo, ["update-ref", ref, root]);
+    return;
+  }
+  const local = git(repo, ["rev-parse", "--verify", "--quiet", ref], { check: false }).stdout.trim()
+    || git(repo, ["rev-parse", "HEAD"]).stdout.trim();
+  // A merge commit of local main's own tree: no file changes, whether or not
+  // main is checked out anywhere.
+  const link = git(repo, ["commit-tree", treeOf(repo, local), "-p", local, "-p", root, "-m", "sidecar: link the remote's initial main"]).stdout.trim();
+  git(repo, ["update-ref", ref, link]);
+}
+
 export function ensureMainBranch(repo: string, config: SidecarConfig): void {
   if (branchExists(repo, config.branch)) {
     git(repo, ["switch", config.branch]);
@@ -772,6 +1333,24 @@ export function ensureMainBranch(repo: string, config: SidecarConfig): void {
   if (remoteOnly === 0) return;
   if (localOnly === 0) {
     git(repo, ["merge", "--ff-only", remoteBranch]);
+    return;
+  }
+  // A review-gated peer's local main is this machine's whole view: the
+  // remote's main with every unpublished local merge on top, including the
+  // link that joins each published commit to the history it was cut from
+  // (see linkPublished). Resetting it would discard those links, so it takes
+  // the remote's side in as a merge instead.
+  if (reviewRequired(config)) {
+    if (git(repo, ["merge-base", "HEAD", remoteBranch], { check: false }).status !== 0) {
+      // The remote's main was started over. Join it the way bootstrap does: a
+      // commit of local main's own tree, so nothing local is lost and the
+      // next review measures everything here from the new public base.
+      const link = git(repo, ["commit-tree", treeOf(repo, "HEAD"), "-p", "HEAD", "-p", remoteBranch, "-m", `sidecar: link the remote's new ${config.branch}`]).stdout.trim();
+      git(repo, ["merge", "--ff-only", link]);
+      console.log(`${remoteBranch} was started over; local ${config.branch} is joined to it and reviewed from there`);
+      return;
+    }
+    mergeInboxBranch(repo, config, remoteBranch, { forkFiles: true });
     return;
   }
   // Diverged: another machine won a push race. Local commits beyond the
@@ -885,7 +1464,7 @@ export function snapshot(
     .stdout.split("\0")
     .filter(Boolean);
 
-  const source = `${currentUser()}@${currentHost()}`;
+  const source = currentMachine();
   const body = [message, "", `source: ${source}`];
   // main-head pins a snapshot to the code it was taken against. Standalone has
   // no separate code repo — mainRoot is this repo — so the trailer would just
@@ -1044,7 +1623,7 @@ export function ensureRedactionFilter(
   // %f is shell-quoted by Git itself, including whitespace and metacharacters.
   // Always run the filter: another checkout or a path rule can require
   // redaction even when this peer's default is none.
-  const command = `${filterCommandQuote(process.execPath)} ${filterCommandQuote(redactCliPath())} redact --checkout-policy --path %f`;
+  const command = `${filterCommandQuote(process.execPath)} ${filterCommandQuote(sidecarCliPath())} redact --checkout-policy --path %f`;
   const wanted: Array<[string, string]> = [
     [`filter.${REDACTION_FILTER_NAME}.clean`, command],
     [`filter.${REDACTION_FILTER_NAME}.revision`, REDACTION_FILTER_REVISION],
@@ -1053,6 +1632,9 @@ export function ensureRedactionFilter(
     [`filter.${REDACTION_FILTER_NAME}.smudge`, "cat"],
     [`filter.${REDACTION_FILTER_NAME}.required`, "true"],
   ];
+  // Git prefers a process filter over clean/smudge, so one configured under
+  // this name would replace redaction outright; it is removed, never kept.
+  const processKey = `filter.${REDACTION_FILTER_NAME}.process`;
   // info/attributes lives in the shared git dir; the worktree-local git dir
   // differs from it inside linked worktrees (which merging uses).
   const attributesPath = path.join(gitCommonDir(repo), "info", "attributes");
@@ -1074,7 +1656,7 @@ export function ensureRedactionFilter(
         return [entry.slice(0, space), entry.slice(space + 1)] as [string, string];
       }),
   );
-  const configOk = wanted.every(([key, value]) => current.get(key) === value);
+  const configOk = wanted.every(([key, value]) => current.get(key) === value) && !current.has(processKey);
   let attributes = "";
   try {
     attributes = fs.readFileSync(attributesPath, "utf8");
@@ -1087,6 +1669,7 @@ export function ensureRedactionFilter(
   for (const [key, value] of wanted) {
     git(repo, ["config", key, value]);
   }
+  git(repo, ["config", "--unset-all", processKey], { check: false });
   if (!attributesOk) {
     fs.mkdirSync(path.dirname(attributesPath), { recursive: true });
     fs.appendFileSync(
@@ -1121,14 +1704,6 @@ export function removeRedactionFilter(repo: string): void {
   } else {
     fs.writeFileSync(attributesPath, `${kept.join("\n").replace(/\s+$/g, "")}\n`, "utf8");
   }
-}
-
-// The filter must be runnable by plain git, outside this process: point it at
-// the built CLI bundle (when running from TypeScript sources, e.g. tests, the
-// sibling dist build).
-function redactCliPath(): string {
-  const self = fileURLToPath(import.meta.url);
-  return self.endsWith(".ts") ? path.join(path.dirname(self), "..", "dist", "cli.js") : self;
 }
 
 // Git runs filter commands through sh; double quotes keep paths with spaces
@@ -1188,7 +1763,7 @@ function refreshInboxFromMain(repo: string, config: SidecarConfig, inbox: string
 }
 
 export function pushBranch(repo: string, branch: string): void {
-  git(repo, ["push", "-u", "origin", `HEAD:refs/heads/${branch}`]);
+  git(repo, ["push", "--no-follow-tags", "-u", "origin", `HEAD:refs/heads/${branch}`]);
   console.log(`pushed ${paint("brand", branch)}`);
 }
 

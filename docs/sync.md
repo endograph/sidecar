@@ -46,6 +46,11 @@ everything a commit every minute would, at a hundredth of the history.
 
 ## Inbox branches and conflict-free merging
 
+(A peer with [review](review.md) required differs in one way: it never
+pushes its inbox history, only one commit per approved review, and the
+canonical merge combines only what the remote already has. See
+[What gets published](review.md#what-gets-published).)
+
 Each sync snapshots local changes onto a per-machine inbox branch and pushes
 it, then merges all inbox branches into the canonical branch and pushes that.
 Because every machine writes only to its own inbox, a sync never stops you to

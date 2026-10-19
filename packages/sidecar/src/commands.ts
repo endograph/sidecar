@@ -10,6 +10,7 @@ import { cmdRefresh } from "./cmd-refresh.js";
 import { cmdHealth, cmdInstances, cmdStatus, cmdTail } from "./cmd-status.js";
 import { cmdDaemon, cmdRegisterInstall, cmdSetInstallSource, cmdUpdate } from "./cmd-daemon.js";
 import { cmdMerge, cmdRedact, cmdRedactions, cmdSnapshot, cmdSync } from "./cmd-sync.js";
+import { cmdReview } from "./cmd-review.js";
 
 type CommandSection = "common" | "sync" | "advanced";
 
@@ -31,7 +32,7 @@ const COMMANDS: Command[] = [
     run: cmdInit,
     section: "common",
     usage:
-      "init [remote] [--peer name] [--path sidecar|.] [--branch main] [--inbox template] [--redaction none|secrets|secrets+pii] [--resolve fork|lww] [--debounce 10m] [--interval 1h] [--ignored] [--local-install]",
+      "init [remote] [--peer name] [--path sidecar|.] [--branch main] [--inbox template] [--redaction none|secrets|secrets+pii] [--resolve fork|lww] [--review off|required] [--review-timeout 1h] [--debounce 10m] [--interval 1h] [--ignored] [--local-install]",
     notes: [
       "--path . makes this repo itself the sidecar (standalone)",
       "--peer name adds a second sidecar as .sidecar.name; --ignored keeps it out of the tree",
@@ -52,6 +53,16 @@ const COMMANDS: Command[] = [
     section: "common",
     usage: "redactions [--peer name]",
     summary: "preview what redaction rewrites before content is pushed",
+  },
+  {
+    name: "review",
+    run: cmdReview,
+    section: "common",
+    usage: "review [show|approve|reject|retry] [id] [--reason text] [--no-sync] [--json] [--peer name]",
+    notes: [
+      "the reviews that gate a peer with review = \"required\"; approve publishes at once",
+      "review reviewer [<command>|--unset] sets who reviews on this machine",
+    ],
   },
   {
     name: "sync",

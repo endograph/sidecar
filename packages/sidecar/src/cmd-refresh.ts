@@ -17,7 +17,7 @@ import {
   fetch,
   git,
   hasAnyCommit,
-  isDirty,
+  isAncestor,
 } from "./git.js";
 import {
   type Peer,
@@ -25,8 +25,12 @@ import {
   expandInbox,
   isStandalone,
   loadPeers,
+  PUBLIC_REFS,
+  inboxPrefix,
+  matchesInboxPrefix,
   requireSidecarCheckout,
   resolveSidecarPath,
+  reviewRequired,
   selectedPeer,
 } from "./config.js";
 import { logSidecarEvent, registerCurrentInstance, withSyncLock } from "./state.js";
@@ -36,9 +40,11 @@ import {
   ensureMainBranch,
   ensureRedactionFilter,
   familySidecarCheckout,
+  refreshPublicRefs,
 } from "./sync.js";
 import { announcePeer, promptYesNoDefaultNo } from "./ui.js";
 import { rulesMayRedact } from "./rules.js";
+import { type Review, markSuperseded, openReview } from "./review.js";
 
 /**
  * Which of a repo's worktrees holds a branch, if any.
@@ -92,16 +98,74 @@ export function unpushedCommits(sidecarPath: string): number {
 }
 
 /**
+ * What deleting this checkout would lose, as phrases for a refusal; empty
+ * when nothing. Measured against the remote refs as last fetched.
+ */
+function heldWork(sidecarPath: string, config: SidecarConfig, inbox: string): string[] {
+  // A review-gated checkout never pushes its own commits, so counting them
+  // would refuse forever; what it would lose is content not yet published.
+  const gated = reviewRequired(config);
+  const unpushed = gated ? 0 : unpushedCommits(sidecarPath);
+  const unpublished = gated && !gatedWorkIsPublished(sidecarPath, config, inbox);
+  const dirtyFiles = git(sidecarPath, ["status", "--porcelain"], { check: false })
+    .stdout.split("\n")
+    .filter(Boolean).length;
+  return [
+    unpushed ? `${unpushed} commit(s) the remote has not seen` : "",
+    unpublished ? "changes not yet published through review" : "",
+    dirtyFiles ? `${dirtyFiles} uncommitted file(s)` : "",
+  ].filter(Boolean);
+}
+
+/**
+ * Whether deleting this gated checkout loses nothing unpublished. Its own
+ * HEAD must be published, or held by a local main that is. A checkout owning
+ * the family's store takes local main and every sibling's inbox with it, so
+ * then all of those must be published too: a gated bootstrap, for one, leaves
+ * the checkout's history on local main while its inbox starts empty.
+ */
+function gatedWorkIsPublished(sidecarPath: string, config: SidecarConfig, inbox: string): boolean {
+  if (!hasAnyCommit(sidecarPath)) return true;
+  const tree = (ref: string): string | undefined => {
+    const result = git(sidecarPath, ["rev-parse", "--verify", "--quiet", `${ref}^{tree}`], { check: false });
+    return result.status === 0 ? result.stdout.trim() : undefined;
+  };
+  // Against the public refs, not origin/*: those are local state any hook or
+  // tool can write, and a forged one would let refresh delete unpublished work.
+  const main = `refs/heads/${config.branch}`;
+  const publicMain = tree(`${PUBLIC_REFS}${config.branch}`);
+  const mainTree = tree(main);
+  const mainPublished = mainTree === undefined || mainTree === publicMain;
+  const published = (ref: string, branch: string): boolean => {
+    const own = tree(ref);
+    return own === publicMain || own === tree(`${PUBLIC_REFS}${branch}`) || (mainPublished && isAncestor(sidecarPath, ref, main));
+  };
+  if (!published("HEAD", inbox)) return false;
+  if (!ownsStore(sidecarPath)) return true;
+  if (!mainPublished) return false;
+  const prefix = inboxPrefix(config);
+  return git(sidecarPath, ["for-each-ref", "--format=%(refname)", "refs/heads/"])
+    .stdout.split("\n")
+    .filter((ref) => ref && matchesInboxPrefix(prefix, ref.slice("refs/heads/".length)))
+    .every((ref) => published(ref, ref.slice("refs/heads/".length)));
+}
+
+/** Whether this checkout holds its family's Git store rather than linking to one. */
+function ownsStore(sidecarPath: string): boolean {
+  try {
+    return fs.statSync(path.join(sidecarPath, ".git")).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Checkouts hanging off this one as linked worktrees — the ones that deleting it
  * would break. Empty unless this checkout owns the store: asked of a linked
  * worktree, `worktree list` answers for the whole family.
  */
 export function dependentWorktrees(sidecarPath: string): string[] {
-  try {
-    if (!fs.statSync(path.join(sidecarPath, ".git")).isDirectory()) return [];
-  } catch {
-    return [];
-  }
+  if (!ownsStore(sidecarPath)) return [];
   const result = git(sidecarPath, ["worktree", "list", "--porcelain"], { check: false });
   if (result.status !== 0) return [];
   const self = realpathOr(sidecarPath);
@@ -172,6 +236,18 @@ export function refreshCheckout(root: string, config: SidecarConfig): void {
   }
 
   const checkoutId = existingCheckoutId(sidecarPath);
+  // Deleting the family's own clone deletes the commits its open review is
+  // of, so retire it; the next sync reviews whatever is still unpublished. A
+  // linked worktree shares the clone and leaves the review alone.
+  if (ownsStore(sidecarPath)) {
+    let open: Review | undefined;
+    try {
+      open = openReview(sidecarPath);
+    } catch {
+      // An unreadable clone (refresh --force) has no family to look up.
+    }
+    if (open) markSuperseded(open);
+  }
   fs.rmSync(sidecarPath, { recursive: true, force: true });
   // Something may still hold an admin entry for the path this checkout occupied:
   // the family's clone if it was a linked worktree, or the family's clone again
@@ -305,21 +381,25 @@ function refreshPeer({ root, config, name }: Peer, parsed: ParsedOptions): void 
   let inbox: string | undefined;
   if (readable) {
     inbox = expandInbox(config, sidecarPath);
-    // origin/<inbox> is what decides how much is unpushed, so it has to be as
-    // current as the network allows before anything is counted against it. A
-    // stale one over-counts, which errs toward refusing.
-    fetch(sidecarPath, true, false);
-    const unpushed = unpushedCommits(sidecarPath);
-    const dirtyFiles = git(sidecarPath, ["status", "--porcelain"], { check: false })
-      .stdout.split("\n")
-      .filter(Boolean).length;
-    if ((unpushed || dirtyFiles) && !force) {
-      const held = [
-        unpushed ? `${unpushed} commit(s) the remote has not seen` : "",
-        dirtyFiles ? `${dirtyFiles} uncommitted file(s)` : "",
-      ].filter(Boolean);
+    // What is held is measured against the remote, so it has to be as current
+    // as the network allows; offline, it stays as last fetched, which errs
+    // toward refusing. A gated checkout is measured against the public refs,
+    // which only sidecar's own fetch writes; an ungated one against
+    // origin/<inbox>, which decides how much is unpushed.
+    if (reviewRequired(config)) {
+      try { refreshPublicRefs(sidecarPath); } catch { /* offline: last fetched */ }
+    } else {
+      fetch(sidecarPath, true, false);
+    }
+    const held = heldWork(sidecarPath, config, inbox);
+    if (held.length && !force) {
+      // A gated checkout's work leaves only through an approved review, which
+      // syncing alone does not give.
+      const publish = reviewRequired(config)
+        ? "approve its review (`sidecar review`) and sync to publish them"
+        : "run `sidecar sync` to push them";
       throw new SidecarError(
-        `this checkout still holds ${held.join(" and ")}; run \`sidecar sync\` to push them, then refresh — or \`sidecar refresh --force\` to discard them`,
+        `this checkout still holds ${held.join(" and ")}; ${publish}, then refresh — or \`sidecar refresh --force\` to discard them`,
       );
     }
   }
@@ -372,7 +452,9 @@ function refreshPeer({ root, config, name }: Peer, parsed: ParsedOptions): void 
   withSyncLock(root, name, "throw", () => {
     // Re-read under the lock: the prompt above is unbounded, and a sync or an
     // agent could have written to the checkout while it sat there.
-    if (readable && !force && isDirty(sidecarPath)) {
+    // Every guard, not only dirtiness: a sync in that window can snapshot new
+    // work and leave the checkout clean but holding it.
+    if (readable && !force && inbox && heldWork(sidecarPath, config, inbox).length) {
       throw new SidecarError("the sidecar checkout changed while waiting for confirmation; rerun refresh");
     }
     if (standalone) declined = refreshStandaloneCheckout(root, config, force);

@@ -27,6 +27,7 @@ import {
   readConfig,
   readInstances,
   readSettings,
+  reviewRequired,
   sidecarStateDir,
   startDetachedDaemon,
   unregisterInstance,
@@ -55,6 +56,19 @@ export type DaemonOptions = {
   intervalSeconds: number;
   debounceSeconds: number;
 };
+
+/**
+ * Whether a peer's sync output and watcher errors must stay out of the
+ * daemon's log: a gated peer's can name files nobody has reviewed. A config that cannot be read
+ * counts as gated, so the answer fails closed.
+ */
+function outputIsPrivate(key: PeerKey): boolean {
+  try {
+    return reviewRequired(readConfig(key, { loadRules: false }));
+  } catch {
+    return true;
+  }
+}
 
 /**
  * Everything the daemon tracks is keyed by the peer's config path, not the
@@ -346,7 +360,9 @@ async function syncInstance(
         command: "daemon",
         ...peerFields(key),
         trigger,
-        message: result.timedOut ? "sync timed out" : result.output.trim().slice(-500) || `sync exited ${result.status}`,
+        message: result.timedOut
+          ? "sync timed out"
+          : (!outputIsPrivate(key) && result.output.trim().slice(-500)) || `sync exited ${result.status}`,
       });
     }
   } finally {
@@ -466,7 +482,8 @@ export async function refreshWatchers(state: DaemonState): Promise<void> {
           logSidecarEvent("failure", {
             command: "daemon",
             ...peerFields(key),
-            message: `watcher error: ${error instanceof Error ? error.message : String(error)}`,
+            // A filesystem error names the file, and on a gated peer that can be unreviewed content.
+            message: outputIsPrivate(key) ? "watcher error" : `watcher error: ${error instanceof Error ? error.message : String(error)}`,
           });
         });
         state.watchers.set(key, watcher);
@@ -474,7 +491,9 @@ export async function refreshWatchers(state: DaemonState): Promise<void> {
         logSidecarEvent("failure", {
           command: "daemon",
           ...peerFields(key),
-          message: `could not watch ${sidecarPath}: ${error instanceof Error ? error.message : String(error)}`,
+          message: outputIsPrivate(key)
+            ? `could not watch ${sidecarPath}`
+            : `could not watch ${sidecarPath}: ${error instanceof Error ? error.message : String(error)}`,
         });
       }
     }

@@ -196,6 +196,9 @@ function currentUser() {
 function currentHost() {
   return os.hostname().split(".", 1)[0] || "unknown";
 }
+function currentMachine() {
+  return `${currentUser()}@${currentHost()}`;
+}
 function parseDuration(value) {
   if (typeof value === "number")
     return Number.isFinite(value) && value >= 0 ? value : undefined;
@@ -229,6 +232,10 @@ import os2 from "node:os";
 import path2 from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+function sidecarCliPath() {
+  const self = fileURLToPath(import.meta.url);
+  return self.endsWith(".ts") ? path2.join(path2.dirname(self), "..", "dist", "cli.js") : self;
+}
 function packageVersion() {
   let current = path2.dirname(fileURLToPath(import.meta.url));
   while (true) {
@@ -322,147 +329,6 @@ var PACKAGE_NAME = "sidecarsync", PACKAGE_SPEC = "sidecarsync", GLOBAL_EXEC_ENV 
 var init_install = __esm(() => {
   init_util();
   INSTALL_SOURCES = new Set(["npm", "bun", "curl"]);
-});
-
-// src/git.ts
-import fs3 from "node:fs";
-import path3 from "node:path";
-import { spawnSync as spawnSync2 } from "node:child_process";
-function git(repo, args, options = {}) {
-  return gitRaw(["-C", repo, ...args], options);
-}
-function gitBytes(repo, args, options = {}) {
-  const check = options.check ?? true;
-  const result = spawnSync2("git", ["-C", repo, ...args], {
-    encoding: "buffer",
-    maxBuffer: 100 * 1024 * 1024
-  });
-  const status = result.status ?? 1;
-  const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
-  const stderr = Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.from(result.stderr ?? "");
-  if (check && status !== 0) {
-    throw new SidecarError(stderr.toString("utf8").trim() || stdout.toString("utf8").trim());
-  }
-  return { status, stdout, stderr };
-}
-function gitRaw(args, options = {}) {
-  const check = options.check ?? true;
-  const result = spawnSync2("git", args, {
-    encoding: "utf8",
-    input: options.input,
-    maxBuffer: 100 * 1024 * 1024
-  });
-  const status = result.status ?? 1;
-  const stdout = result.stdout ?? "";
-  const stderr = result.stderr ?? "";
-  if (check && status !== 0) {
-    throw new SidecarError(stderr.trim() || stdout.trim());
-  }
-  return { status, stdout, stderr };
-}
-function fetch(repo, quiet, check = true) {
-  const args = ["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"];
-  if (quiet)
-    args.splice(1, 0, "--quiet");
-  git(repo, args, { check });
-}
-function hasAnyCommit(repo) {
-  return git(repo, ["rev-parse", "--verify", "HEAD"], { check: false }).status === 0;
-}
-function branchExists(repo, branch) {
-  return git(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { check: false }).status === 0;
-}
-function remoteRefExists(repo, branch) {
-  return git(repo, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`], {
-    check: false
-  }).status === 0;
-}
-function isAncestor(repo, maybeAncestor, descendant) {
-  return git(repo, ["merge-base", "--is-ancestor", maybeAncestor, descendant], { check: false }).status === 0;
-}
-function gitToplevel(cwd) {
-  const root = gitToplevelOptional(cwd);
-  if (!root)
-    throw new SidecarError("not inside a Git repository");
-  return root;
-}
-function gitToplevelOptional(cwd) {
-  const result = gitRaw(["-C", cwd, "rev-parse", "--show-toplevel"], { check: false });
-  if (result.status !== 0)
-    return;
-  return result.stdout.trim();
-}
-function gitCommonDir(root) {
-  const commonDir = gitCommonDirOptional(root);
-  if (!commonDir)
-    throw new SidecarError("not inside a Git repository");
-  return commonDir;
-}
-function gitExcludePath(root) {
-  const commonDir = gitCommonDirOptional(root);
-  return commonDir ? path3.join(commonDir, "info", "exclude") : undefined;
-}
-function isGitIgnored(root, relativePath) {
-  return git(root, ["check-ignore", "-q", "--", relativePath], { check: false }).status === 0;
-}
-function isGitTracked(root, relativePath) {
-  return git(root, ["ls-files", "--error-unmatch", "--", relativePath], { check: false }).status === 0;
-}
-function gitCommonDirOptional(root) {
-  const result = gitRaw(["-C", root, "rev-parse", "--git-common-dir"], { check: false });
-  if (result.status !== 0)
-    return;
-  return path3.resolve(root, result.stdout.trim());
-}
-function gitDir(repo) {
-  const result = git(repo, ["rev-parse", "--git-dir"]).stdout.trim();
-  return path3.isAbsolute(result) ? result : path3.resolve(repo, result);
-}
-function hasGitMetadata(repo) {
-  return fs3.existsSync(path3.join(repo, ".git"));
-}
-function isDirty(repo) {
-  return Boolean(git(repo, ["status", "--porcelain"]).stdout.trim());
-}
-function ensureClean(repo) {
-  if (isDirty(repo))
-    throw new SidecarError("sidecar checkout has uncommitted changes");
-}
-function ensureCommitIdentity(repo) {
-  if (git(repo, ["config", "user.name"], { check: false }).status !== 0) {
-    git(repo, ["config", "user.name", currentUser()]);
-  }
-  if (git(repo, ["config", "user.email"], { check: false }).status !== 0) {
-    git(repo, ["config", "user.email", `${slug(currentUser())}@${slug(currentHost())}.local`]);
-  }
-}
-function familyPrimaryRoot(root) {
-  const primary = jjDefaultWorkspace(root) ?? gitMainWorktree(root);
-  if (!primary)
-    return;
-  return realpathOr(primary) === realpathOr(root) ? undefined : primary;
-}
-function jjDefaultWorkspace(root) {
-  const pointer = path3.join(root, ".jj", "repo");
-  try {
-    if (!fs3.statSync(pointer).isFile())
-      return;
-    const repo = path3.resolve(path3.dirname(pointer), fs3.readFileSync(pointer, "utf8").trim());
-    const workspace = path3.dirname(path3.dirname(repo));
-    return fs3.existsSync(path3.join(workspace, ".jj")) ? workspace : undefined;
-  } catch {
-    return;
-  }
-}
-function gitMainWorktree(root) {
-  const result = git(root, ["worktree", "list", "--porcelain"], { check: false });
-  if (result.status !== 0)
-    return;
-  const entry = result.stdout.split(/\r?\n/).find((line) => line.startsWith("worktree "));
-  return entry?.slice("worktree ".length).trim() || undefined;
-}
-var init_git = __esm(() => {
-  init_util();
 });
 
 // ../../node_modules/.bun/smol-toml@1.7.0/node_modules/smol-toml/dist/date.js
@@ -1428,6 +1294,157 @@ var init_dist = __esm(() => {
    */
 });
 
+// src/git.ts
+import fs3 from "node:fs";
+import path3 from "node:path";
+import { spawnSync as spawnSync2 } from "node:child_process";
+function git(repo, args, options = {}) {
+  return gitRaw(["-C", repo, ...args], options);
+}
+function gitBytes(repo, args, options = {}) {
+  const check = options.check ?? true;
+  const result = spawnSync2("git", ["-C", repo, ...args], {
+    encoding: "buffer",
+    maxBuffer: 100 * 1024 * 1024
+  });
+  const status = result.status ?? 1;
+  const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
+  const stderr = Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.from(result.stderr ?? "");
+  if (check && status !== 0) {
+    throw new SidecarError(stderr.toString("utf8").trim() || stdout.toString("utf8").trim());
+  }
+  return { status, stdout, stderr };
+}
+function gitRaw(args, options = {}) {
+  const check = options.check ?? true;
+  const result = spawnSync2("git", args, {
+    encoding: "utf8",
+    input: options.input,
+    maxBuffer: 100 * 1024 * 1024
+  });
+  const status = result.status ?? 1;
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  if (check && status !== 0) {
+    throw new SidecarError(stderr.trim() || stdout.trim());
+  }
+  return { status, stdout, stderr };
+}
+function fetch(repo, quiet, check = true) {
+  const args = ["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"];
+  if (quiet)
+    args.splice(1, 0, "--quiet");
+  git(repo, args, { check });
+}
+function hasAnyCommit(repo) {
+  return git(repo, ["rev-parse", "--verify", "HEAD"], { check: false }).status === 0;
+}
+function branchExists(repo, branch) {
+  return git(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { check: false }).status === 0;
+}
+function remoteRefExists(repo, branch) {
+  return git(repo, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`], {
+    check: false
+  }).status === 0;
+}
+function isAncestor(repo, maybeAncestor, descendant) {
+  return git(repo, ["merge-base", "--is-ancestor", maybeAncestor, descendant], { check: false }).status === 0;
+}
+function treeOf(repo, ref) {
+  return git(repo, ["rev-parse", `${ref}^{tree}`]).stdout.trim();
+}
+function emptyTree(repo) {
+  return git(repo, ["mktree"], { input: "" }).stdout.trim();
+}
+function gitToplevel(cwd) {
+  const root = gitToplevelOptional(cwd);
+  if (!root)
+    throw new SidecarError("not inside a Git repository");
+  return root;
+}
+function gitToplevelOptional(cwd) {
+  const result = gitRaw(["-C", cwd, "rev-parse", "--show-toplevel"], { check: false });
+  if (result.status !== 0)
+    return;
+  return result.stdout.trim();
+}
+function gitCommonDir(root) {
+  const commonDir = gitCommonDirOptional(root);
+  if (!commonDir)
+    throw new SidecarError("not inside a Git repository");
+  return commonDir;
+}
+function gitExcludePath(root) {
+  const commonDir = gitCommonDirOptional(root);
+  return commonDir ? path3.join(commonDir, "info", "exclude") : undefined;
+}
+function isGitIgnored(root, relativePath) {
+  return git(root, ["check-ignore", "-q", "--", relativePath], { check: false }).status === 0;
+}
+function isGitTracked(root, relativePath) {
+  return git(root, ["ls-files", "--error-unmatch", "--", relativePath], { check: false }).status === 0;
+}
+function gitCommonDirOptional(root) {
+  const result = gitRaw(["-C", root, "rev-parse", "--git-common-dir"], { check: false });
+  if (result.status !== 0)
+    return;
+  return path3.resolve(root, result.stdout.trim());
+}
+function gitDir(repo) {
+  const result = git(repo, ["rev-parse", "--git-dir"]).stdout.trim();
+  return path3.isAbsolute(result) ? result : path3.resolve(repo, result);
+}
+function hasGitMetadata(repo) {
+  return fs3.existsSync(path3.join(repo, ".git"));
+}
+function isDirty(repo) {
+  return Boolean(git(repo, ["status", "--porcelain"]).stdout.trim());
+}
+function ensureClean(repo) {
+  if (isDirty(repo))
+    throw new SidecarError("sidecar checkout has uncommitted changes");
+}
+function sidecarIdentity() {
+  return { name: currentUser(), email: `${slug(currentUser())}@${slug(currentHost())}.local` };
+}
+function ensureCommitIdentity(repo) {
+  const { name, email } = sidecarIdentity();
+  if (git(repo, ["config", "user.name"], { check: false }).status !== 0) {
+    git(repo, ["config", "user.name", name]);
+  }
+  if (git(repo, ["config", "user.email"], { check: false }).status !== 0) {
+    git(repo, ["config", "user.email", email]);
+  }
+}
+function familyPrimaryRoot(root) {
+  const primary = jjDefaultWorkspace(root) ?? gitMainWorktree(root);
+  if (!primary)
+    return;
+  return realpathOr(primary) === realpathOr(root) ? undefined : primary;
+}
+function jjDefaultWorkspace(root) {
+  const pointer = path3.join(root, ".jj", "repo");
+  try {
+    if (!fs3.statSync(pointer).isFile())
+      return;
+    const repo = path3.resolve(path3.dirname(pointer), fs3.readFileSync(pointer, "utf8").trim());
+    const workspace = path3.dirname(path3.dirname(repo));
+    return fs3.existsSync(path3.join(workspace, ".jj")) ? workspace : undefined;
+  } catch {
+    return;
+  }
+}
+function gitMainWorktree(root) {
+  const result = git(root, ["worktree", "list", "--porcelain"], { check: false });
+  if (result.status !== 0)
+    return;
+  const entry = result.stdout.split(/\r?\n/).find((line) => line.startsWith("worktree "));
+  return entry?.slice("worktree ".length).trim() || undefined;
+}
+var init_git = __esm(() => {
+  init_util();
+});
+
 // src/redaction.ts
 function redactText(input, mode = DEFAULT_REDACTION_MODE) {
   if (mode === "none")
@@ -1582,7 +1599,8 @@ function parseHealthRecord(text) {
     lastFailureAt: typeof record.lastFailureAt === "string" ? record.lastFailureAt : undefined,
     consecutiveFailures: typeof record.consecutiveFailures === "number" && Number.isFinite(record.consecutiveFailures) ? record.consecutiveFailures : 0,
     stage: typeof record.stage === "string" ? record.stage : undefined,
-    message: typeof record.message === "string" ? record.message : undefined
+    message: typeof record.message === "string" ? record.message : undefined,
+    review: record.review === "pending" || record.review === "attention" ? record.review : undefined
   };
 }
 function serializeHealthRecord(record) {
@@ -1595,24 +1613,27 @@ function nextHealthRecord(previous, identity, outcome, now) {
     ...identity,
     status: outcome.status,
     updatedAt: now,
-    lastSuccessAt: previous?.lastSuccessAt,
-    lastFailureAt: previous?.lastFailureAt,
+    lastSuccessAt: isoTimestamp(previous?.lastSuccessAt),
+    lastFailureAt: isoTimestamp(previous?.lastFailureAt),
     consecutiveFailures: 0
   };
   if (outcome.status === "ok")
-    return { ...base, lastSuccessAt: now };
+    return { ...base, lastSuccessAt: now, ...outcome.review ? { review: outcome.review } : {} };
   return {
     ...base,
     lastFailureAt: now,
-    consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
+    consecutiveFailures: Math.max(0, Math.floor(previous?.consecutiveFailures ?? 0)) + 1,
     stage: outcome.stage,
     message: redactText(outcome.message).trim().slice(-MESSAGE_LIMIT)
   };
 }
+function isoTimestamp(value) {
+  return value && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(value) ? value : undefined;
+}
 function shouldPublishHealth(previous, next, now = Date.now()) {
   if (!previous)
     return true;
-  if (next.status === "failed" || previous.status !== next.status)
+  if (next.status === "failed" || previous.status !== next.status || previous.review !== next.review)
     return true;
   const last = Date.parse(previous.updatedAt);
   if (!Number.isFinite(last))
@@ -3538,6 +3559,22 @@ function ensureDistinctCheckouts(peers) {
 function sameRemoteKey(remote) {
   return remote.trim().replace(/\/+$/, "").replace(/\.git$/, "");
 }
+function reviewRequired(config) {
+  return config.review === "required";
+}
+function privateFailures() {
+  return failuresArePrivate;
+}
+function keepFailuresPrivate() {
+  failuresArePrivate = true;
+}
+function notePeerPolicy(config) {
+  if (reviewRequired(config))
+    keepFailuresPrivate();
+}
+function reviewTimeoutSeconds(config) {
+  return config.reviewTimeout ?? DEFAULT_REVIEW_TIMEOUT_SECONDS;
+}
 function findConfigRoot(start) {
   const root = findConfigRootOptional(start);
   if (root)
@@ -3556,7 +3593,11 @@ function findConfigRootOptional(start) {
   }
 }
 function writeConfig(configPath, config) {
-  const text = [
+  notePeerPolicy(config);
+  fs5.writeFileSync(configPath, configText(config), "utf8");
+}
+function configText(config) {
+  return [
     `version = ${config.version}`,
     `remote = ${JSON.stringify(config.remote)}`,
     `path = ${JSON.stringify(config.path)}`,
@@ -3566,10 +3607,11 @@ function writeConfig(configPath, config) {
     `resolve = ${JSON.stringify(config.resolve ?? DEFAULT_RESOLVE)}`,
     ...config.debounce === undefined ? [] : [`debounce = ${config.debounce}`],
     ...config.interval === undefined ? [] : [`interval = ${config.interval}`],
+    ...reviewRequired(config) ? [`review = "required"`] : [],
+    ...config.reviewTimeout === undefined ? [] : [`review-timeout = ${config.reviewTimeout}`],
     ""
   ].join(`
 `);
-  fs5.writeFileSync(configPath, text, "utf8");
 }
 function readConfig(configPath, options = {}) {
   let values;
@@ -3580,9 +3622,21 @@ function readConfig(configPath, options = {}) {
     }
     values = parsed;
   } catch (error) {
+    if (error.code !== "ENOENT")
+      keepFailuresPrivate();
     if (error instanceof SidecarError)
       throw error;
     throw new SidecarError(`${configPath} is not valid TOML: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (values.review !== undefined && values.review !== "off")
+    keepFailuresPrivate();
+  const unknown = Object.keys(values).filter((key) => !CONFIG_KEYS.has(key));
+  if (unknown.length) {
+    throw new SidecarError(`${configPath}: unknown key${unknown.length > 1 ? "s" : ""} ${unknown.map((key) => JSON.stringify(key)).join(", ")}; this sidecar may be older than the config — update it with \`sidecar update\``);
+  }
+  const version = numberConfigValue(configPath, values, "version", CONFIG_VERSION);
+  if (version !== CONFIG_VERSION) {
+    throw new SidecarError(`${configPath}: config version ${version} is not supported by this sidecar (expected ${CONFIG_VERSION}); update it with \`sidecar update\``);
   }
   const remote = optionalStringConfigValue(configPath, values, "remote");
   if (!remote)
@@ -3592,7 +3646,7 @@ function readConfig(configPath, options = {}) {
   const config = {
     peer,
     remote,
-    version: numberConfigValue(configPath, values, "version", 1),
+    version,
     path: stringConfigValue(configPath, values, "path", DEFAULT_PATH),
     branch: stringConfigValue(configPath, values, "branch", DEFAULT_BRANCH),
     inbox: stringConfigValue(configPath, values, "inbox", DEFAULT_INBOX),
@@ -3600,6 +3654,8 @@ function readConfig(configPath, options = {}) {
     resolve: resolveModeConfigValue(stringConfigValue(configPath, values, "resolve", DEFAULT_RESOLVE), configPath),
     debounce: durationConfigValue(values.debounce, `${configPath} debounce`),
     interval: durationConfigValue(values.interval, `${configPath} interval`),
+    review: reviewModeConfigValue(stringConfigValue(configPath, values, "review", "off"), configPath),
+    reviewTimeout: durationConfigValue(values["review-timeout"], `${configPath} review-timeout`),
     rules: options.loadRules === false ? undefined : readRules(rulesPath),
     rulesPath
   };
@@ -3615,6 +3671,11 @@ function redactionModeConfigValue(value, source) {
   if (REDACTION_MODES.includes(value))
     return value;
   throw new SidecarError(`${source}: invalid redaction mode ${JSON.stringify(value)}; expected one of ${REDACTION_MODES.join(", ")}`);
+}
+function reviewModeConfigValue(value, source) {
+  if (REVIEW_MODES.includes(value))
+    return value;
+  throw new SidecarError(`${source}: invalid review mode ${JSON.stringify(value)}; expected one of ${REVIEW_MODES.join(", ")}`);
 }
 function durationConfigValue(value, source) {
   if (value === undefined)
@@ -3736,6 +3797,8 @@ function inboxPrefix(config) {
   return inboxBranchPrefix(config.inbox);
 }
 function remoteBranchName(remoteBranch) {
+  if (remoteBranch.startsWith(PUBLIC_REFS))
+    return remoteBranch.slice(PUBLIC_REFS.length);
   return remoteBranch.startsWith("origin/") ? remoteBranch.slice("origin/".length) : remoteBranch;
 }
 function matchesInboxPrefix(prefix, branch) {
@@ -3749,7 +3812,7 @@ function inboxBranchPrefix(template) {
   const slashIndex = staticPrefix.lastIndexOf("/");
   return slashIndex === -1 ? staticPrefix : staticPrefix.slice(0, slashIndex + 1);
 }
-var DEFAULT_PATH = "sidecar", DEFAULT_BRANCH = "main", DEFAULT_INBOX = "sidecar-inbox/{user}/{random}", branchValidity, DEFAULT_PEER = "default", PEER_ENV = "SIDECAR_PEER", PEER_NAME, RESERVED_PEER_SUFFIXES, RESOLVE_MODES, DEFAULT_RESOLVE = "fork";
+var DEFAULT_PATH = "sidecar", DEFAULT_BRANCH = "main", DEFAULT_INBOX = "sidecar-inbox/{user}/{random}", branchValidity, DEFAULT_PEER = "default", PEER_ENV = "SIDECAR_PEER", SOFT_SYNC_ENV = "SIDECAR_SYNC_SOFT", LOCAL_SYNC_ENV = "SIDECAR_SYNC_LOCAL", PEER_NAME, RESERVED_PEER_SUFFIXES, RESOLVE_MODES, DEFAULT_RESOLVE = "fork", REVIEW_MODES, DEFAULT_REVIEW_TIMEOUT_SECONDS, CONFIG_VERSION = 1, CONFIG_KEYS, failuresArePrivate = false, PUBLIC_REFS = "refs/sidecar-public/";
 var init_config = __esm(() => {
   init_dist();
   init_util();
@@ -3761,6 +3824,21 @@ var init_config = __esm(() => {
   PEER_NAME = /^[a-z0-9][a-z0-9-]*$/;
   RESERVED_PEER_SUFFIXES = new Set(["swp", "swo", "swx", "bak", "orig", "rej", "tmp", "old", "example", "sample", "lock"]);
   RESOLVE_MODES = ["fork", "lww"];
+  REVIEW_MODES = ["off", "required"];
+  DEFAULT_REVIEW_TIMEOUT_SECONDS = 60 * 60;
+  CONFIG_KEYS = new Set([
+    "version",
+    "remote",
+    "path",
+    "branch",
+    "inbox",
+    "redaction",
+    "resolve",
+    "debounce",
+    "interval",
+    "review",
+    "review-timeout"
+  ]);
 });
 
 // src/state.ts
@@ -3803,7 +3881,8 @@ function readSettings() {
       daemonEnabled: typeof record.daemonEnabled === "boolean" ? record.daemonEnabled : true,
       autoUpdate: typeof record.autoUpdate === "boolean" ? record.autoUpdate : true,
       lastUpdateCheckAt: typeof record.lastUpdateCheckAt === "string" ? record.lastUpdateCheckAt : undefined,
-      installSource: INSTALL_SOURCES.has(record.installSource) ? record.installSource : undefined
+      installSource: INSTALL_SOURCES.has(record.installSource) ? record.installSource : undefined,
+      reviewer: typeof record.reviewer === "string" && record.reviewer.trim() ? record.reviewer : undefined
     };
   } catch (error) {
     logSidecarEvent("failure", {
@@ -3823,6 +3902,8 @@ function writeSettings(settings) {
     record.lastUpdateCheckAt = settings.lastUpdateCheckAt;
   if (settings.installSource)
     record.installSource = settings.installSource;
+  if (settings.reviewer)
+    record.reviewer = settings.reviewer;
   fs6.writeFileSync(settingsPath(), `${JSON.stringify(record, null, 2)}
 `, "utf8");
 }
@@ -4073,8 +4154,21 @@ function acquireSyncLockOrThrow(root, peer) {
     return release;
   throw new SidecarError("another sidecar sync is already running; try again once it finishes");
 }
+function acquireSyncLockWaiting(root, peer) {
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + SYNC_LOCK_WAIT_MS;
+  while (true) {
+    const release = acquireSyncLock(root, peer);
+    if (release)
+      return release;
+    if (Date.now() >= deadline) {
+      throw new SidecarError("another sidecar sync is still running; try again once it finishes");
+    }
+    Atomics.wait(sleeper, 0, 0, 250);
+  }
+}
 function withSyncLock(root, peer, onBusy, fn) {
-  const releaseLock = onBusy === "skip" ? acquireSyncLock(root, peer) : acquireSyncLockOrThrow(root, peer);
+  const releaseLock = onBusy === "skip" ? acquireSyncLock(root, peer) : onBusy === "wait" ? acquireSyncLockWaiting(root, peer) : acquireSyncLockOrThrow(root, peer);
   if (!releaseLock) {
     console.log("another sidecar sync is already running; skipping this soft sync");
     return false;
@@ -4106,7 +4200,7 @@ function syncLockIsStale(lockDir) {
     return error.code !== "EPERM";
   }
 }
-var STATE_DIR_ENV = "SIDECAR_STATE_DIR", DEFAULT_SETTINGS, LOG_ROTATE_BYTES;
+var STATE_DIR_ENV = "SIDECAR_STATE_DIR", DEFAULT_SETTINGS, LOG_ROTATE_BYTES, SYNC_LOCK_WAIT_MS;
 var init_state = __esm(() => {
   init_util();
   init_git();
@@ -4115,6 +4209,7 @@ var init_state = __esm(() => {
   init_redaction();
   DEFAULT_SETTINGS = { daemonEnabled: true, autoUpdate: true };
   LOG_ROTATE_BYTES = 5 * 1024 * 1024;
+  SYNC_LOCK_WAIT_MS = 10 * 60 * 1000;
 });
 
 // src/service.ts
@@ -4415,12 +4510,395 @@ var init_service = __esm(() => {
   init_state();
 });
 
-// src/sync.ts
+// src/review.ts
 import crypto4 from "node:crypto";
 import fs8 from "node:fs";
-import os5 from "node:os";
 import path8 from "node:path";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
+import { spawn as spawn2, spawnSync as spawnSync4 } from "node:child_process";
+function newId() {
+  return crypto4.randomBytes(4).toString("hex");
+}
+function reviewsDir() {
+  return path8.join(sidecarStateDir(), "reviews");
+}
+function reviewDir(id) {
+  return path8.join(reviewsDir(), id);
+}
+function writePrivateFile(filePath, text) {
+  const temporary = `${filePath}.${crypto4.randomUUID()}.tmp`;
+  try {
+    fs8.writeFileSync(temporary, text, { encoding: "utf8", mode: 384 });
+    fs8.renameSync(temporary, filePath);
+  } finally {
+    fs8.rmSync(temporary, { force: true });
+  }
+}
+function writePrivateJson(filePath, value) {
+  writePrivateFile(filePath, `${JSON.stringify(value, null, 2)}
+`);
+}
+function readJson(filePath) {
+  try {
+    return JSON.parse(fs8.readFileSync(filePath, "utf8"));
+  } catch {
+    return;
+  }
+}
+function readReview(id) {
+  keepFailuresPrivate();
+  if (!ID_PATTERN.test(id))
+    return;
+  const dir = reviewDir(id);
+  const record = readJson(path8.join(dir, "review.json"));
+  if (!record || record.id !== id)
+    return;
+  const verdict = readJson(path8.join(dir, "verdict.json"));
+  const run = readJson(runPath(dir));
+  return { record, verdict, run, state: reviewState(record, verdict, run), dir };
+}
+function runPath(dir) {
+  return path8.join(dir, "run.json");
+}
+function reviewFamily(sidecarPath) {
+  return realpathOr(gitCommonDir(sidecarPath));
+}
+function listReviews(sidecarPath) {
+  let ids;
+  try {
+    ids = fs8.readdirSync(reviewsDir());
+  } catch {
+    return [];
+  }
+  const family = sidecarPath === undefined ? undefined : reviewFamily(sidecarPath);
+  return ids.map(readReview).filter((review) => review !== undefined).filter((review) => family === undefined || review.record.family === family).sort((left, right) => right.record.createdAt.localeCompare(left.record.createdAt) || right.record.id.localeCompare(left.record.id));
+}
+function findReview(idOrPrefix) {
+  const exact = readReview(idOrPrefix);
+  if (exact)
+    return exact;
+  const matches = listReviews().filter((review) => review.record.id.startsWith(idOrPrefix));
+  if (matches.length === 1)
+    return matches[0];
+  if (matches.length > 1)
+    throw new SidecarError(`review id ${JSON.stringify(idOrPrefix)} is ambiguous; use more of it`);
+  throw new SidecarError(`no review ${JSON.stringify(idOrPrefix)} on this machine`);
+}
+function isOpen(review) {
+  return review.state !== "published" && review.state !== "superseded";
+}
+function assertOpen(review) {
+  if (!isOpen(review))
+    throw new SidecarError(`review ${review.record.id} is already ${review.state}`);
+}
+function openReview(sidecarPath) {
+  return listReviews(sidecarPath).find(isOpen);
+}
+function reviewState(record, verdict, run) {
+  if (record.publishedAt)
+    return "published";
+  if (record.supersededAt)
+    return "superseded";
+  if (verdict)
+    return verdict.verdict;
+  if (run?.finishedAt && run.exitCode !== 0)
+    return "failed";
+  if (run && !run.finishedAt && !pidAlive(run.pid))
+    return "failed";
+  if (!run && record.launchedAt && (Date.now() - Date.parse(record.launchedAt)) / 1000 > LAUNCH_GRACE_SECONDS)
+    return "failed";
+  return "pending";
+}
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0)
+    return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+function reviewAttention(review, now = Date.now()) {
+  if (review.state === "rejected")
+    return "rejected";
+  if (review.state === "failed") {
+    const run = review.run;
+    if (!run)
+      return "reviewer never started";
+    if (run.finishedAt) {
+      return run.signal ? `reviewer stopped by ${run.signal} without a verdict` : `reviewer exited ${run.exitCode} without a verdict`;
+    }
+    return "reviewer stopped without a verdict";
+  }
+  if (review.state !== "pending")
+    return;
+  if (!review.record.launchedAt && !readSettings().reviewer)
+    return "no reviewer is configured on this machine";
+  const age = (now - Date.parse(review.record.createdAt)) / 1000;
+  if (age > review.record.timeoutSeconds)
+    return `undecided for over ${formatDuration(review.record.timeoutSeconds)}`;
+  return;
+}
+function formatDuration(seconds) {
+  if (seconds >= 3600 && seconds % 3600 === 0)
+    return `${seconds / 3600}h`;
+  if (seconds >= 60 && seconds % 60 === 0)
+    return `${seconds / 60}m`;
+  return `${Math.round(seconds)}s`;
+}
+function peerReviewGuidelinesFileName(name) {
+  return name === DEFAULT_PEER ? ".sidecar-review" : `.sidecar-review.${name}`;
+}
+function peerReviewGuidelinesPath(root, name) {
+  return path8.join(root, peerReviewGuidelinesFileName(name));
+}
+function readGuidelines(root, peer) {
+  try {
+    const text = fs8.readFileSync(peerReviewGuidelinesPath(root, peer), "utf8").trim();
+    return text || undefined;
+  } catch (error) {
+    if (error.code === "ENOENT")
+      return;
+    throw new SidecarError(`could not read ${peerReviewGuidelinesPath(root, peer)}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+function createReview(options) {
+  const { root, config, sidecarPath, base, head } = options;
+  const guidelines = readGuidelines(root, config.peer);
+  const id = newId();
+  const dir = reviewDir(id);
+  fs8.mkdirSync(reviewsDir(), { recursive: true, mode: 448 });
+  fs8.mkdirSync(dir, { mode: 448 });
+  const fields = git(sidecarPath, ["diff-tree", ...PACKET_DIFF_OPTIONS, "--name-status", "-z", base, head]).stdout.split("\x00").filter(Boolean);
+  const files = [];
+  for (let index = 0;index + 1 < fields.length; index += 2)
+    files.push({ status: fields[index], path: fields[index + 1] });
+  writeOpaqueArtifacts(sidecarPath, dir, base, head, files);
+  const diff = git(sidecarPath, ["diff-tree", ...PACKET_DIFF_OPTIONS, "-p", "--no-color", "--no-ext-diff", "--no-textconv", base, head]).stdout;
+  const record = {
+    schema: REVIEW_SCHEMA,
+    id,
+    family: reviewFamily(sidecarPath),
+    root,
+    peer: config.peer,
+    base,
+    head,
+    tree: treeOf(sidecarPath, head),
+    files,
+    createdAt: nowIso(),
+    timeoutSeconds: reviewTimeoutSeconds(config)
+  };
+  writePrivateFile(path8.join(dir, "diff.patch"), diff);
+  if (guidelines)
+    writePrivateFile(path8.join(dir, "guidelines.md"), `${guidelines}
+`);
+  writePrivateFile(path8.join(dir, "instructions.md"), reviewInstructions(record, config, guidelines));
+  writePrivateJson(path8.join(dir, "review.json"), record);
+  logSidecarEvent("review-open", { id, root, peer: config.peer, files: files.length });
+  pruneClosedReviews(sidecarPath);
+  return { record, state: "pending", dir };
+}
+function writeOpaqueArtifacts(repo, dir, from, head, files) {
+  const binary = new Set(git(repo, ["diff-tree", ...PACKET_DIFF_OPTIONS, "--numstat", "-z", from, head]).stdout.split("\x00").filter((entry) => entry.startsWith("-\t-\t")).map((entry) => entry.slice("-\t-\t".length)));
+  const blobs = new Set(git(repo, ["ls-tree", "-r", "-z", "--full-tree", head]).stdout.split("\x00").filter((entry) => entry.split(" ")[1] === "blob").map((entry) => entry.slice(entry.indexOf("\t") + 1)));
+  const utf8 = new TextDecoder("utf-8", { fatal: true });
+  const isText = (blob) => {
+    try {
+      utf8.decode(blob);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  let count = 0;
+  for (const file of files) {
+    if (file.status === "D" || !blobs.has(file.path))
+      continue;
+    const blob = gitBytes(repo, ["cat-file", "blob", `${head}:${file.path}`]).stdout;
+    if (!binary.has(file.path) && isText(blob))
+      continue;
+    count += 1;
+    file.artifact = path8.join("opaque", String(count).padStart(4, "0"));
+    fs8.mkdirSync(path8.join(dir, "opaque"), { recursive: true, mode: 448 });
+    fs8.writeFileSync(path8.join(dir, file.artifact), blob, { mode: 384 });
+  }
+}
+function updateRecord(review, change) {
+  const record = { ...review.record, ...change };
+  writePrivateJson(path8.join(review.dir, "review.json"), record);
+  review.record = record;
+}
+function markPublishing(review, inbox, commit) {
+  updateRecord(review, { publishing: { inbox, commit } });
+}
+function markPublished(review, commit) {
+  updateRecord(review, { publishedAt: nowIso(), publishedCommit: commit });
+  logSidecarEvent("review-published", { id: review.record.id, commit });
+}
+function markSuperseded(review) {
+  updateRecord(review, { supersededAt: nowIso() });
+  logSidecarEvent("review-superseded", { id: review.record.id });
+}
+function pruneClosedReviews(sidecarPath) {
+  const closed = listReviews(sidecarPath).filter((review) => !isOpen(review));
+  for (const review of closed.slice(KEEP_CLOSED_REVIEWS)) {
+    fs8.rmSync(review.dir, { recursive: true, force: true });
+  }
+}
+function pruneOrphanedReviews() {
+  for (const review of listReviews()) {
+    if (!fs8.existsSync(review.record.family))
+      fs8.rmSync(review.dir, { recursive: true, force: true });
+  }
+}
+function opaqueSection(record) {
+  const opaque = record.files.filter((file) => file.artifact);
+  if (!opaque.length)
+    return "";
+  return `
+These files' content does not appear faithfully in \`diff.patch\` (binary, not
+UTF-8, or diffs turned off). Their complete new content, as it would be
+published, is in the packet.
+Inspect each one; if you cannot, do not approve:
+
+${opaque.map((file) => `- \`${file.artifact}\` — ${file.path}`).join(`
+`)}
+`;
+}
+function reviewInstructions(record, config, guidelines) {
+  return `# Sidecar publish review ${record.id}
+
+A sidecar is a scratchpad repository that syncs automatically to a shared Git
+remote (${redactText(config.remote)}). This machine wants to publish the change in
+\`diff.patch\`. Everyone with access to that remote can read what you approve,
+and it stays in the remote's history.
+
+Decide whether anything in the change should not leave this machine. This is
+not a code review: ignore quality, style, and correctness.
+
+Secret redaction has already run. Values it caught appear as placeholders such
+as \`<API_KEY>\`, \`<TOKEN>\`, or \`<SECRET>\`; they are not leaks. Look for what
+pattern matching misses:
+
+- credentials in unusual formats, or ones split across lines
+- personal data about real people: contact details, health, finances, private conversations
+- confidential material: customer names and data, unreleased plans, internal-only details
+- anything the repository's guidelines below rule out
+
+## Files
+
+All in this directory (\`$SIDECAR_REVIEW_DIR\`):
+
+- \`diff.patch\` — the change exactly as it would be published
+- \`review.json\` — the repository, peer, and changed paths
+${guidelines ? "- `guidelines.md` — this repository's guidelines, repeated below\n" : ""}${opaqueSection(record)}
+## Guidelines
+
+${guidelines ?? "This repository has no review guidelines (`.sidecar-review` beside its `.sidecar`)."}
+
+## Decide
+
+Approve, and the change is published on the next sync:
+
+    sidecar review approve ${record.id}
+
+Reject, saying which file and what kind of content. Do not repeat the
+sensitive value itself:
+
+    sidecar review reject ${record.id} --reason "<file: what kind of content>"
+
+If you are unsure, or a person should weigh in, do neither: leave the review
+open and raise it with them. Nothing is published until someone approves, and
+they decide with the same two commands.
+`;
+}
+function configuredReviewer() {
+  const command = readSettings().reviewer;
+  if (!command)
+    throw new SidecarError("no reviewer is configured; set one with `sidecar review reviewer <command>`");
+  return command;
+}
+function launchReviewer(review) {
+  updateRecord(review, { launchedAt: nowIso() });
+  const child = spawn2(process.execPath, [sidecarCliPath(), "review", "run", review.record.id], {
+    cwd: review.dir,
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, [SKIP_LOCAL_EXEC_ENV]: "1" }
+  });
+  child.unref();
+  logSidecarEvent("review-launch", { id: review.record.id });
+}
+function runReviewer(idOrPrefix) {
+  const review = findReview(idOrPrefix);
+  const { id } = review.record;
+  assertOpen(review);
+  if (review.run)
+    throw new SidecarError(`review ${id}'s reviewer already ran; \`sidecar review retry ${id}\` opens a new review of the same change`);
+  const command = configuredReviewer();
+  const file = runPath(review.dir);
+  const run = { pid: process.pid, command, startedAt: nowIso() };
+  writePrivateJson(file, run);
+  const log = fs8.openSync(path8.join(review.dir, "reviewer.log"), "a", 384);
+  let result;
+  try {
+    result = spawnSync4("/bin/sh", ["-c", command], {
+      cwd: review.dir,
+      stdio: ["ignore", log, log],
+      env: reviewerEnv(review)
+    });
+  } finally {
+    fs8.closeSync(log);
+  }
+  const finished = { ...run, finishedAt: nowIso(), exitCode: result.status, signal: result.signal };
+  writePrivateJson(file, finished);
+  logSidecarEvent("review-run", { id, exitCode: result.status, signal: result.signal });
+  return 0;
+}
+function reviewerEnv(review) {
+  const env = { ...process.env };
+  for (const name of [PEER_ENV, SOFT_SYNC_ENV, LOCAL_SYNC_ENV, SKIP_LOCAL_EXEC_ENV, GLOBAL_EXEC_ENV])
+    delete env[name];
+  const { record } = review;
+  return {
+    ...env,
+    SIDECAR_REVIEW_ID: record.id,
+    SIDECAR_REVIEW_DIR: review.dir,
+    SIDECAR_REVIEW_PROMPT: path8.join(review.dir, "instructions.md"),
+    SIDECAR_REVIEW_DIFF: path8.join(review.dir, "diff.patch"),
+    SIDECAR_REVIEW_ROOT: record.root,
+    SIDECAR_REVIEW_PEER: record.peer,
+    SIDECAR_REVIEW_CONFIG: peerConfigPath(record.root, record.peer)
+  };
+}
+function decideReview(review, verdict, reason) {
+  assertOpen(review);
+  if (review.record.publishing && verdict === "rejected") {
+    throw new SidecarError(`review ${review.record.id} is already being published; it can no longer be rejected`);
+  }
+  const record = { verdict, ...reason ? { reason } : {}, decidedAt: nowIso() };
+  writePrivateJson(path8.join(review.dir, "verdict.json"), record);
+  review.verdict = record;
+  review.state = verdict;
+  logSidecarEvent("review-decision", { id: review.record.id, verdict });
+}
+var REVIEW_SCHEMA = 1, KEEP_CLOSED_REVIEWS = 10, ID_PATTERN, LAUNCH_GRACE_SECONDS = 60, PACKET_DIFF_OPTIONS;
+var init_review = __esm(() => {
+  init_util();
+  init_git();
+  init_install();
+  init_config();
+  init_state();
+  init_redaction();
+  ID_PATTERN = /^[0-9a-f]+$/;
+  PACKET_DIFF_OPTIONS = ["-r", "--no-renames", "--ignore-submodules=none"];
+});
+
+// src/sync.ts
+import crypto5 from "node:crypto";
+import fs9 from "node:fs";
+import os5 from "node:os";
+import path9 from "node:path";
 function syncProject(root, config, options) {
   const stage = (name) => options.onStage?.(name);
   stage("checkout");
@@ -4428,6 +4906,7 @@ function syncProject(root, config, options) {
   if (!options.remote && !hasAnyCommit(sidecarPath)) {
     throw new SidecarError(`local sync requires an initialized sidecar checkout at ${sidecarPath}; run \`sidecar sync\` first`);
   }
+  bindReviewPolicy(sidecarPath, config);
   const inbox = expandInbox(config, sidecarPath);
   ensureCommitIdentity(sidecarPath);
   ensureRedactionFilter(sidecarPath, config.redaction, config);
@@ -4444,7 +4923,9 @@ function syncProject(root, config, options) {
     settleCheckouts(sidecarPath, config, inbox, siblings);
   }
   if (!options.remote)
-    return;
+    return {};
+  if (reviewRequired(config))
+    return publishReviewed(root, sidecarPath, config, inbox, siblings, stage);
   stage("push-inbox");
   syncBranchBeforePush(sidecarPath, inbox, config);
   pushBranch(sidecarPath, inbox);
@@ -4452,6 +4933,288 @@ function syncProject(root, config, options) {
   mergeInboxBranches(sidecarPath, config, { forkFiles: true, push: true, remote: true });
   stage("settle-remote");
   settleCheckouts(sidecarPath, config, inbox, siblings);
+  return {};
+}
+function withPublicGit(repo, fn) {
+  assertRedactionFilterIntact(repo);
+  const { name, email } = sidecarIdentity();
+  const overrides = [
+    ["core.hooksPath", os5.devNull],
+    ["core.attributesFile", os5.devNull],
+    ["core.autocrlf", "false"],
+    ["commit.gpgSign", "false"],
+    ["tag.gpgSign", "false"],
+    ["i18n.commitEncoding", "UTF-8"],
+    ["rerere.enabled", "false"],
+    ["rerere.autoUpdate", "false"],
+    ["merge.renormalize", "false"],
+    ["merge.default", "text"],
+    ["push.pushOption", ""],
+    ["push.followTags", "false"],
+    ...neutralizedDrivers(repo)
+  ];
+  const env = {
+    GIT_AUTHOR_NAME: name,
+    GIT_AUTHOR_EMAIL: email,
+    GIT_COMMITTER_NAME: name,
+    GIT_COMMITTER_EMAIL: email,
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_ATTR_SOURCE: emptyTree(repo),
+    GIT_CONFIG_PARAMETERS: undefined,
+    GIT_CONFIG_COUNT: String(overrides.length)
+  };
+  overrides.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${index}`] = key;
+    env[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
+  const saved = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  const apply = (values) => {
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined)
+        delete process.env[key];
+      else
+        process.env[key] = value;
+    }
+  };
+  apply(env);
+  try {
+    return fn();
+  } finally {
+    apply(saved);
+  }
+}
+function neutralizedDrivers(repo) {
+  const keys = git(repo, ["config", "--name-only", "--get-regexp", "^(merge|filter)\\..+\\.(driver|clean|smudge|process)$"], { check: false }).stdout.split(`
+`).filter(Boolean);
+  return keys.flatMap((key) => {
+    const [section, ...rest] = key.split(".");
+    const driver = rest.slice(0, -1).join(".");
+    if (section === "merge")
+      return [[`merge.${driver}.driver`, "git merge-file --marker-size=%L %A %O %B"]];
+    if (driver === REDACTION_FILTER_NAME)
+      return [];
+    return [[`filter.${driver}.clean`, "cat"], [`filter.${driver}.smudge`, "cat"], [`filter.${driver}.process`, ""], [`filter.${driver}.required`, "false"]];
+  });
+}
+function assertRedactionFilterIntact(repo) {
+  if (git(repo, ["config", "--get-all", `filter.${REDACTION_FILTER_NAME}.process`], { check: false }).status === 0) {
+    throw new SidecarError(`filter.${REDACTION_FILTER_NAME}.process is configured; remove it — a review-gated peer publishes only through sidecar's own redaction filter`);
+  }
+}
+function assertPublishDestination(repo) {
+  const pushUrl = git(repo, ["config", "--get-all", "remote.origin.pushurl"], { check: false }).stdout.trim();
+  if (!pushUrl)
+    return;
+  const url = git(repo, ["config", "--get", "remote.origin.url"], { check: false }).stdout.trim();
+  if (pushUrl !== url) {
+    throw new SidecarError("remote.origin.pushurl sends this sidecar's pushes somewhere other than its remote; a review-gated peer publishes only to its remote — unset it");
+  }
+}
+function fetchPublic(repo) {
+  git(repo, ["fetch", "--quiet", "--prune", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*", `+refs/heads/*:${PUBLIC_REFS}*`]);
+}
+function publicRef(branch) {
+  return `${PUBLIC_REFS}${branch}`;
+}
+function refreshPublicRefs(repo) {
+  withPublicGit(repo, () => fetchPublic(repo));
+}
+function publicTip(repo, branch) {
+  return git(repo, ["rev-parse", "--verify", "--quiet", publicRef(branch)], { check: false }).stdout.trim() || undefined;
+}
+function isPublic(repo, commit) {
+  return Boolean(git(repo, ["for-each-ref", "--contains", commit, "--format=%(refname)", PUBLIC_REFS]).stdout.trim());
+}
+function publishReviewed(root, sidecarPath, config, inbox, siblings, stage) {
+  stage("fetch");
+  withPublicGit(sidecarPath, () => {
+    fetchPublic(sidecarPath);
+    if (!publicTip(sidecarPath, config.branch))
+      bootstrapReviewedMain(sidecarPath, config);
+    stage("publish");
+    const open = openReview(sidecarPath);
+    if (open?.state === "approved")
+      publishApprovedReview(sidecarPath, config, inbox, open);
+  });
+  stage("merge");
+  withPublicGit(sidecarPath, () => mergeFetchedInboxes(sidecarPath, config, { forkFiles: true }));
+  stage("merge-local");
+  mergeInboxBranches(sidecarPath, config, { forkFiles: true, push: false, remote: false });
+  stage("settle-remote");
+  settleCheckouts(sidecarPath, config, inbox, siblings);
+  stage("review");
+  const gate = withPublicGit(sidecarPath, () => gateUnpublished(root, sidecarPath, config));
+  if (gate?.launch)
+    launchReviewer(gate.review);
+  return gate ? { held: { review: gate.review, attention: reviewAttention(gate.review) } } : {};
+}
+function gateUnpublished(root, sidecarPath, config) {
+  const head = git(sidecarPath, ["rev-parse", `refs/heads/${config.branch}`]).stdout.trim();
+  const headTree = treeOf(sidecarPath, head);
+  const publicMain = publicTip(sidecarPath, config.branch);
+  const base = publicMain && git(sidecarPath, ["merge-base", head, publicMain], { check: false }).stdout.trim();
+  if (!base)
+    throw new SidecarError(`local ${config.branch} shares no history with the remote's; nothing is reviewed or published until it does`);
+  const open = openReview(sidecarPath);
+  const hasReviewer = Boolean(readSettings().reviewer);
+  if (treeOf(sidecarPath, base) === headTree) {
+    if (open && open.state !== "approved")
+      markSuperseded(open);
+    return;
+  }
+  if (open?.state === "pending" || open?.state === "approved") {
+    return { review: open, launch: open.state === "pending" && !open.record.launchedAt && hasReviewer };
+  }
+  if (open) {
+    if (open.record.tree === headTree)
+      return { review: open, launch: false };
+    markSuperseded(open);
+  }
+  const review = createReview({ root, config, sidecarPath, base, head });
+  console.log(`opened review ${paint("brand", review.record.id)} for ${review.record.files.length} changed file(s)`);
+  return { review, launch: hasReviewer };
+}
+function publishApprovedReview(sidecarPath, config, inbox, review) {
+  const { record } = review;
+  const target = record.publishing ?? { inbox, commit: cutPublishCommit(sidecarPath, config, inbox, record) };
+  const protectRef = publishingRef(record.id);
+  if (!isPublic(sidecarPath, target.commit)) {
+    const parents = git(sidecarPath, ["rev-list", "--parents", "-n", "1", target.commit]).stdout.trim().split(" ").slice(1);
+    if (!parents.every((parent) => isPublic(sidecarPath, parent))) {
+      markSuperseded(review);
+      git(sidecarPath, ["update-ref", "-d", protectRef], { check: false });
+      console.log(`review ${paint("brand", record.id)} was measured from a commit the remote does not have; reviewing again`);
+      return;
+    }
+    assertPublishDestination(sidecarPath);
+    if (!record.publishing) {
+      git(sidecarPath, ["update-ref", protectRef, target.commit]);
+      markPublishing(review, target.inbox, target.commit);
+    }
+    const push = git(sidecarPath, ["push", "--no-follow-tags", "origin", `${target.commit}:refs/heads/${target.inbox}`], { check: false });
+    if (push.status !== 0) {
+      throw new SidecarError(push.stderr.trim() || `could not publish review ${record.id} to ${target.inbox}`);
+    }
+    fetchPublic(sidecarPath);
+    console.log(`published review ${paint("brand", record.id)} to ${paint("brand", target.inbox)}`);
+  }
+  linkPublished(sidecarPath, config, review, target.commit);
+  markPublished(review, target.commit);
+  git(sidecarPath, ["update-ref", "-d", protectRef], { check: false });
+}
+function publishingRef(id) {
+  return `refs/sidecar-publishing/${id}`;
+}
+function retryReview(review) {
+  const { record } = review;
+  if (!isOpen(review))
+    throw new SidecarError(`review ${record.id} is already ${review.state}`);
+  if (record.publishing)
+    throw new SidecarError(`review ${record.id} is already being published`);
+  if (review.state === "approved")
+    throw new SidecarError(`review ${record.id} is approved and publishes on the next sync`);
+  const config = loadPeer(record.root, record.peer).config;
+  const sidecarPath = requireSidecarCheckout(record.root, config);
+  markSuperseded(review);
+  const fresh = withPublicGit(sidecarPath, () => createReview({ root: record.root, config, sidecarPath, base: record.base, head: record.head }));
+  launchReviewer(fresh);
+  return fresh;
+}
+function cutPublishCommit(sidecarPath, config, inbox, record) {
+  const previous = publicTip(sidecarPath, inbox);
+  const parents = [record.base, ...previous && !isAncestor(sidecarPath, previous, record.base) ? [previous] : []];
+  const body = [
+    "sidecar publish",
+    "",
+    `source: ${currentMachine()}`,
+    `inbox: ${inbox}`,
+    `review: ${record.id}`,
+    ...publishedWriteTrailers(sidecarPath, config, record)
+  ];
+  return git(sidecarPath, [
+    "commit-tree",
+    record.tree,
+    ...parents.flatMap((parent) => ["-p", parent]),
+    "-m",
+    body.join(`
+`)
+  ]).stdout.trim();
+}
+function publishedWriteTrailers(repo, config, record) {
+  const defaults = { resolve: config.resolve, redaction: config.redaction };
+  const paths = record.files.map((file) => file.path).filter((filePath) => resolveFileRules(config.rules, filePath, defaults).resolve === "lww");
+  if (paths.length > WRITTEN_TRAILER_LIMIT)
+    return [];
+  const now = Math.floor(Date.now() / 1000);
+  return paths.map((filePath) => {
+    const { time } = lastWriteEvent(repo, record.head, filePath);
+    return lwwWrittenTrailer(filePath, { time: Math.min(Math.max(0, time), now), source: `review-${record.id}` });
+  });
+}
+function linkPublished(sidecarPath, config, review, published) {
+  const main = `refs/heads/${config.branch}`;
+  if (isAncestor(sidecarPath, published, main))
+    return;
+  if (!isAncestor(sidecarPath, review.record.head, main)) {
+    logSidecarEvent("review-link-skip", { sidecarPath, id: review.record.id });
+    return;
+  }
+  withScratchWorktree(sidecarPath, config, "HEAD", (worktree) => {
+    git(worktree, ["switch", config.branch]);
+    git(worktree, ["merge", "--no-ff", "-s", "ours", "-m", `sidecar: link published review ${review.record.id}`, published]);
+  });
+}
+function mergePublishedInboxes(sidecarPath, config, options) {
+  return withPublicGit(sidecarPath, () => {
+    fetchPublic(sidecarPath);
+    return mergeFetchedInboxes(sidecarPath, config, options);
+  });
+}
+function mergeFetchedInboxes(sidecarPath, config, options) {
+  if (!publicTip(sidecarPath, config.branch))
+    return 0;
+  const publicMain = publicRef(config.branch);
+  if (publishedInboxBranches(sidecarPath, config).every((ref) => isAncestor(sidecarPath, ref, publicMain))) {
+    console.log("no published inbox branches to merge");
+    return 0;
+  }
+  assertPublishDestination(sidecarPath);
+  return withScratchWorktree(sidecarPath, config, publicMain, (worktree) => {
+    assertRedactionFilterIntact(worktree);
+    const maxAttempts = 3;
+    for (let attempt = 1;; attempt += 1) {
+      if (attempt > 1) {
+        fetchPublic(sidecarPath);
+        git(worktree, ["reset", "--hard", publicMain]);
+      }
+      const pending = publishedInboxBranches(worktree, config).filter((ref) => !isAncestor(worktree, ref, "HEAD"));
+      if (!pending.length) {
+        console.log("no published inbox branches to merge");
+        return 0;
+      }
+      const merged = [];
+      for (const ref of pending) {
+        console.log(`merging ${paint("brand", remoteBranchName(ref))}`);
+        if (mergeInboxBranch(worktree, config, ref, options))
+          merged.push(ref);
+      }
+      const push = git(worktree, ["push", "--no-follow-tags", "origin", `HEAD:refs/heads/${config.branch}`], { check: false });
+      if (push.status !== 0) {
+        if (attempt >= maxAttempts)
+          throw new SidecarError(push.stderr.trim() || `could not push ${config.branch}`);
+        console.log(`push of ${config.branch} was rejected; refetching and retrying`);
+        continue;
+      }
+      fetchPublic(sidecarPath);
+      console.log(`pushed ${config.branch}`);
+      console.log(`merged ${merged.length} inbox branch(es)`);
+      return merged.length;
+    }
+  });
+}
+function publishedInboxBranches(repo, config) {
+  const prefix = inboxPrefix(config);
+  return git(repo, ["for-each-ref", "--format=%(refname)", PUBLIC_REFS]).stdout.split(/\r?\n/).map((ref) => ref.trim()).filter((ref) => ref && matchesInboxPrefix(prefix, ref.slice(PUBLIC_REFS.length))).sort();
 }
 function settleCheckouts(sidecarPath, config, inbox, siblings) {
   refreshInboxFromMain(sidecarPath, config, inbox);
@@ -4465,7 +5228,7 @@ function settleCheckouts(sidecarPath, config, inbox, siblings) {
     } catch (error) {
       logSidecarEvent("settle-skip", {
         sidecarPath: sibling,
-        message: error instanceof Error ? error.message : String(error)
+        ...reviewRequired(config) ? {} : { message: error instanceof Error ? error.message : String(error) }
       });
     }
   }
@@ -4500,32 +5263,43 @@ function reportSyncHealth(root, config, outcome) {
     const sidecarPath = resolveSidecarPath(root, config);
     if (!hasGitMetadata(sidecarPath))
       return;
-    const branch = healthBranchFor(sidecarPath);
-    const previous = readHealthRecordAt(sidecarPath, `origin/${branch}`);
-    const identity = {
-      machine: `${currentUser()}@${currentHost()}`,
-      root,
-      peer: config.peer === DEFAULT_PEER ? undefined : config.peer,
-      inbox: expandInbox(config, sidecarPath),
-      version: packageVersion()
-    };
-    const record = nextHealthRecord(previous, identity, outcome, nowIso());
-    if (!shouldPublishHealth(previous, record))
-      return;
-    publishHealthRecord(sidecarPath, branch, record);
-    logSidecarEvent("health", {
-      branch,
-      status: record.status,
-      stage: record.stage,
-      consecutiveFailures: record.consecutiveFailures
-    });
+    withPublicGit(sidecarPath, () => publishHealth(root, config, sidecarPath, outcome));
   } catch (error) {
     logSidecarEvent("failure", {
       command: "health",
       root,
-      message: `could not publish health: ${error instanceof Error ? error.message : String(error)}`
+      message: reviewRequired(config) ? "could not publish health" : `could not publish health: ${error instanceof Error ? error.message : String(error)}`
     });
   }
+}
+function publishHealth(root, config, sidecarPath, outcome) {
+  const branch = healthBranchFor(sidecarPath);
+  const gated = reviewRequired(config);
+  if (gated && outcome.status === "failed") {
+    try {
+      fetchPublic(sidecarPath);
+    } catch {}
+  }
+  const previous = readHealthRecordAt(sidecarPath, gated ? publicRef(branch) : `origin/${branch}`);
+  const identity = {
+    machine: currentMachine(),
+    root,
+    peer: config.peer === DEFAULT_PEER ? undefined : config.peer,
+    inbox: expandInbox(config, sidecarPath),
+    version: packageVersion()
+  };
+  const record = nextHealthRecord(previous, identity, outcome, nowIso());
+  if (!shouldPublishHealth(previous, record))
+    return;
+  if (gated)
+    assertPublishDestination(sidecarPath);
+  publishHealthRecord(sidecarPath, branch, record);
+  logSidecarEvent("health", {
+    branch,
+    status: record.status,
+    stage: record.stage,
+    consecutiveFailures: record.consecutiveFailures
+  });
 }
 function publishHealthRecord(sidecarPath, branch, record) {
   const blob = git(sidecarPath, ["hash-object", "-w", "--stdin"], {
@@ -4535,17 +5309,8 @@ function publishHealthRecord(sidecarPath, branch, record) {
     input: `100644 blob ${blob}	${HEALTH_FILE}
 `
   }).stdout.trim();
-  const commit = git(sidecarPath, [
-    "-c",
-    `user.name=${currentUser()}`,
-    "-c",
-    `user.email=${slug(currentUser())}@${slug(currentHost())}.local`,
-    "commit-tree",
-    tree,
-    "-m",
-    `health: ${record.status} — ${record.machine}`
-  ]).stdout.trim();
-  git(sidecarPath, ["push", "--force", "origin", `${commit}:refs/heads/${branch}`]);
+  const commit = git(sidecarPath, ["commit-tree", tree, "-m", `health: ${record.status} — ${record.machine}`]).stdout.trim();
+  git(sidecarPath, ["push", "--no-follow-tags", "--force", "origin", `${commit}:refs/heads/${branch}`]);
 }
 function readHealthRecordAt(sidecarPath, ref) {
   const result = git(sidecarPath, ["show", `${ref}:${HEALTH_FILE}`], { check: false });
@@ -4572,9 +5337,9 @@ function mergeInboxBranches(sidecarPath, config, options) {
   ensureCommitIdentity(sidecarPath);
   if (options.remote)
     fetch(sidecarPath, false);
-  if (!hasPendingInboxWork(sidecarPath, config)) {
+  if (!hasPendingInboxWork(sidecarPath, config) && mainContainsRemote(sidecarPath, config)) {
     if (options.push && !mainMatchesRemote(sidecarPath, config)) {
-      const push = git(sidecarPath, ["push", "origin", `refs/heads/${config.branch}:refs/heads/${config.branch}`], {
+      const push = git(sidecarPath, ["push", "--no-follow-tags", "origin", `refs/heads/${config.branch}:refs/heads/${config.branch}`], {
         check: false
       });
       if (push.status === 0) {
@@ -4593,18 +5358,21 @@ function mergeInboxBranches(sidecarPath, config, options) {
   if (git(sidecarPath, ["branch", "--show-current"]).stdout.trim() === config.branch) {
     ensureInboxBranch(sidecarPath, config, expandInbox(config, sidecarPath));
   }
-  const scratch = path8.join(os5.tmpdir(), `sidecar-merge-${crypto4.createHash("sha1").update(sidecarPath).digest("hex").slice(0, 12)}`);
-  const worktree = path8.join(scratch, "checkout");
+  return withScratchWorktree(sidecarPath, config, "HEAD", (worktree) => mergeInboxBranchesAt(worktree, config, options));
+}
+function withScratchWorktree(sidecarPath, config, start, fn) {
+  const scratch = path9.join(os5.tmpdir(), `sidecar-merge-${crypto5.createHash("sha1").update(sidecarPath).digest("hex").slice(0, 12)}`);
+  const worktree = path9.join(scratch, "checkout");
   git(sidecarPath, ["worktree", "remove", "--force", worktree], { check: false });
-  fs8.rmSync(scratch, { recursive: true, force: true });
+  fs9.rmSync(scratch, { recursive: true, force: true });
   git(sidecarPath, ["worktree", "prune", "--expire", "now"], { check: false });
   try {
-    git(sidecarPath, ["worktree", "add", "--detach", worktree]);
+    git(sidecarPath, ["worktree", "add", "--detach", worktree, start]);
     ensureRedactionFilter(worktree, config.redaction, config);
-    return mergeInboxBranchesAt(worktree, config, options);
+    return fn(worktree);
   } finally {
     git(sidecarPath, ["worktree", "remove", "--force", worktree], { check: false });
-    fs8.rmSync(scratch, { recursive: true, force: true });
+    fs9.rmSync(scratch, { recursive: true, force: true });
   }
 }
 function mainMatchesRemote(repo, config) {
@@ -4614,6 +5382,11 @@ function mainMatchesRemote(repo, config) {
   const local = refs.get(localRef);
   const remote = refs.get(remoteRef);
   return local !== undefined && local === remote;
+}
+function mainContainsRemote(repo, config) {
+  if (!remoteRefExists(repo, config.branch) || !branchExists(repo, config.branch))
+    return true;
+  return isAncestor(repo, `origin/${config.branch}`, `refs/heads/${config.branch}`);
 }
 function hasPendingInboxWork(repo, config) {
   const main = `refs/heads/${config.branch}`;
@@ -4638,7 +5411,7 @@ function mergeInboxBranchesAt(sidecarPath, config, options) {
         merged.push(remoteBranch);
     }
     if (options.push) {
-      const push = git(sidecarPath, ["push", "-u", "origin", `HEAD:refs/heads/${config.branch}`], { check: false });
+      const push = git(sidecarPath, ["push", "--no-follow-tags", "-u", "origin", `HEAD:refs/heads/${config.branch}`], { check: false });
       if (push.status !== 0) {
         if (attempt >= maxAttempts) {
           throw new SidecarError(push.stderr.trim() || `could not push ${config.branch}`);
@@ -4709,10 +5482,10 @@ function familySidecarCheckout(root, config) {
   } catch {
     return;
   }
-  if (primaryConfig.remote !== config.remote)
+  if (!sharesFamilyCheckout(primaryConfig, config))
     return;
   const primaryPath = resolveSidecarPath(primary, primaryConfig);
-  if (path8.resolve(primaryPath) === path8.resolve(primary))
+  if (path9.resolve(primaryPath) === path9.resolve(primary))
     return;
   if (!hasGitMetadata(primaryPath))
     cloneOrUpdate(primary, primaryConfig, true);
@@ -4732,7 +5505,7 @@ function checkoutIsUnlinkedFromFamily(root, config, sidecarPath) {
   if (isStandalone(config))
     return false;
   try {
-    if (!fs8.statSync(path8.join(sidecarPath, ".git")).isDirectory())
+    if (!fs9.statSync(path9.join(sidecarPath, ".git")).isDirectory())
       return false;
   } catch {
     return false;
@@ -4741,21 +5514,34 @@ function checkoutIsUnlinkedFromFamily(root, config, sidecarPath) {
   if (!primary)
     return false;
   try {
-    const primaryConfig = readConfig(peerConfigPath(primary, config.peer));
-    return primaryConfig.remote === config.remote;
+    return sharesFamilyCheckout(readConfig(peerConfigPath(primary, config.peer)), config);
   } catch {
     return false;
   }
 }
+function sharesFamilyCheckout(primaryConfig, config) {
+  return primaryConfig.remote === config.remote && reviewRequired(primaryConfig) === reviewRequired(config);
+}
+function bindReviewPolicy(sidecarPath, config) {
+  const bound = git(sidecarPath, ["config", "--local", "--get", REVIEW_POLICY_KEY], { check: false }).stdout.trim();
+  if (reviewRequired(config)) {
+    if (bound !== "required")
+      git(sidecarPath, ["config", "--local", REVIEW_POLICY_KEY, "required"]);
+    return;
+  }
+  if (bound === "required") {
+    throw new SidecarError(`${sidecarPath} holds work from a peer that requires review, and this peer would publish it unreviewed; set review = "required" in this repo's ${peerFileName(config.peer)} too — or, to publish that work without review, \`git -C ${sidecarPath} config --unset ${REVIEW_POLICY_KEY}\``);
+  }
+}
 function cloneOrUpdate(root, config, bootstrapMain, options) {
   const sidecarPath = resolveSidecarPath(root, config);
-  if (fs8.existsSync(sidecarPath) && !hasGitMetadata(sidecarPath)) {
-    if (fs8.readdirSync(sidecarPath).length) {
+  if (fs9.existsSync(sidecarPath) && !hasGitMetadata(sidecarPath)) {
+    if (fs9.readdirSync(sidecarPath).length) {
       throw new SidecarError(`${sidecarPath} exists and is not an empty Git repo`);
     }
-    fs8.rmdirSync(sidecarPath);
+    fs9.rmdirSync(sidecarPath);
   }
-  if (!fs8.existsSync(sidecarPath)) {
+  if (!fs9.existsSync(sidecarPath)) {
     const primaryPath = familySidecarCheckout(root, config);
     if (primaryPath)
       git(primaryPath, ["worktree", "add", "--detach", sidecarPath]);
@@ -4776,7 +5562,7 @@ function cloneOrUpdate(root, config, bootstrapMain, options) {
     throw new SidecarError(`${sidecarPath} is not usable as a sidecar checkout`);
   }
   if (options?.checkoutId) {
-    fs8.writeFileSync(path8.join(gitDir(sidecarPath), "sidecar-id"), `${options.checkoutId}
+    fs9.writeFileSync(path9.join(gitDir(sidecarPath), "sidecar-id"), `${options.checkoutId}
 `, {
       encoding: "utf8",
       mode: 384
@@ -4784,6 +5570,7 @@ function cloneOrUpdate(root, config, bootstrapMain, options) {
   }
   ensureCommitIdentity(sidecarPath);
   ensureRedactionFilter(sidecarPath, config.redaction, config);
+  bindReviewPolicy(sidecarPath, config);
   if (bootstrapMain)
     bootstrapMainBranch(sidecarPath, config);
   const inbox = expandInbox(config, sidecarPath);
@@ -4793,6 +5580,10 @@ function cloneOrUpdate(root, config, bootstrapMain, options) {
 function bootstrapMainBranch(repo, config) {
   if (remoteRefExists(repo, config.branch))
     return;
+  if (reviewRequired(config)) {
+    withPublicGit(repo, () => bootstrapReviewedMain(repo, config));
+    return;
+  }
   if (hasAnyCommit(repo)) {
     const current = git(repo, ["branch", "--show-current"]).stdout.trim();
     if (current !== config.branch) {
@@ -4811,7 +5602,7 @@ function bootstrapMainBranch(repo, config) {
     pushBranch(repo, config.branch);
     return;
   }
-  fs8.writeFileSync(path8.join(repo, "README.md"), `# Sidecar
+  fs9.writeFileSync(path9.join(repo, "README.md"), `# Sidecar
 
 Scratch space for a code repository: plans, notes, and agent context.
 This is a plain git repo you own — read it, edit it, clone it anywhere.
@@ -4820,6 +5611,21 @@ Kept in sync by [sidecar](https://github.com/endograph/sidecar).
   git(repo, ["add", "README.md"]);
   git(repo, ["commit", "-m", "Initialize sidecar"]);
   pushBranch(repo, config.branch);
+}
+function bootstrapReviewedMain(repo, config) {
+  assertPublishDestination(repo);
+  const root = git(repo, ["commit-tree", emptyTree(repo), "-m", "Initialize sidecar"]).stdout.trim();
+  git(repo, ["push", "--no-follow-tags", "origin", `${root}:refs/heads/${config.branch}`]);
+  fetchPublic(repo);
+  console.log(`started ${config.branch} on the remote empty; this checkout's content is published through review`);
+  const ref = `refs/heads/${config.branch}`;
+  if (!hasAnyCommit(repo)) {
+    git(repo, ["update-ref", ref, root]);
+    return;
+  }
+  const local = git(repo, ["rev-parse", "--verify", "--quiet", ref], { check: false }).stdout.trim() || git(repo, ["rev-parse", "HEAD"]).stdout.trim();
+  const link = git(repo, ["commit-tree", treeOf(repo, local), "-p", local, "-p", root, "-m", "sidecar: link the remote's initial main"]).stdout.trim();
+  git(repo, ["update-ref", ref, link]);
 }
 function ensureMainBranch(repo, config) {
   if (branchExists(repo, config.branch)) {
@@ -4840,6 +5646,16 @@ function ensureMainBranch(repo, config) {
     return;
   if (localOnly === 0) {
     git(repo, ["merge", "--ff-only", remoteBranch]);
+    return;
+  }
+  if (reviewRequired(config)) {
+    if (git(repo, ["merge-base", "HEAD", remoteBranch], { check: false }).status !== 0) {
+      const link = git(repo, ["commit-tree", treeOf(repo, "HEAD"), "-p", "HEAD", "-p", remoteBranch, "-m", `sidecar: link the remote's new ${config.branch}`]).stdout.trim();
+      git(repo, ["merge", "--ff-only", link]);
+      console.log(`${remoteBranch} was started over; local ${config.branch} is joined to it and reviewed from there`);
+      return;
+    }
+    mergeInboxBranch(repo, config, remoteBranch, { forkFiles: true });
     return;
   }
   const tip = git(repo, ["rev-parse", "--short", "HEAD"]).stdout.trim();
@@ -4889,29 +5705,29 @@ function ensureSidecarCheckout(root, config) {
   return requireSidecarCheckout(root, config);
 }
 function snapshot(repo, mainRoot, inbox, message = "sidecar snapshot", redactionMode = DEFAULT_REDACTION_MODE, policy) {
-  if (fs8.existsSync(path8.join(gitDir(repo), "MERGE_HEAD"))) {
+  if (fs9.existsSync(path9.join(gitDir(repo), "MERGE_HEAD"))) {
     throw new SidecarError("cannot snapshot an unfinished merge; resolve or abort it before syncing");
   }
   const rewired = ensureRedactionFilter(repo, redactionMode, policy);
-  const revisionPath = path8.join(gitDir(repo), "sidecar-redaction-revision");
+  const revisionPath = path9.join(gitDir(repo), "sidecar-redaction-revision");
   const revision = `${REDACTION_FILTER_REVISION}:${redactionMode}:${rulesFingerprint(policy?.rules)}`;
   let appliedRevision = "";
   try {
-    appliedRevision = fs8.readFileSync(revisionPath, "utf8");
+    appliedRevision = fs9.readFileSync(revisionPath, "utf8");
   } catch {}
   git(repo, ["add", "-A"]);
   if ((rewired || appliedRevision !== revision) && hasAnyCommit(repo)) {
     git(repo, ["add", "--renormalize", "."]);
   }
   if (git(repo, ["diff", "--cached", "--quiet"], { check: false }).status === 0) {
-    fs8.writeFileSync(revisionPath, revision, "utf8");
+    fs9.writeFileSync(revisionPath, revision, "utf8");
     console.log("no sidecar changes to snapshot");
     return false;
   }
   const staged = git(repo, ["diff", "--cached", "--name-only", "-z", "--diff-filter=d"]).stdout.split("\x00").filter(Boolean);
-  const source = `${currentUser()}@${currentHost()}`;
+  const source = currentMachine();
   const body = [message, "", `source: ${source}`];
-  if (path8.resolve(repo) !== path8.resolve(mainRoot)) {
+  if (path9.resolve(repo) !== path9.resolve(mainRoot)) {
     const mainHead = git(mainRoot, ["rev-parse", "--short", "HEAD"], { check: false });
     body.push(`main-head: ${mainHead.status === 0 ? mainHead.stdout.trim() : "unborn"}`);
   }
@@ -4919,7 +5735,7 @@ function snapshot(repo, mainRoot, inbox, message = "sidecar snapshot", redaction
   body.push(...writtenTrailers(repo, staged));
   git(repo, ["commit", "-m", body.join(`
 `)]);
-  fs8.writeFileSync(revisionPath, revision, "utf8");
+  fs9.writeFileSync(revisionPath, revision, "utf8");
   console.log(`committed sidecar snapshot to ${paint("brand", inbox)}`);
   reportRedactions(repo, staged, redactionMode, policy?.rules);
   return true;
@@ -4933,7 +5749,7 @@ function writtenTrailers(repo, staged) {
 `))
       continue;
     try {
-      const seconds = Math.floor(fs8.lstatSync(path8.join(repo, relPath)).mtimeMs / 1000);
+      const seconds = Math.floor(fs9.lstatSync(path9.join(repo, relPath)).mtimeMs / 1000);
       if (seconds > 0)
         trailers.push(`${WRITTEN_TRAILER} ${seconds} ${relPath}`);
     } catch {}
@@ -4944,7 +5760,7 @@ function reportRedactions(repo, staged, mode, rules) {
   let files = 0;
   let items = 0;
   for (const relPath of staged) {
-    const delta = fileRedactionDelta(path8.join(repo, relPath), mode, { rules, relativePath: relPath });
+    const delta = fileRedactionDelta(path9.join(repo, relPath), mode, { rules, relativePath: relPath });
     if (!delta)
       continue;
     files += 1;
@@ -4958,7 +5774,7 @@ function reportRedactions(repo, staged, mode, rules) {
 function fileRedactionDelta(filePath, mode, policy) {
   let data;
   try {
-    data = fs8.readFileSync(filePath);
+    data = fs9.readFileSync(filePath);
   } catch {
     return;
   }
@@ -4973,14 +5789,14 @@ function fileRedactionDelta(filePath, mode, policy) {
   return { text, redacted, items };
 }
 function checkoutRedactionPolicy(repo) {
-  const policyPath = path8.join(gitDir(repo), REDACTION_POLICY_FILE);
+  const policyPath = path9.join(gitDir(repo), REDACTION_POLICY_FILE);
   let bound;
   try {
-    bound = JSON.parse(fs8.readFileSync(policyPath, "utf8"));
+    bound = JSON.parse(fs9.readFileSync(policyPath, "utf8"));
   } catch {
     throw new SidecarError("missing or invalid checkout redaction policy; run `sidecar sync`");
   }
-  if (!bound || typeof bound !== "object" || typeof bound.fingerprint !== "string" || bound.rulesPath !== undefined && (typeof bound.rulesPath !== "string" || !path8.isAbsolute(bound.rulesPath))) {
+  if (!bound || typeof bound !== "object" || typeof bound.fingerprint !== "string" || bound.rulesPath !== undefined && (typeof bound.rulesPath !== "string" || !path9.isAbsolute(bound.rulesPath))) {
     throw new SidecarError("invalid checkout redaction policy; run `sidecar sync`");
   }
   const mode = redactionModeConfigValue(bound.mode, "checkout redaction mode");
@@ -4995,27 +5811,28 @@ function ensureRedactionFilter(repo, mode = DEFAULT_REDACTION_MODE, policy) {
   if (policy?.rules?.length && !policy.rulesPath) {
     throw new SidecarError("path redaction rules require an explicit host rules file");
   }
-  const rulesPath = policy?.rulesPath ? path8.resolve(policy.rulesPath) : undefined;
+  const rulesPath = policy?.rulesPath ? path9.resolve(policy.rulesPath) : undefined;
   if (rulesPath && rulesFingerprint(readRules(rulesPath)) !== fingerprint) {
     throw new SidecarError("sidecar rules changed during this operation; run `sidecar sync` to apply them");
   }
-  const policyPath = path8.join(gitDir(repo), REDACTION_POLICY_FILE);
+  const policyPath = path9.join(gitDir(repo), REDACTION_POLICY_FILE);
   const bound = JSON.stringify({ mode, rulesPath, fingerprint });
   let previous = "";
   try {
-    previous = fs8.readFileSync(policyPath, "utf8");
+    previous = fs9.readFileSync(policyPath, "utf8");
   } catch {}
   const policyChanged = previous !== bound;
   if (policyChanged)
-    fs8.writeFileSync(policyPath, bound, { encoding: "utf8", mode: 384 });
-  const command = `${filterCommandQuote(process.execPath)} ${filterCommandQuote(redactCliPath())} redact --checkout-policy --path %f`;
+    fs9.writeFileSync(policyPath, bound, { encoding: "utf8", mode: 384 });
+  const command = `${filterCommandQuote(process.execPath)} ${filterCommandQuote(sidecarCliPath())} redact --checkout-policy --path %f`;
   const wanted = [
     [`filter.${REDACTION_FILTER_NAME}.clean`, command],
     [`filter.${REDACTION_FILTER_NAME}.revision`, REDACTION_FILTER_REVISION],
     [`filter.${REDACTION_FILTER_NAME}.smudge`, "cat"],
     [`filter.${REDACTION_FILTER_NAME}.required`, "true"]
   ];
-  const attributesPath = path8.join(gitCommonDir(repo), "info", "attributes");
+  const processKey = `filter.${REDACTION_FILTER_NAME}.process`;
+  const attributesPath = path9.join(gitCommonDir(repo), "info", "attributes");
   const line = `* filter=${REDACTION_FILTER_NAME}`;
   const configured = git(repo, ["config", "--get-regexp", `^filter\\.${REDACTION_FILTER_NAME}\\.`], {
     check: false
@@ -5025,10 +5842,10 @@ function ensureRedactionFilter(repo, mode = DEFAULT_REDACTION_MODE, policy) {
     const space = entry.indexOf(" ");
     return [entry.slice(0, space), entry.slice(space + 1)];
   }));
-  const configOk = wanted.every(([key, value]) => current.get(key) === value);
+  const configOk = wanted.every(([key, value]) => current.get(key) === value) && !current.has(processKey);
   let attributes = "";
   try {
-    attributes = fs8.readFileSync(attributesPath, "utf8");
+    attributes = fs9.readFileSync(attributesPath, "utf8");
   } catch {}
   const attributesOk = attributes.split(/\r?\n/).includes(line);
   if (configOk && attributesOk)
@@ -5036,9 +5853,10 @@ function ensureRedactionFilter(repo, mode = DEFAULT_REDACTION_MODE, policy) {
   for (const [key, value] of wanted) {
     git(repo, ["config", key, value]);
   }
+  git(repo, ["config", "--unset-all", processKey], { check: false });
   if (!attributesOk) {
-    fs8.mkdirSync(path8.dirname(attributesPath), { recursive: true });
-    fs8.appendFileSync(attributesPath, attributes && !attributes.endsWith(`
+    fs9.mkdirSync(path9.dirname(attributesPath), { recursive: true });
+    fs9.appendFileSync(attributesPath, attributes && !attributes.endsWith(`
 `) ? `
 ${line}
 ` : `${line}
@@ -5048,13 +5866,13 @@ ${line}
 }
 function removeRedactionFilter(repo) {
   git(repo, ["config", "--remove-section", `filter.${REDACTION_FILTER_NAME}`], { check: false });
-  fs8.rmSync(path8.join(gitDir(repo), "sidecar-redaction-revision"), { force: true });
-  fs8.rmSync(path8.join(gitDir(repo), REDACTION_POLICY_FILE), { force: true });
-  const attributesPath = path8.join(gitCommonDir(repo), "info", "attributes");
+  fs9.rmSync(path9.join(gitDir(repo), "sidecar-redaction-revision"), { force: true });
+  fs9.rmSync(path9.join(gitDir(repo), REDACTION_POLICY_FILE), { force: true });
+  const attributesPath = path9.join(gitCommonDir(repo), "info", "attributes");
   const line = `* filter=${REDACTION_FILTER_NAME}`;
   let contents;
   try {
-    contents = fs8.readFileSync(attributesPath, "utf8");
+    contents = fs9.readFileSync(attributesPath, "utf8");
   } catch {
     return;
   }
@@ -5063,16 +5881,12 @@ function removeRedactionFilter(repo) {
   if (kept.length === lines.length)
     return;
   if (kept.every((entry) => !entry.trim())) {
-    fs8.rmSync(attributesPath, { force: true });
+    fs9.rmSync(attributesPath, { force: true });
   } else {
-    fs8.writeFileSync(attributesPath, `${kept.join(`
+    fs9.writeFileSync(attributesPath, `${kept.join(`
 `).replace(/\s+$/g, "")}
 `, "utf8");
   }
-}
-function redactCliPath() {
-  const self = fileURLToPath2(import.meta.url);
-  return self.endsWith(".ts") ? path8.join(path8.dirname(self), "..", "dist", "cli.js") : self;
 }
 function filterCommandQuote(value) {
   return `"${value.replace(/([\\"$`])/g, "\\$1")}"`;
@@ -5120,7 +5934,7 @@ function refreshInboxFromMain(repo, config, inbox) {
   }
 }
 function pushBranch(repo, branch) {
-  git(repo, ["push", "-u", "origin", `HEAD:refs/heads/${branch}`]);
+  git(repo, ["push", "--no-follow-tags", "-u", "origin", `HEAD:refs/heads/${branch}`]);
   console.log(`pushed ${paint("brand", branch)}`);
 }
 function forkConflicts(repo, remoteBranch, selectedPaths) {
@@ -5163,14 +5977,14 @@ function forkConflicts(repo, remoteBranch, selectedPaths) {
         continue;
       const { oid, mode } = stages[stage];
       const outPath = forkPath(conflictPath, label, oid);
-      const fullOut = path8.join(repo, outPath);
-      fs8.mkdirSync(path8.dirname(fullOut), { recursive: true });
-      fs8.rmSync(fullOut, { force: true });
+      const fullOut = path9.join(repo, outPath);
+      fs9.mkdirSync(path9.dirname(fullOut), { recursive: true });
+      fs9.rmSync(fullOut, { force: true });
       if (mode === "120000")
-        fs8.symlinkSync(blob.toString("utf8"), fullOut);
+        fs9.symlinkSync(blob.toString("utf8"), fullOut);
       else {
-        fs8.writeFileSync(fullOut, blob);
-        fs8.chmodSync(fullOut, mode === "100755" ? 493 : 420);
+        fs9.writeFileSync(fullOut, blob);
+        fs9.chmodSync(fullOut, mode === "100755" ? 493 : 420);
       }
       git(repo, ["add", "--", `:(literal)${outPath}`]);
       versions.push({
@@ -5178,18 +5992,18 @@ function forkConflicts(repo, remoteBranch, selectedPaths) {
         label,
         oid,
         path: outPath,
-        sha256: crypto4.createHash("sha256").update(blob).digest("hex")
+        sha256: crypto5.createHash("sha256").update(blob).digest("hex")
       });
     }
     git(repo, ["rm", "-f", "--", `:(literal)${conflictPath}`]);
     manifest.paths.push({ path: conflictPath, versions });
   }
-  const manifestDir = path8.join(repo, ".sidecar-conflicts");
-  fs8.mkdirSync(manifestDir, { recursive: true });
-  const manifestPath = path8.join(manifestDir, `${timestamp}-${manifestLabel}-fork-files.json`);
-  fs8.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}
+  const manifestDir = path9.join(repo, ".sidecar-conflicts");
+  fs9.mkdirSync(manifestDir, { recursive: true });
+  const manifestPath = path9.join(manifestDir, `${timestamp}-${manifestLabel}-fork-files.json`);
+  fs9.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}
 `, "utf8");
-  git(repo, ["add", "--", `:(literal)${path8.relative(repo, manifestPath)}`]);
+  git(repo, ["add", "--", `:(literal)${path9.relative(repo, manifestPath)}`]);
   if (Object.keys(selectConflictPaths(unmergedPaths(repo), selectedPaths)).length) {
     throw new SidecarError("fork-files did not clear all unmerged paths");
   }
@@ -5219,7 +6033,7 @@ function resolveLastWriterWins(repo, canonicalBranch, remoteBranch, selectedPath
     ...selections.filter((entry) => entry.winner).map((entry) => entry.filePath)
   ]);
   for (const filePath of present) {
-    for (let parent = path8.posix.dirname(filePath);parent !== "."; parent = path8.posix.dirname(parent)) {
+    for (let parent = path9.posix.dirname(filePath);parent !== "."; parent = path9.posix.dirname(parent)) {
       if (present.has(parent))
         throw new SidecarError(`last-writer-wins selected incompatible file and directory paths: ${parent}, ${filePath}`);
     }
@@ -5246,12 +6060,12 @@ function resolveLastWriterWins(repo, canonicalBranch, remoteBranch, selectedPath
     written.push(lwwWrittenTrailer(filePath, write));
   }
   if (manifest.paths.length) {
-    const manifestDir = path8.join(repo, ".sidecar-conflicts");
-    fs8.mkdirSync(manifestDir, { recursive: true });
-    const manifestPath = path8.join(manifestDir, `${timestamp}-${fileLabel(branch)}-lww.json`);
-    fs8.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}
+    const manifestDir = path9.join(repo, ".sidecar-conflicts");
+    fs9.mkdirSync(manifestDir, { recursive: true });
+    const manifestPath = path9.join(manifestDir, `${timestamp}-${fileLabel(branch)}-lww.json`);
+    fs9.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}
 `, "utf8");
-    git(repo, ["add", "--", `:(literal)${path8.relative(repo, manifestPath)}`]);
+    git(repo, ["add", "--", `:(literal)${path9.relative(repo, manifestPath)}`]);
   }
   if (Object.keys(selectConflictPaths(unmergedPaths(repo), selectedPaths)).length) {
     throw new SidecarError("last-writer-wins did not clear all unmerged paths");
@@ -5279,7 +6093,7 @@ function treeEntry(repo, ref, filePath) {
   return;
 }
 function lwwTrailerPrefix(filePath) {
-  return `sidecar-lww-${crypto4.createHash("sha256").update(filePath).digest("hex")}:`;
+  return `sidecar-lww-${crypto5.createHash("sha256").update(filePath).digest("hex")}:`;
 }
 function lwwWrittenTrailer(filePath, write) {
   return `${lwwTrailerPrefix(filePath)} ${write.time} ${write.source || "-"}`;
@@ -5326,11 +6140,11 @@ function recordedLwwEvent(body, prefix) {
   return Number.isInteger(time) && time >= 0 && source ? { time, source: source === "-" ? "" : source } : undefined;
 }
 function forkPath(conflictPath, label, oid) {
-  const parsed = path8.parse(conflictPath);
+  const parsed = path9.parse(conflictPath);
   const shortOid = oid ? oid.slice(0, 7) : "missing";
   const safeLabel = fileLabel(label);
   const forkName = parsed.ext ? `${parsed.name}.conflict.${safeLabel}.${shortOid}${parsed.ext}` : `${parsed.name}.conflict.${safeLabel}.${shortOid}`;
-  return path8.join(parsed.dir, forkName);
+  return path9.join(parsed.dir, forkName);
 }
 function fileLabel(value) {
   return slug(value).replaceAll("/", "-");
@@ -5389,7 +6203,7 @@ function pendingInboxBranches(repo, config) {
   });
   return [...local, ...remote].sort();
 }
-var SOFT_SYNC_ENV = "SIDECAR_SYNC_SOFT", LOCAL_SYNC_ENV = "SIDECAR_SYNC_LOCAL", WRITTEN_TRAILER = "written:", WRITTEN_TRAILER_LIMIT = 500, REDACTION_FILTER_NAME = "sidecar-redact", REDACTION_FILTER_REVISION = "2", REDACTION_POLICY_FILE = "sidecar-redaction-policy";
+var REVIEW_POLICY_KEY = "sidecar.review", WRITTEN_TRAILER = "written:", WRITTEN_TRAILER_LIMIT = 500, REDACTION_FILTER_NAME = "sidecar-redact", REDACTION_FILTER_REVISION = "2", REDACTION_POLICY_FILE = "sidecar-redaction-policy";
 var init_sync = __esm(() => {
   init_color();
   init_util();
@@ -5397,13 +6211,14 @@ var init_sync = __esm(() => {
   init_install();
   init_config();
   init_state();
+  init_review();
   init_rules();
   init_health();
   init_redaction();
 });
 
 // src/ui.ts
-import fs9 from "node:fs";
+import fs10 from "node:fs";
 function announcePeer(peer, peers) {
   const index = peers.indexOf(peer);
   if (index > 0)
@@ -5465,13 +6280,13 @@ function promptYesNoDefaultNo(question) {
   return answer === "y" || answer === "yes";
 }
 function promptLine(prompt) {
-  fs9.writeSync(1, prompt);
-  const fd = fs9.openSync(process.platform === "win32" ? "CONIN$" : "/dev/tty", "r");
+  fs10.writeSync(1, prompt);
+  const fd = fs10.openSync(process.platform === "win32" ? "CONIN$" : "/dev/tty", "r");
   try {
     const chunks = [];
     const buffer = Buffer.alloc(1);
     while (true) {
-      const bytesRead = fs9.readSync(fd, buffer, 0, 1, null);
+      const bytesRead = fs10.readSync(fd, buffer, 0, 1, null);
       if (bytesRead === 0)
         break;
       const char = buffer.toString("utf8", 0, bytesRead);
@@ -5482,7 +6297,7 @@ function promptLine(prompt) {
     }
     return chunks.join("").trim();
   } finally {
-    fs9.closeSync(fd);
+    fs10.closeSync(fd);
   }
 }
 var init_ui = __esm(() => {
@@ -5491,9 +6306,9 @@ var init_ui = __esm(() => {
 });
 
 // src/cmd-init.ts
-import fs10 from "node:fs";
-import path9 from "node:path";
-import { spawnSync as spawnSync4 } from "node:child_process";
+import fs11 from "node:fs";
+import path10 from "node:path";
+import { spawnSync as spawnSync5 } from "node:child_process";
 function cmdDeinit(args) {
   const parsed = parseOptions(args, { boolean: new Set(["--yes", "-y"]), value: new Set(["--peer"]) });
   if (parsed.positional.length)
@@ -5515,7 +6330,7 @@ function cmdDeinit(args) {
   const configPath = peerConfigPath(root, name);
   const leftovers = [];
   let config;
-  if (fs10.existsSync(configPath)) {
+  if (fs11.existsSync(configPath)) {
     try {
       config = readConfig(configPath);
     } catch {
@@ -5548,12 +6363,14 @@ function cmdDeinit(args) {
       removeCheckout(checkoutPath);
       const ignoreEntry = ignoreEntryForSidecarPath(root, config.path);
       if (ignoreEntry) {
-        removeIgnoreEntry(path9.join(root, ".gitignore"), ignoreEntry);
+        removeIgnoreEntry(path10.join(root, ".gitignore"), ignoreEntry);
         removeZedInclusion(root, ignoreEntry);
       }
     }
-    fs10.rmSync(configPath, { force: true });
-    fs10.rmSync(peerRulesPath(root, name), { force: true });
+    fs11.rmSync(configPath, { force: true });
+    fs11.rmSync(peerRulesPath(root, name), { force: true });
+    fs11.rmSync(peerReviewGuidelinesPath(root, name), { force: true });
+    pruneOrphanedReviews();
     unregisterInstance(configPath);
   });
   console.log(`removed sidecar from ${paint("repo", root)}${name === DEFAULT_PEER ? "" : ` (peer ${paint("brand", name)})`}`);
@@ -5568,9 +6385,9 @@ function cmdDeinit(args) {
 function assertDeinitTarget(root, checkoutPath) {
   const target = realpathOr(checkoutPath);
   const host = realpathOr(root);
-  const hostFromTarget = path9.relative(target, host);
-  const parts = path9.relative(host, target).split(path9.sep);
-  const containsHost = !path9.isAbsolute(hostFromTarget) && hostFromTarget.split(path9.sep)[0] !== "..";
+  const hostFromTarget = path10.relative(target, host);
+  const parts = path10.relative(host, target).split(path10.sep);
+  const containsHost = !path10.isAbsolute(hostFromTarget) && hostFromTarget.split(path10.sep)[0] !== "..";
   if (containsHost || parts.includes(".git") || parts.includes(".jj")) {
     throw new SidecarError(`refusing to delete ${checkoutPath}, which contains the host repo or its VCS metadata`);
   }
@@ -5591,19 +6408,19 @@ function releaseStandaloneCheckout(root, config) {
 }
 function removeCheckout(checkoutPath) {
   try {
-    if (fs10.statSync(path9.join(checkoutPath, ".git")).isFile()) {
+    if (fs11.statSync(path10.join(checkoutPath, ".git")).isFile()) {
       git(checkoutPath, ["worktree", "remove", "--force", checkoutPath], { check: false });
     }
   } catch {}
-  fs10.rmSync(checkoutPath, { recursive: true, force: true });
+  fs11.rmSync(checkoutPath, { recursive: true, force: true });
 }
 function cmdInit(args) {
   const parsed = parseOptions(args, {
     boolean: new Set(["--no-clone", "--no-bootstrap-main", "--local-install", "--ignored"]),
-    value: new Set(["--path", "--branch", "--inbox", "--redaction", "--resolve", "--debounce", "--interval", "--peer"])
+    value: new Set(["--path", "--branch", "--inbox", "--redaction", "--resolve", "--review", "--review-timeout", "--debounce", "--interval", "--peer"])
   });
   if (parsed.positional.length > 1) {
-    throw new SidecarError("usage: sidecar init [remote] [--peer name] [--path sidecar] [--branch main] [--inbox template] [--redaction mode] [--resolve fork|lww] [--debounce 10m] [--interval 1h] [--ignored]");
+    throw new SidecarError("usage: sidecar init [remote] [--peer name] [--path sidecar] [--branch main] [--inbox template] [--redaction mode] [--resolve fork|lww] [--review off|required] [--review-timeout 1h] [--debounce 10m] [--interval 1h] [--ignored]");
   }
   const remote = parsed.positional[0];
   const requestedPeer = parsed.values.get("--peer");
@@ -5643,13 +6460,15 @@ function cmdInit(args) {
 }
 function configurePeer(root, name, remote, parsed) {
   const configPath = peerConfigPath(root, name);
-  let reuse = !remote && fs10.existsSync(configPath);
-  if (remote && fs10.existsSync(configPath)) {
+  let reuse = !remote && fs11.existsSync(configPath);
+  let built;
+  if (remote && fs11.existsSync(configPath)) {
     const existing = readConfig(configPath);
-    const unchanged = existing.remote === remote && existing.path === getValue(parsed, "--path", existing.path) && existing.branch === getValue(parsed, "--branch", existing.branch) && existing.inbox === getValue(parsed, "--inbox", existing.inbox) && existing.redaction === getValue(parsed, "--redaction", existing.redaction) && existing.resolve === getValue(parsed, "--resolve", existing.resolve) && existing.debounce === durationConfigValue(parsed.values.get("--debounce") ?? existing.debounce, "--debounce") && existing.interval === durationConfigValue(parsed.values.get("--interval") ?? existing.interval, "--interval");
-    reuse = unchanged || !promptOverwriteConfig(configPath, existing.remote, remote);
+    built = buildInitConfig(root, name, remote, parsed, existing);
+    reuse = configText(built) === configText(existing) || !promptOverwriteConfig(configPath, existing.remote, remote);
   }
-  const config = reuse ? readConfig(configPath) : buildInitConfig(root, name, remote, parsed);
+  const config = reuse ? readConfig(configPath) : built ?? buildInitConfig(root, name, remote, parsed);
+  notePeerPolicy(config);
   if (!reuse) {
     config.rulesPath = peerRulesPath(root, name);
     config.rules = readRules(config.rulesPath);
@@ -5658,7 +6477,7 @@ function configurePeer(root, name, remote, parsed) {
     if (isStandalone(config)) {
       throw new SidecarError("--ignored cannot apply to a standalone sidecar: its .sidecar is part of the tree it syncs");
     }
-    for (const file of [peerFileName(name), peerRulesFileName(name)]) {
+    for (const file of [peerFileName(name), peerRulesFileName(name), peerReviewGuidelinesFileName(name)]) {
       if (isGitTracked(root, file)) {
         throw new SidecarError(`${file} is tracked by git; \`git rm --cached ${file}\` before ignoring it`);
       }
@@ -5691,9 +6510,11 @@ function excludePeerFile(root, name) {
     throw new SidecarError(`--ignored needs a git exclude file, and ${root} has none; ignore ${configFile} in your own VCS config`);
   }
   const rulesFile = peerRulesFileName(name);
+  const guidelinesFile = peerReviewGuidelinesFileName(name);
   ensureIgnoreLine(exclude, `/${configFile}`);
   ensureIgnoreLine(exclude, `/${rulesFile}`);
-  console.log(`ignored ${configFile} and ${rulesFile} via .git/info/exclude`);
+  ensureIgnoreLine(exclude, `/${guidelinesFile}`);
+  console.log(`ignored ${configFile}, ${rulesFile}, and ${guidelinesFile} via .git/info/exclude`);
 }
 function initRoot(remote, parsed) {
   const cwd = process.cwd();
@@ -5708,9 +6529,9 @@ function initRoot(remote, parsed) {
   console.log(`initialized ${paint("repo", cwd)} as a Git repository`);
   return cwd;
 }
-function buildInitConfig(root, name, remote, parsed) {
+function buildInitConfig(root, name, remote, parsed, existing) {
   const defaultPath = name === DEFAULT_PEER ? DEFAULT_PATH : name;
-  const rawPath = parsed.values.has("--path") ? getValue(parsed, "--path", defaultPath) : promptSidecarPath(root, name, defaultPath);
+  const rawPath = parsed.values.has("--path") ? getValue(parsed, "--path", defaultPath) : existing?.path ?? promptSidecarPath(root, name, defaultPath);
   const sidecarPath = pathIsRepoRoot(root, rawPath) ? "." : rawPath;
   const standalone = isStandalonePath(sidecarPath);
   if (standalone && name !== DEFAULT_PEER) {
@@ -5721,12 +6542,14 @@ function buildInitConfig(root, name, remote, parsed) {
     remote: remote ?? (standalone ? standaloneRemote(root) : promptRemote(root)),
     version: 1,
     path: sidecarPath,
-    branch: getValue(parsed, "--branch", DEFAULT_BRANCH),
-    inbox: getValue(parsed, "--inbox", DEFAULT_INBOX),
-    redaction: parsed.values.has("--redaction") ? redactionModeConfigValue(getValue(parsed, "--redaction", DEFAULT_REDACTION_MODE), "--redaction") : promptRedactionMode(),
-    resolve: parsed.values.has("--resolve") ? resolveModeConfigValue(getValue(parsed, "--resolve", DEFAULT_RESOLVE), "--resolve") : DEFAULT_RESOLVE,
-    debounce: durationConfigValue(parsed.values.get("--debounce"), "--debounce"),
-    interval: durationConfigValue(parsed.values.get("--interval"), "--interval")
+    branch: getValue(parsed, "--branch", existing?.branch ?? DEFAULT_BRANCH),
+    inbox: getValue(parsed, "--inbox", existing?.inbox ?? DEFAULT_INBOX),
+    redaction: parsed.values.has("--redaction") ? redactionModeConfigValue(getValue(parsed, "--redaction", DEFAULT_REDACTION_MODE), "--redaction") : existing?.redaction ?? promptRedactionMode(),
+    resolve: parsed.values.has("--resolve") ? resolveModeConfigValue(getValue(parsed, "--resolve", DEFAULT_RESOLVE), "--resolve") : existing?.resolve ?? DEFAULT_RESOLVE,
+    debounce: durationConfigValue(parsed.values.get("--debounce"), "--debounce") ?? existing?.debounce,
+    interval: durationConfigValue(parsed.values.get("--interval"), "--interval") ?? existing?.interval,
+    review: reviewModeConfigValue(getValue(parsed, "--review", existing?.review ?? "off"), "--review"),
+    reviewTimeout: durationConfigValue(parsed.values.get("--review-timeout"), "--review-timeout") ?? existing?.reviewTimeout
   };
 }
 function printCheckoutVisibility(root, config) {
@@ -5743,7 +6566,7 @@ function printCheckoutVisibility(root, config) {
     console.log(`sidecar path outside repo; not updating .gitignore`);
     return;
   }
-  ensureIgnoreEntry(exclude ?? path9.join(root, ".gitignore"), ignoreEntry);
+  ensureIgnoreEntry(exclude ?? path10.join(root, ".gitignore"), ignoreEntry);
   const name = ignoreEntry.replace(/\/+$/, "");
   console.log(`ignored ${name}/ via ${exclude ? ".git/info/exclude" : ".gitignore"}`);
   if (hasZedInclusion(root, ignoreEntry)) {
@@ -5757,8 +6580,8 @@ function printCheckoutVisibility(root, config) {
   }
 }
 function offerLocalInstall(root, standalone, forced) {
-  const manifestPath = path9.join(root, "package.json");
-  if (!fs10.existsSync(manifestPath)) {
+  const manifestPath = path10.join(root, "package.json");
+  if (!fs11.existsSync(manifestPath)) {
     if (forced)
       throw new SidecarError("--local-install requires a package.json");
     return;
@@ -5768,7 +6591,7 @@ function offerLocalInstall(root, standalone, forced) {
   let source;
   let manifest;
   try {
-    source = fs10.readFileSync(manifestPath, "utf8");
+    source = fs11.readFileSync(manifestPath, "utf8");
     const parsed = JSON.parse(source);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
       throw new Error("not an object");
@@ -5794,7 +6617,7 @@ function offerLocalInstall(root, standalone, forced) {
     manifest.pnpm = pnpm;
   }
   const indent = /^([ \t]+)"/m.exec(source)?.[1] ?? "  ";
-  fs10.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, indent)}
+  fs11.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, indent)}
 `);
   console.log(`added ${paint("brand", PACKAGE_NAME)} to devDependencies; run your package manager's install to pin it`);
   if (managers.has("bun")) {
@@ -5822,7 +6645,7 @@ function detectPackageManagers(root) {
     ["package-lock.json", "npm"],
     ["yarn.lock", "yarn"]
   ];
-  return new Set(lockfiles.filter(([file]) => fs10.existsSync(path9.join(root, file))).map(([, manager]) => manager));
+  return new Set(lockfiles.filter(([file]) => fs11.existsSync(path10.join(root, file))).map(([, manager]) => manager));
 }
 function ensureDaemonSetup(globalSidecar) {
   if (process.env[SKIP_SERVICE_ENV] === "1")
@@ -5832,7 +6655,7 @@ function ensureDaemonSetup(globalSidecar) {
   const service = daemonServiceStatus();
   if (!service.available || service.installed && service.running)
     return;
-  const result = spawnSync4(globalSidecar, ["daemon", "enable"], {
+  const result = spawnSync5(globalSidecar, ["daemon", "enable"], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -5884,7 +6707,7 @@ function warnIfGlobalPredatesPeers(executable, peers) {
   console.error(`sidecar: warning: the global sidecar (${version ? `v${version}` : "unknown version"}) predates peers; its daemon syncs only .sidecar until it is updated`);
 }
 function registerInstallWithGlobalSidecar(executable, root) {
-  const result = spawnSync4(executable, ["register-install"], {
+  const result = spawnSync5(executable, ["register-install"], {
     cwd: root,
     encoding: "utf8",
     env: {
@@ -5901,7 +6724,7 @@ function installGlobalSidecar() {
   const bun = findExecutableOnPath(process.platform === "win32" ? "bun.exe" : "bun");
   const command = bun ? [bun, "add", "-g", PACKAGE_SPEC] : ["npm", "install", "-g", PACKAGE_SPEC];
   console.log(`running ${command.join(" ")}`);
-  const result = spawnSync4(command[0], command.slice(1), { stdio: "inherit" });
+  const result = spawnSync5(command[0], command.slice(1), { stdio: "inherit" });
   if (result.status !== 0) {
     throw new SidecarError(`global sidecar install failed; run \`${command.join(" ")}\` manually`);
   }
@@ -5920,7 +6743,7 @@ function cmdClone(args) {
     const { root, config } = peer;
     if (parsed.flags.has("--if-missing")) {
       const sidecarPath = resolveSidecarPath(root, config);
-      if (fs10.existsSync(sidecarPath) && hasGitMetadata(sidecarPath))
+      if (fs11.existsSync(sidecarPath) && hasGitMetadata(sidecarPath))
         continue;
     }
     cloneOrUpdate(root, config, !parsed.flags.has("--no-bootstrap-main"));
@@ -6008,7 +6831,7 @@ function createRemoteWithGh(root) {
   const origin = git(root, ["remote", "get-url", "origin"], { check: false }).stdout.trim() || undefined;
   const parsedOrigin = origin ? parseGitHubRemote(origin) : undefined;
   const owner = parsedOrigin?.owner ?? ghLogin(gh);
-  const baseName = parsedOrigin?.repo ?? path9.basename(root);
+  const baseName = parsedOrigin?.repo ?? path10.basename(root);
   const suggested = owner ? `${owner}/${baseName}-sidecar` : `${baseName}-sidecar`;
   const answer = promptLine(`repository to create ${paint("quiet", `[${suggested}]`)}: `) || suggested;
   const fullName = answer.includes("/") ? answer : owner ? `${owner}/${answer}` : undefined;
@@ -6016,7 +6839,7 @@ function createRemoteWithGh(root) {
     throw new SidecarError("could not determine the repository owner; enter it as owner/name");
   }
   console.log(`running gh repo create ${fullName} --private`);
-  const create = spawnSync4(gh, ["repo", "create", fullName, "--private"], { stdio: "inherit" });
+  const create = spawnSync5(gh, ["repo", "create", fullName, "--private"], { stdio: "inherit" });
   if (create.status !== 0) {
     throw new SidecarError("gh repo create failed; create the repo yourself and rerun `sidecar init <remote>`");
   }
@@ -6030,14 +6853,14 @@ function parseGitHubRemote(url) {
   return { owner: match[1], repo: match[2] };
 }
 function ghLogin(gh) {
-  const result = spawnSync4(gh, ["api", "user", "-q", ".login"], { encoding: "utf8" });
+  const result = spawnSync5(gh, ["api", "user", "-q", ".login"], { encoding: "utf8" });
   if (result.status !== 0)
     return;
   const login = result.stdout.trim();
   return login || undefined;
 }
 function ghGitProtocol(gh) {
-  const result = spawnSync4(gh, ["config", "get", "git_protocol"], { encoding: "utf8" });
+  const result = spawnSync5(gh, ["config", "get", "git_protocol"], { encoding: "utf8" });
   if (result.status !== 0)
     return "https";
   return result.stdout.trim() || "https";
@@ -6057,38 +6880,38 @@ function removeIgnoreEntry(ignorePath, sidecarPath) {
   removeIgnoreLine(ignorePath, `/${sidecarPath.replace(/^\/+|\/+$/g, "")}/`);
 }
 function ensureIgnoreLine(ignorePath, entry) {
-  const lines = fs10.existsSync(ignorePath) ? fs10.readFileSync(ignorePath, "utf8").split(/\r?\n/) : [];
+  const lines = fs11.existsSync(ignorePath) ? fs11.readFileSync(ignorePath, "utf8").split(/\r?\n/) : [];
   if (lines.includes(entry))
     return;
   while (lines.length && lines[lines.length - 1] === "")
     lines.pop();
   lines.push(entry);
-  fs10.mkdirSync(path9.dirname(ignorePath), { recursive: true });
-  fs10.writeFileSync(ignorePath, `${lines.join(`
+  fs11.mkdirSync(path10.dirname(ignorePath), { recursive: true });
+  fs11.writeFileSync(ignorePath, `${lines.join(`
 `).replace(/\s+$/g, "")}
 `, "utf8");
 }
 function removeIgnoreLine(ignorePath, entry) {
-  if (!fs10.existsSync(ignorePath))
+  if (!fs11.existsSync(ignorePath))
     return;
-  const lines = fs10.readFileSync(ignorePath, "utf8").split(/\r?\n/);
+  const lines = fs11.readFileSync(ignorePath, "utf8").split(/\r?\n/);
   const kept = lines.filter((line) => line !== entry);
   if (kept.length === lines.length)
     return;
   if (kept.every((line) => !line.trim())) {
-    fs10.rmSync(ignorePath);
+    fs11.rmSync(ignorePath);
   } else {
-    fs10.writeFileSync(ignorePath, `${kept.join(`
+    fs11.writeFileSync(ignorePath, `${kept.join(`
 `).replace(/\s+$/g, "")}
 `, "utf8");
   }
 }
 function hasZedInclusion(root, sidecarPath) {
-  const settingsPath2 = path9.join(root, ".zed", "settings.json");
-  if (!fs10.existsSync(settingsPath2))
+  const settingsPath2 = path10.join(root, ".zed", "settings.json");
+  if (!fs11.existsSync(settingsPath2))
     return false;
   try {
-    const parsed = JSON.parse(fs10.readFileSync(settingsPath2, "utf8"));
+    const parsed = JSON.parse(fs11.readFileSync(settingsPath2, "utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
       return false;
     const inclusions = parsed.file_scan_inclusions;
@@ -6102,11 +6925,11 @@ function zedInclusionGlob(sidecarPath) {
 }
 function ensureZedInclusion(root, sidecarPath) {
   const glob = zedInclusionGlob(sidecarPath);
-  const settingsPath2 = path9.join(root, ".zed", "settings.json");
+  const settingsPath2 = path10.join(root, ".zed", "settings.json");
   let settings = {};
-  if (fs10.existsSync(settingsPath2)) {
+  if (fs11.existsSync(settingsPath2)) {
     try {
-      const parsed = JSON.parse(fs10.readFileSync(settingsPath2, "utf8"));
+      const parsed = JSON.parse(fs11.readFileSync(settingsPath2, "utf8"));
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
         return false;
       settings = parsed;
@@ -6118,18 +6941,18 @@ function ensureZedInclusion(root, sidecarPath) {
   if (!inclusions.includes(glob)) {
     inclusions.push(glob);
     settings.file_scan_inclusions = inclusions;
-    fs10.mkdirSync(path9.dirname(settingsPath2), { recursive: true });
-    fs10.writeFileSync(settingsPath2, `${JSON.stringify(settings, null, 2)}
+    fs11.mkdirSync(path10.dirname(settingsPath2), { recursive: true });
+    fs11.writeFileSync(settingsPath2, `${JSON.stringify(settings, null, 2)}
 `, "utf8");
   }
   return true;
 }
 function removeZedInclusion(root, sidecarPath) {
-  const settingsPath2 = path9.join(root, ".zed", "settings.json");
-  if (!fs10.existsSync(settingsPath2))
+  const settingsPath2 = path10.join(root, ".zed", "settings.json");
+  if (!fs11.existsSync(settingsPath2))
     return;
   try {
-    const settings = JSON.parse(fs10.readFileSync(settingsPath2, "utf8"));
+    const settings = JSON.parse(fs11.readFileSync(settingsPath2, "utf8"));
     if (!settings || typeof settings !== "object" || Array.isArray(settings))
       return;
     const inclusions = settings.file_scan_inclusions;
@@ -6144,17 +6967,17 @@ function removeZedInclusion(root, sidecarPath) {
     } else {
       delete settings.file_scan_inclusions;
     }
-    fs10.writeFileSync(settingsPath2, `${JSON.stringify(settings, null, 2)}
+    fs11.writeFileSync(settingsPath2, `${JSON.stringify(settings, null, 2)}
 `, "utf8");
   } catch {
     console.error(`sidecar: warning: could not safely remove the Zed inclusion from ${settingsPath2}`);
   }
 }
 function ignoreEntryForSidecarPath(root, sidecarPath) {
-  const resolvedRoot = path9.resolve(root);
-  const resolvedSidecarPath = path9.resolve(root, sidecarPath);
-  const relative = path9.relative(resolvedRoot, resolvedSidecarPath);
-  if (!relative || relative.startsWith("..") || path9.isAbsolute(relative))
+  const resolvedRoot = path10.resolve(root);
+  const resolvedSidecarPath = path10.resolve(root, sidecarPath);
+  const relative = path10.relative(resolvedRoot, resolvedSidecarPath);
+  if (!relative || relative.startsWith("..") || path10.isAbsolute(relative))
     return;
   return relative;
 }
@@ -6170,11 +6993,12 @@ var init_cmd_init = __esm(() => {
   init_ui();
   init_redaction();
   init_rules();
+  init_review();
 });
 
 // src/cmd-refresh.ts
-import fs11 from "node:fs";
-import path10 from "node:path";
+import fs12 from "node:fs";
+import path11 from "node:path";
 function worktreeHoldingBranch(repo, branch) {
   const result = git(repo, ["worktree", "list", "--porcelain"], { check: false });
   if (result.status !== 0)
@@ -6202,13 +7026,53 @@ function unpushedCommits(sidecarPath) {
   });
   return counted.status === 0 ? Number(counted.stdout.trim()) || 0 : 0;
 }
-function dependentWorktrees(sidecarPath) {
+function heldWork(sidecarPath, config, inbox) {
+  const gated = reviewRequired(config);
+  const unpushed = gated ? 0 : unpushedCommits(sidecarPath);
+  const unpublished = gated && !gatedWorkIsPublished(sidecarPath, config, inbox);
+  const dirtyFiles = git(sidecarPath, ["status", "--porcelain"], { check: false }).stdout.split(`
+`).filter(Boolean).length;
+  return [
+    unpushed ? `${unpushed} commit(s) the remote has not seen` : "",
+    unpublished ? "changes not yet published through review" : "",
+    dirtyFiles ? `${dirtyFiles} uncommitted file(s)` : ""
+  ].filter(Boolean);
+}
+function gatedWorkIsPublished(sidecarPath, config, inbox) {
+  if (!hasAnyCommit(sidecarPath))
+    return true;
+  const tree = (ref) => {
+    const result = git(sidecarPath, ["rev-parse", "--verify", "--quiet", `${ref}^{tree}`], { check: false });
+    return result.status === 0 ? result.stdout.trim() : undefined;
+  };
+  const main = `refs/heads/${config.branch}`;
+  const publicMain = tree(`${PUBLIC_REFS}${config.branch}`);
+  const mainTree = tree(main);
+  const mainPublished = mainTree === undefined || mainTree === publicMain;
+  const published = (ref, branch) => {
+    const own = tree(ref);
+    return own === publicMain || own === tree(`${PUBLIC_REFS}${branch}`) || mainPublished && isAncestor(sidecarPath, ref, main);
+  };
+  if (!published("HEAD", inbox))
+    return false;
+  if (!ownsStore(sidecarPath))
+    return true;
+  if (!mainPublished)
+    return false;
+  const prefix = inboxPrefix(config);
+  return git(sidecarPath, ["for-each-ref", "--format=%(refname)", "refs/heads/"]).stdout.split(`
+`).filter((ref) => ref && matchesInboxPrefix(prefix, ref.slice("refs/heads/".length))).every((ref) => published(ref, ref.slice("refs/heads/".length)));
+}
+function ownsStore(sidecarPath) {
   try {
-    if (!fs11.statSync(path10.join(sidecarPath, ".git")).isDirectory())
-      return [];
+    return fs12.statSync(path11.join(sidecarPath, ".git")).isDirectory();
   } catch {
-    return [];
+    return false;
   }
+}
+function dependentWorktrees(sidecarPath) {
+  if (!ownsStore(sidecarPath))
+    return [];
   const result = git(sidecarPath, ["worktree", "list", "--porcelain"], { check: false });
   if (result.status !== 0)
     return [];
@@ -6219,11 +7083,11 @@ function existingCheckoutId(sidecarPath) {
   const candidates = [];
   const reported = git(sidecarPath, ["rev-parse", "--git-dir"], { check: false });
   if (reported.status === 0)
-    candidates.push(path10.resolve(sidecarPath, reported.stdout.trim()));
-  candidates.push(path10.join(sidecarPath, ".git"));
+    candidates.push(path11.resolve(sidecarPath, reported.stdout.trim()));
+  candidates.push(path11.join(sidecarPath, ".git"));
   for (const candidate of candidates) {
     try {
-      const id = slug(fs11.readFileSync(path10.join(candidate, "sidecar-id"), "utf8"));
+      const id = slug(fs12.readFileSync(path11.join(candidate, "sidecar-id"), "utf8"));
       if (id)
         return id;
     } catch {}
@@ -6235,12 +7099,20 @@ function refreshCheckout(root, config) {
   if (isStandalone(config)) {
     throw new SidecarError("refusing to delete a standalone sidecar, which is the repo itself");
   }
-  const relative = path10.relative(root, sidecarPath);
-  if (!relative || relative.startsWith("..") || path10.isAbsolute(relative)) {
+  const relative = path11.relative(root, sidecarPath);
+  if (!relative || relative.startsWith("..") || path11.isAbsolute(relative)) {
     throw new SidecarError(`refusing to delete ${sidecarPath}, which is not inside ${root}`);
   }
   const checkoutId = existingCheckoutId(sidecarPath);
-  fs11.rmSync(sidecarPath, { recursive: true, force: true });
+  if (ownsStore(sidecarPath)) {
+    let open;
+    try {
+      open = openReview(sidecarPath);
+    } catch {}
+    if (open)
+      markSuperseded(open);
+  }
+  fs12.rmSync(sidecarPath, { recursive: true, force: true });
   const family = familySidecarCheckout(root, config);
   if (family) {
     git(family, ["worktree", "prune", "--expire", "now"], { check: false });
@@ -6301,16 +7173,17 @@ function refreshPeer({ root, config, name }, parsed) {
   let inbox;
   if (readable) {
     inbox = expandInbox(config, sidecarPath);
-    fetch(sidecarPath, true, false);
-    const unpushed = unpushedCommits(sidecarPath);
-    const dirtyFiles = git(sidecarPath, ["status", "--porcelain"], { check: false }).stdout.split(`
-`).filter(Boolean).length;
-    if ((unpushed || dirtyFiles) && !force) {
-      const held = [
-        unpushed ? `${unpushed} commit(s) the remote has not seen` : "",
-        dirtyFiles ? `${dirtyFiles} uncommitted file(s)` : ""
-      ].filter(Boolean);
-      throw new SidecarError(`this checkout still holds ${held.join(" and ")}; run \`sidecar sync\` to push them, then refresh — or \`sidecar refresh --force\` to discard them`);
+    if (reviewRequired(config)) {
+      try {
+        refreshPublicRefs(sidecarPath);
+      } catch {}
+    } else {
+      fetch(sidecarPath, true, false);
+    }
+    const held = heldWork(sidecarPath, config, inbox);
+    if (held.length && !force) {
+      const publish = reviewRequired(config) ? "approve its review (`sidecar review`) and sync to publish them" : "run `sidecar sync` to push them";
+      throw new SidecarError(`this checkout still holds ${held.join(" and ")}; ${publish}, then refresh — or \`sidecar refresh --force\` to discard them`);
     }
   }
   if (standalone) {
@@ -6337,7 +7210,7 @@ function refreshPeer({ root, config, name }, parsed) {
   }
   let declined;
   withSyncLock(root, name, "throw", () => {
-    if (readable && !force && isDirty(sidecarPath)) {
+    if (readable && !force && inbox && heldWork(sidecarPath, config, inbox).length) {
       throw new SidecarError("the sidecar checkout changed while waiting for confirmation; rerun refresh");
     }
     if (standalone)
@@ -6359,10 +7232,11 @@ var init_cmd_refresh = __esm(() => {
   init_sync();
   init_ui();
   init_rules();
+  init_review();
 });
 
 // src/cmd-status.ts
-import fs12 from "node:fs";
+import fs13 from "node:fs";
 function statusLine(label, value, role) {
   labelLine(STATUS_LABEL_WIDTH, label, value, role);
 }
@@ -6395,6 +7269,8 @@ function printPeerStatus({ root, config, configPath }) {
   statusLine("main branch", config.branch);
   statusLine("inbox branch", inbox);
   statusLine("conflicts", config.resolve === "lww" ? "last writer wins" : "fork files");
+  if (reviewRequired(config))
+    printReviewLine(sidecarPath);
   if (!checkoutPresent) {
     statusLine("checkout", "missing — run `sidecar init`", "bad");
     printDaemonLine();
@@ -6425,6 +7301,36 @@ function printPeerStatus({ root, config, configPath }) {
     statusLine("pending inbox", "none", "quiet");
   }
 }
+function printReviewLine(sidecarPath) {
+  const review = hasGitMetadata(sidecarPath) ? openReview(sidecarPath) : undefined;
+  const reviewer = readSettings().reviewer;
+  if (!review) {
+    if (reviewer)
+      statusLine("review", `required — nothing waiting (reviewer: ${reviewer})`, "quiet");
+    else
+      statusLine("review", "required — no reviewer configured; reviews wait for `sidecar review approve`", "attn");
+    return;
+  }
+  const attention = reviewAttention(review);
+  const age = formatRelativeTime(review.record.createdAt) ?? review.record.createdAt;
+  const summary = `${review.state} ${review.record.id}, opened ${age}, ${review.record.files.length} file(s)`;
+  statusLine("review", attention ? `${summary} — needs attention: ${attention}` : summary, attention ? "attn" : undefined);
+  if (review.verdict?.reason)
+    console.log(`  ${paint("quiet", review.verdict.reason)}`);
+  console.log(`  ${paint("quiet", `sidecar review show ${review.record.id}`)}`);
+}
+function openReviewPayload(sidecarPath) {
+  const review = openReview(sidecarPath);
+  if (!review)
+    return;
+  return {
+    id: review.record.id,
+    state: review.state,
+    attention: reviewAttention(review),
+    createdAt: review.record.createdAt,
+    files: review.record.files.length
+  };
+}
 function statusPayload({ root, name, config, configPath }) {
   const sidecarPath = resolveSidecarPath(root, config);
   const checkoutPresent = hasGitMetadata(sidecarPath);
@@ -6445,13 +7351,15 @@ function statusPayload({ root, name, config, configPath }) {
     familyLinked: checkoutPresent ? !checkoutIsUnlinkedFromFamily(root, config, sidecarPath) : undefined,
     daemon: daemonHealth().text,
     lastSyncAt: readInstances().find((instance) => instance.configPath === configPath)?.lastSyncAt,
-    pendingInbox: checkoutPresent ? pendingStatusInboxBranches(sidecarPath, config) : undefined
+    pendingInbox: checkoutPresent ? pendingStatusInboxBranches(sidecarPath, config) : undefined,
+    review: reviewRequired(config) ? { required: true, open: checkoutPresent ? openReviewPayload(sidecarPath) : undefined } : undefined
   };
 }
 function pendingStatusInboxBranches(sidecarPath, config) {
   fetch(sidecarPath, true, false);
   const base = remoteRefExists(sidecarPath, config.branch) ? `origin/${config.branch}` : branchExists(sidecarPath, config.branch) ? config.branch : "HEAD";
-  return pendingInboxBranches(sidecarPath, config).filter((remoteBranch) => !isAncestor(sidecarPath, remoteBranch, base));
+  const candidates = reviewRequired(config) ? pendingInboxBranches(sidecarPath, config).filter((branch) => branch.startsWith("origin/")) : pendingInboxBranches(sidecarPath, config);
+  return candidates.filter((remoteBranch) => !isAncestor(sidecarPath, remoteBranch, base));
 }
 function daemonHealth() {
   if (!shouldUseGlobalRegistry()) {
@@ -6553,6 +7461,10 @@ function healthStatusLine(state, record) {
     const age = formatRelativeTime(record.updatedAt) ?? record.updatedAt;
     return { text: `stale — last reported ${age}`, role: "attn" };
   }
+  if (record.review === "attention")
+    return { text: "ok — publishing held, review needs attention", role: "attn" };
+  if (record.review === "pending")
+    return { text: "ok — publishing held for review", role: "ok" };
   return { text: "ok", role: "ok" };
 }
 function cmdInstances(args) {
@@ -6606,16 +7518,16 @@ function cmdTail(args) {
     throw new SidecarError("--lines requires a positive integer");
   }
   const filePath = sidecarLogPath();
-  if (!fs12.existsSync(filePath)) {
+  if (!fs13.existsSync(filePath)) {
     if (parsed.flags.has("-f") || parsed.flags.has("--follow")) {
       followLog(filePath, 0);
       return 0;
     }
     return 0;
   }
-  const stat = fs12.statSync(filePath);
+  const stat = fs13.statSync(filePath);
   if (stat.size > 0) {
-    process.stdout.write(lastLines(fs12.readFileSync(filePath, "utf8"), lines));
+    process.stdout.write(lastLines(fs13.readFileSync(filePath, "utf8"), lines));
   }
   if (parsed.flags.has("-f") || parsed.flags.has("--follow")) {
     followLog(filePath, stat.size);
@@ -6638,7 +7550,7 @@ function followLog(filePath, startOffset) {
     sleep(1000);
     let stat;
     try {
-      stat = fs12.statSync(filePath);
+      stat = fs13.statSync(filePath);
     } catch {
       offset = 0;
       continue;
@@ -6647,17 +7559,17 @@ function followLog(filePath, startOffset) {
       offset = 0;
     if (stat.size <= offset)
       continue;
-    const fd = fs12.openSync(filePath, "r");
+    const fd = fs13.openSync(filePath, "r");
     try {
       const length = stat.size - offset;
       const buffer = Buffer.alloc(length);
-      const bytesRead = fs12.readSync(fd, buffer, 0, length, offset);
+      const bytesRead = fs13.readSync(fd, buffer, 0, length, offset);
       if (bytesRead > 0) {
         process.stdout.write(buffer.subarray(0, bytesRead).toString("utf8"));
         offset += bytesRead;
       }
     } finally {
-      fs12.closeSync(fd);
+      fs13.closeSync(fd);
     }
   }
 }
@@ -6676,6 +7588,7 @@ var init_cmd_status = __esm(() => {
   init_sync();
   init_ui();
   init_health();
+  init_review();
   STATUS_LABEL_WIDTH = "pending inbox:".length;
 });
 
@@ -7064,20 +7977,20 @@ var require_ignore = __commonJS((exports, module) => {
     const index = body.indexOf(SLASH);
     return index < 0 || index === body.length - 1;
   };
-  var basenameOf = (path11) => {
-    const end = path11.length - 1;
-    const index = path11.lastIndexOf(SLASH, path11[end] === SLASH ? end - 1 : end);
-    return index < 0 ? path11 : path11.slice(index + 1);
+  var basenameOf = (path12) => {
+    const end = path12.length - 1;
+    const index = path12.lastIndexOf(SLASH, path12[end] === SLASH ? end - 1 : end);
+    return index < 0 ? path12 : path12.slice(index + 1);
   };
-  var parentOf = (path11) => {
-    if (path11.charCodeAt(0) === SLASH_CODE || path11.indexOf(DOUBLE_SLASH) >= 0) {
-      const slices = path11.split(SLASH).filter(Boolean);
+  var parentOf = (path12) => {
+    if (path12.charCodeAt(0) === SLASH_CODE || path12.indexOf(DOUBLE_SLASH) >= 0) {
+      const slices = path12.split(SLASH).filter(Boolean);
       slices.pop();
       return slices.length ? slices.join(SLASH) + SLASH : EMPTY;
     }
-    const end = path11.length - 1;
-    const cut = path11.lastIndexOf(SLASH, path11.charCodeAt(end) === SLASH_CODE ? end - 1 : end);
-    return cut < 0 ? EMPTY : path11.slice(0, cut + 1);
+    const end = path12.length - 1;
+    const cut = path12.lastIndexOf(SLASH, path12.charCodeAt(end) === SLASH_CODE ? end - 1 : end);
+    return cut < 0 ? EMPTY : path12.slice(0, cut + 1);
   };
   var isString = (subject) => typeof subject === "string";
   var checkPattern = (pattern) => pattern && isString(pattern) && !REGEX_TEST_BLANK_LINE.test(pattern) && !REGEX_INVALID_TRAILING_BACKSLASH.test(pattern) && pattern.indexOf("#") !== 0;
@@ -7162,19 +8075,19 @@ var require_ignore = __commonJS((exports, module) => {
       makeArray(isString(pattern) ? splitPattern(pattern) : pattern).forEach(this._add, this);
       return this._added;
     }
-    test(path11, checkUnignored, mode) {
+    test(path12, checkUnignored, mode) {
       let ignored = false;
       let unignored = false;
       let matchedRule;
       const rules = this._rules;
       const { length } = rules;
       const shortcut = this._basenameCount * 2 >= length;
-      const basename = shortcut ? basenameOf(path11) : path11;
+      const basename = shortcut ? basenameOf(path12) : path12;
       for (let index = 0;index < length; index++) {
         const rule = rules[index];
         const { negative } = rule;
         const skip = unignored === negative && ignored !== unignored || negative && !ignored && !unignored && !checkUnignored;
-        if (!skip && rule[mode].test(shortcut && rule._basenameOnly ? basename : path11)) {
+        if (!skip && rule[mode].test(shortcut && rule._basenameOnly ? basename : path12)) {
           ignored = !negative;
           unignored = negative;
           matchedRule = negative ? UNDEFINED : rule;
@@ -7193,38 +8106,38 @@ var require_ignore = __commonJS((exports, module) => {
   var throwError = (message, Ctor) => {
     throw new Ctor(message);
   };
-  var checkPath = (path11, originalPath, doThrow) => {
-    if (!isString(path11)) {
+  var checkPath = (path12, originalPath, doThrow) => {
+    if (!isString(path12)) {
       return doThrow(`path must be a string, but got \`${originalPath}\``, TypeError);
     }
-    if (!path11) {
+    if (!path12) {
       return doThrow(`path must not be empty`, TypeError);
     }
-    if (checkPath.isNotRelative(path11)) {
+    if (checkPath.isNotRelative(path12)) {
       const r = "`path.relative()`d";
       return doThrow(`path should be a ${r} string, but got "${originalPath}"`, RangeError);
     }
     return true;
   };
-  var isNotRelative = (path11) => {
-    const first = path11.charCodeAt(0);
+  var isNotRelative = (path12) => {
+    const first = path12.charCodeAt(0);
     if (first === SLASH_CODE) {
       return true;
     }
     if (first !== DOT_CODE) {
       return false;
     }
-    if (path11.length === 1) {
+    if (path12.length === 1) {
       return true;
     }
-    const second = path11.charCodeAt(1);
+    const second = path12.charCodeAt(1);
     if (second === SLASH_CODE) {
       return true;
     }
     if (second !== DOT_CODE) {
       return false;
     }
-    return path11.length === 2 || path11.charCodeAt(2) === SLASH_CODE;
+    return path12.length === 2 || path12.charCodeAt(2) === SLASH_CODE;
   };
   checkPath.isNotRelative = isNotRelative;
   checkPath.convert = (p) => p;
@@ -7254,51 +8167,51 @@ var require_ignore = __commonJS((exports, module) => {
       return this.add(pattern);
     }
     _test(originalPath, cache, checkUnignored) {
-      const path11 = originalPath && checkPath.convert(originalPath);
-      checkPath(path11, originalPath, this._strictPathCheck ? throwError : RETURN_FALSE);
-      return this._t(path11, cache, checkUnignored);
+      const path12 = originalPath && checkPath.convert(originalPath);
+      checkPath(path12, originalPath, this._strictPathCheck ? throwError : RETURN_FALSE);
+      return this._t(path12, cache, checkUnignored);
     }
-    checkIgnore(path11) {
-      if (path11.charCodeAt(path11.length - 1) !== SLASH_CODE) {
-        return this.test(path11);
+    checkIgnore(path12) {
+      if (path12.charCodeAt(path12.length - 1) !== SLASH_CODE) {
+        return this.test(path12);
       }
-      const parentPath = parentOf(path11);
+      const parentPath = parentOf(path12);
       if (parentPath) {
         const parent = this._t(parentPath, this._testCache, true);
         if (parent.ignored) {
           return parent;
         }
       }
-      return this._rules.test(path11, false, MODE_CHECK_IGNORE);
+      return this._rules.test(path12, false, MODE_CHECK_IGNORE);
     }
-    _t(path11, cache, checkUnignored) {
-      if (path11 in cache) {
-        return cache[path11];
+    _t(path12, cache, checkUnignored) {
+      if (path12 in cache) {
+        return cache[path12];
       }
-      const parentPath = parentOf(path11);
+      const parentPath = parentOf(path12);
       const parent = parentPath ? this._t(parentPath, cache, checkUnignored) : UNDEFINED;
-      return cache[path11] = parent && parent.ignored ? parent : this._rules.test(path11, checkUnignored, MODE_IGNORE);
+      return cache[path12] = parent && parent.ignored ? parent : this._rules.test(path12, checkUnignored, MODE_IGNORE);
     }
-    ignores(path11) {
-      return this._test(path11, this._ignoreCache, false).ignored;
+    ignores(path12) {
+      return this._test(path12, this._ignoreCache, false).ignored;
     }
     createFilter() {
-      return (path11) => !this.ignores(path11);
+      return (path12) => !this.ignores(path12);
     }
     filter(paths) {
       return makeArray(paths).filter(this.createFilter());
     }
-    test(path11) {
-      return this._test(path11, this._testCache, true);
+    test(path12) {
+      return this._test(path12, this._testCache, true);
     }
   }
   var factory = (options) => new Ignore(options);
-  var isPathValid = (path11) => checkPath(path11 && checkPath.convert(path11), path11, RETURN_FALSE);
+  var isPathValid = (path12) => checkPath(path12 && checkPath.convert(path12), path12, RETURN_FALSE);
   var setupWindows = () => {
     const makePosix = (str) => /^\\\\\?\\/.test(str) || /["<>|\u0000-\u001F]+/u.test(str) ? str : str.replace(/\\/g, "/");
     checkPath.convert = makePosix;
     const REGEX_TEST_WINDOWS_PATH_ABSOLUTE = /^[a-z]:\//i;
-    checkPath.isNotRelative = (path11) => REGEX_TEST_WINDOWS_PATH_ABSOLUTE.test(path11) || isNotRelative(path11);
+    checkPath.isNotRelative = (path12) => REGEX_TEST_WINDOWS_PATH_ABSOLUTE.test(path12) || isNotRelative(path12);
   };
   if (typeof process !== "undefined" && process.platform === "win32") {
     setupWindows();
@@ -7321,15 +8234,22 @@ __export(exports_daemon, {
   checkAndInstallUpdate: () => checkAndInstallUpdate,
   WATCH_LIMIT: () => WATCH_LIMIT
 });
-import fs13 from "node:fs";
-import path11 from "node:path";
-import { spawn as spawn2 } from "node:child_process";
-import { fileURLToPath as fileURLToPath3 } from "node:url";
+import fs14 from "node:fs";
+import path12 from "node:path";
+import { spawn as spawn3 } from "node:child_process";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+function outputIsPrivate(key) {
+  try {
+    return reviewRequired(readConfig(key, { loadRules: false }));
+  } catch {
+    return true;
+  }
+}
 function peerRoot(key) {
-  return path11.dirname(key);
+  return path12.dirname(key);
 }
 function peerName(key) {
-  return peerNameOf(path11.basename(key)) ?? DEFAULT_PEER;
+  return peerNameOf(path12.basename(key)) ?? DEFAULT_PEER;
 }
 function peerFields(key) {
   const peer = peerName(key);
@@ -7417,7 +8337,7 @@ function maybeAdoptNewerInstall(state, bootVersion) {
     executable: onPath,
     reason: "new-install"
   });
-  const child = spawn2(onPath, ["daemon", "restart"], {
+  const child = spawn3(onPath, ["daemon", "restart"], {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
@@ -7437,7 +8357,7 @@ async function runCycle(state) {
   let skipped = 0;
   for (const instance of readInstances()) {
     const key = instance.configPath;
-    if (!fs13.existsSync(instance.configPath)) {
+    if (!fs14.existsSync(instance.configPath)) {
       const misses = (state.misses.get(key) ?? 0) + 1;
       state.misses.set(key, misses);
       if (misses >= PRUNE_AFTER_MISSES) {
@@ -7524,7 +8444,7 @@ async function syncInstance(state, key, trigger, options = {}) {
         command: "daemon",
         ...peerFields(key),
         trigger,
-        message: result.timedOut ? "sync timed out" : result.output.trim().slice(-500) || `sync exited ${result.status}`
+        message: result.timedOut ? "sync timed out" : !outputIsPrivate(key) && result.output.trim().slice(-500) || `sync exited ${result.status}`
       });
     }
   } finally {
@@ -7551,7 +8471,7 @@ async function syncIfDirty(state, key, trigger) {
 }
 async function checkoutIsDirty(key) {
   const sidecarPath = readInstances().find((instance) => instance.configPath === key)?.sidecarPath;
-  if (!sidecarPath || !fs13.existsSync(sidecarPath))
+  if (!sidecarPath || !fs14.existsSync(sidecarPath))
     return false;
   const result = await runChild("git", ["-C", sidecarPath, "status", "--porcelain"], { timeoutMs: 30000 });
   return result.status === 0 && Boolean(result.stdout.trim());
@@ -7559,7 +8479,7 @@ async function checkoutIsDirty(key) {
 function localSidecarCliPath(root) {
   if (!projectDependsOnSidecar(root))
     return;
-  const candidate = path11.join(root, "node_modules", PACKAGE_NAME, "dist", "cli.js");
+  const candidate = path12.join(root, "node_modules", PACKAGE_NAME, "dist", "cli.js");
   if (!isFile(candidate))
     return;
   const localVersion = installedPackageVersion(root);
@@ -7568,10 +8488,10 @@ function localSidecarCliPath(root) {
   return candidate;
 }
 function currentCliPath() {
-  return process.argv[1] || fileURLToPath3(import.meta.url);
+  return process.argv[1] || fileURLToPath2(import.meta.url);
 }
 function selectWatchTargets(instances, limit = WATCH_LIMIT) {
-  return [...instances].filter((instance) => fs13.existsSync(instance.configPath) && fs13.existsSync(instance.sidecarPath)).sort((left, right) => instanceRecency(right) - instanceRecency(left)).slice(0, limit);
+  return [...instances].filter((instance) => fs14.existsSync(instance.configPath) && fs14.existsSync(instance.sidecarPath)).sort((left, right) => instanceRecency(right) - instanceRecency(left)).slice(0, limit);
 }
 function instanceRecency(instance) {
   const time = Date.parse(instance.lastSyncAt ?? instance.updatedAt ?? instance.registeredAt);
@@ -7622,8 +8542,8 @@ async function refreshWatchers(state) {
         });
         watcher.on("all", (...args) => {
           scheduleWatchSync(state, key);
-          const changedPath = typeof args[1] === "string" ? path11.resolve(args[1]) : "";
-          if (changedPath !== path11.join(path11.resolve(sidecarPath), ".gitignore"))
+          const changedPath = typeof args[1] === "string" ? path12.resolve(args[1]) : "";
+          if (changedPath !== path12.join(path12.resolve(sidecarPath), ".gitignore"))
             return;
           if (state.watchers.get(key) !== watcher)
             return;
@@ -7636,7 +8556,7 @@ async function refreshWatchers(state) {
           logSidecarEvent("failure", {
             command: "daemon",
             ...peerFields(key),
-            message: `watcher error: ${error instanceof Error ? error.message : String(error)}`
+            message: outputIsPrivate(key) ? "watcher error" : `watcher error: ${error instanceof Error ? error.message : String(error)}`
           });
         });
         state.watchers.set(key, watcher);
@@ -7644,7 +8564,7 @@ async function refreshWatchers(state) {
         logSidecarEvent("failure", {
           command: "daemon",
           ...peerFields(key),
-          message: `could not watch ${sidecarPath}: ${error instanceof Error ? error.message : String(error)}`
+          message: outputIsPrivate(key) ? `could not watch ${sidecarPath}` : `could not watch ${sidecarPath}: ${error instanceof Error ? error.message : String(error)}`
         });
       }
     }
@@ -7717,7 +8637,7 @@ async function watchRegistry(state) {
     const watcher = chokidar.watch(sidecarStateDir(), { ignoreInitial: true, depth: 0 });
     watcher.on("all", (...args) => {
       const filePath = typeof args[1] === "string" ? args[1] : "";
-      if (path11.basename(filePath) !== "instances.json")
+      if (path12.basename(filePath) !== "instances.json")
         return;
       if (state.registryTimer)
         return;
@@ -7736,7 +8656,7 @@ async function watchRegistry(state) {
 function compileGitignoreMatcher(lines) {
   const rules = import_ignore.default({ ignorecase: false }).add(lines);
   return (relativePath) => {
-    const normalized = relativePath.split(path11.sep).join("/");
+    const normalized = relativePath.split(path12.sep).join("/");
     if (!import_ignore.default.isPathValid(normalized))
       return false;
     return rules.ignores(normalized);
@@ -7745,19 +8665,19 @@ function compileGitignoreMatcher(lines) {
 function watchIgnoreMatcher(sidecarPath) {
   let gitignore;
   try {
-    const ignoreFile = path11.join(sidecarPath, ".gitignore");
-    if (fs13.existsSync(ignoreFile)) {
-      gitignore = compileGitignoreMatcher(fs13.readFileSync(ignoreFile, "utf8").split(`
+    const ignoreFile = path12.join(sidecarPath, ".gitignore");
+    if (fs14.existsSync(ignoreFile)) {
+      gitignore = compileGitignoreMatcher(fs14.readFileSync(ignoreFile, "utf8").split(`
 `));
     }
   } catch {}
-  const root = path11.resolve(sidecarPath);
+  const root = path12.resolve(sidecarPath);
   return (candidate, stats) => {
-    const relative = path11.relative(root, candidate);
+    const relative = path12.relative(root, candidate);
     if (!relative)
       return false;
-    const normalized = relative.split(path11.sep).join("/");
-    if (normalized === ".." || normalized.startsWith("../") || path11.isAbsolute(relative))
+    const normalized = relative.split(path12.sep).join("/");
+    if (normalized === ".." || normalized.startsWith("../") || path12.isAbsolute(relative))
       return true;
     if (normalized === ".git" || normalized.startsWith(".git/"))
       return true;
@@ -7836,10 +8756,10 @@ function restartAfterUpdate() {
 }
 async function acquireDaemonPid() {
   const pidPath = daemonPidPath();
-  fs13.mkdirSync(path11.dirname(pidPath), { recursive: true });
+  fs14.mkdirSync(path12.dirname(pidPath), { recursive: true });
   while (true) {
     try {
-      fs13.writeFileSync(pidPath, `${process.pid}
+      fs14.writeFileSync(pidPath, `${process.pid}
 `, { encoding: "utf8", flag: "wx" });
       return;
     } catch (error) {
@@ -7855,7 +8775,7 @@ async function acquireDaemonPid() {
       continue;
     }
     logSidecarEvent("daemon-pid-heal", { holder: holder ?? null });
-    fs13.rmSync(pidPath, { force: true });
+    fs14.rmSync(pidPath, { force: true });
   }
 }
 function installShutdownHandlers() {
@@ -7870,12 +8790,12 @@ function installShutdownHandlers() {
 function removeOwnPidFile() {
   try {
     if (readPid(daemonPidPath()) === process.pid)
-      fs13.rmSync(daemonPidPath(), { force: true });
+      fs14.rmSync(daemonPidPath(), { force: true });
   } catch {}
 }
 function readPid(pidPath) {
   try {
-    const pid = Number(fs13.readFileSync(pidPath, "utf8").trim());
+    const pid = Number(fs14.readFileSync(pidPath, "utf8").trim());
     return Number.isInteger(pid) && pid > 0 ? pid : undefined;
   } catch {
     return;
@@ -7883,7 +8803,7 @@ function readPid(pidPath) {
 }
 function runChild(command, args, options) {
   return new Promise((resolve) => {
-    const child = spawn2(command, args, {
+    const child = spawn3(command, args, {
       cwd: options.cwd,
       env: options.env ?? process.env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -7916,21 +8836,21 @@ function runChild(command, args, options) {
 }
 function isFile(filePath) {
   try {
-    return fs13.statSync(filePath).isFile();
+    return fs14.statSync(filePath).isFile();
   } catch {
     return false;
   }
 }
 function realpathOr2(filePath) {
   try {
-    return fs13.realpathSync(filePath);
+    return fs14.realpathSync(filePath);
   } catch {
-    return path11.resolve(filePath);
+    return path12.resolve(filePath);
   }
 }
 function isInsidePath2(child, parent) {
-  const relative = path11.relative(parent, child);
-  return Boolean(relative) && !relative.startsWith("..") && !path11.isAbsolute(relative);
+  const relative = path12.relative(parent, child);
+  return Boolean(relative) && !relative.startsWith("..") && !path12.isAbsolute(relative);
 }
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -8132,9 +9052,9 @@ var init_cmd_daemon = __esm(() => {
 });
 
 // src/cmd-sync.ts
-import fs14 from "node:fs";
+import fs15 from "node:fs";
 import os6 from "node:os";
-import path12 from "node:path";
+import path13 from "node:path";
 function cmdSnapshot(args) {
   const parsed = parseOptions(args, {
     boolean: new Set(["--push"]),
@@ -8143,17 +9063,23 @@ function cmdSnapshot(args) {
   if (parsed.positional.length)
     throw new SidecarError("usage: sidecar snapshot [--push] [-m message] [--peer name]");
   const peers = loadPeers(selectedPeer(parsed));
+  const push = parsed.flags.has("--push");
+  const gated = push ? peers.filter((peer) => reviewRequired(peer.config)) : [];
+  if (gated.length) {
+    throw new SidecarError(`${peers.length === 1 ? "this peer requires" : `${gated.map((peer) => peer.name).join(", ")} require`} review before anything is published; snapshot without --push, and \`sidecar sync\` opens or advances the review`);
+  }
   for (const peer of peers) {
     announcePeer(peer, peers);
     const { root, config } = peer;
     const sidecarPath = requireSidecarCheckout(root, config);
     withSyncLock(root, peer.name, "throw", () => {
+      bindReviewPolicy(sidecarPath, config);
       const inbox = expandInbox(config, sidecarPath);
       ensureCommitIdentity(sidecarPath);
       ensureRedactionFilter(sidecarPath, config.redaction, config);
       ensureInboxBranch(sidecarPath, config, inbox);
       const committed = snapshot(sidecarPath, root, inbox, getValue(parsed, "--message", getValue(parsed, "-m", "")) || undefined, config.redaction, config);
-      if (committed && parsed.flags.has("--push")) {
+      if (committed && push) {
         syncBranchBeforePush(sidecarPath, inbox, config);
         pushBranch(sidecarPath, inbox);
       }
@@ -8171,12 +9097,19 @@ function cmdSync(args) {
   }
   const peers = loadPeers(selectedPeer(parsed), { loadRules: false });
   const failed = [];
+  const soft = parsed.flags.has("--soft") || process.env[SOFT_SYNC_ENV] === "1";
+  const options = {
+    lock: soft ? "skip" : "throw",
+    remote: !parsed.flags.has("--local") && process.env[LOCAL_SYNC_ENV] !== "1",
+    snapshot: !parsed.flags.has("--no-snapshot"),
+    message: getValue(parsed, "--message", getValue(parsed, "-m", "")) || undefined
+  };
   for (const peer of peers) {
     announcePeer(peer, peers);
     try {
       if (peer.config.rulesPath)
         peer.config.rules = readRules(peer.config.rulesPath);
-      syncPeer(peer, parsed);
+      syncPeer(peer, options);
     } catch (error) {
       if (peers.length === 1)
         throw error;
@@ -8189,18 +9122,19 @@ function cmdSync(args) {
   }
   return 0;
 }
-function syncPeer(peer, parsed) {
+function syncPeer(peer, options) {
   const { root, config } = peer;
-  const soft = parsed.flags.has("--soft") || process.env[SOFT_SYNC_ENV] === "1";
-  const remote = !parsed.flags.has("--local") && process.env[LOCAL_SYNC_ENV] !== "1";
+  const { remote } = options;
+  const soft = options.lock === "skip";
   let stage = "start";
+  let outcome = {};
   let synced;
   try {
-    synced = withSyncLock(root, peer.name, soft ? "skip" : "throw", () => {
-      syncProject(root, config, {
-        snapshot: !parsed.flags.has("--no-snapshot"),
+    synced = withSyncLock(root, peer.name, options.lock, () => {
+      outcome = syncProject(root, config, {
+        snapshot: options.snapshot,
         remote,
-        message: getValue(parsed, "--message", getValue(parsed, "-m", "")) || undefined,
+        message: options.message,
         onStage: (name) => {
           stage = name;
         }
@@ -8212,13 +9146,18 @@ function syncPeer(peer, parsed) {
       reportSyncHealth(root, config, {
         status: "failed",
         stage,
-        message: error instanceof Error ? error.message : String(error)
+        message: reviewRequired(config) ? "details are shown only by a sync run by hand on that machine" : error instanceof Error ? error.message : String(error)
       });
     throw error;
   }
   if (synced) {
+    const held = outcome.held;
+    if (held) {
+      const { id } = held.review.record;
+      console.log(held.attention ? `sidecar: publishing is held — review ${id} needs attention: ${held.attention}; \`sidecar review show ${id}\`` : `sidecar: publishing is held for review ${id}; \`sidecar review show ${id}\``);
+    }
     if (remote)
-      reportSyncHealth(root, config, { status: "ok" });
+      reportSyncHealth(root, config, held ? { status: "ok", review: held.attention ? "attention" : "pending" } : { status: "ok" });
     if (!soft) {
       const sidecarPath = resolveSidecarPath(root, config);
       if (checkoutIsUnlinkedFromFamily(root, config, sidecarPath)) {
@@ -8243,12 +9182,16 @@ function cmdMerge(args) {
     const { root, config } = peer;
     const sidecarPath = requireSidecarCheckout(root, config);
     withSyncLock(root, peer.name, "throw", () => {
+      bindReviewPolicy(sidecarPath, config);
       ensureRedactionFilter(sidecarPath, config.redaction, config);
-      mergeInboxBranches(sidecarPath, config, {
-        forkFiles: parsed.flags.has("--fork-files"),
-        push: !parsed.flags.has("--no-push"),
-        remote: true
-      });
+      const forkFiles = parsed.flags.has("--fork-files");
+      const push = !parsed.flags.has("--no-push");
+      if (reviewRequired(config) && push) {
+        mergePublishedInboxes(sidecarPath, config, { forkFiles });
+        mergeInboxBranches(sidecarPath, config, { forkFiles, push: false, remote: false });
+        return;
+      }
+      mergeInboxBranches(sidecarPath, config, { forkFiles, push, remote: true });
     });
   }
   return 0;
@@ -8272,7 +9215,7 @@ function printPeerRedactions({ root, config }) {
   let shown = 0;
   let items = 0;
   for (const relPath of files) {
-    const delta = fileRedactionDelta(path12.join(sidecarPath, relPath), config.redaction, { rules: config.rules, relativePath: relPath });
+    const delta = fileRedactionDelta(path13.join(sidecarPath, relPath), config.redaction, { rules: config.rules, relativePath: relPath });
     if (!delta)
       continue;
     if (shown)
@@ -8291,12 +9234,12 @@ ${items} redaction(s) in ${shown} file(s) will be pushed this way (default: ${co
   console.log("local files are untouched; redaction is controlled by the peer's configuration and rules");
 }
 function printRedactionDiff(original, redacted) {
-  const scratch = fs14.mkdtempSync(path12.join(os6.tmpdir(), "sidecar-redactions-"));
+  const scratch = fs15.mkdtempSync(path13.join(os6.tmpdir(), "sidecar-redactions-"));
   try {
-    const localPath = path12.join(scratch, "local");
-    const pushedPath = path12.join(scratch, "pushed");
-    fs14.writeFileSync(localPath, original, "utf8");
-    fs14.writeFileSync(pushedPath, redacted, "utf8");
+    const localPath = path13.join(scratch, "local");
+    const pushedPath = path13.join(scratch, "pushed");
+    fs15.writeFileSync(localPath, original, "utf8");
+    fs15.writeFileSync(pushedPath, redacted, "utf8");
     const color = colorLevel() > 0 ? ["--color"] : [];
     const diff = gitRaw(["diff", "--no-index", ...color, "--", localPath, pushedPath], { check: false });
     const lines = diff.stdout.split(`
@@ -8307,7 +9250,7 @@ function printRedactionDiff(original, redacted) {
     if (body)
       console.log(body);
   } finally {
-    fs14.rmSync(scratch, { recursive: true, force: true });
+    fs15.rmSync(scratch, { recursive: true, force: true });
   }
 }
 function cmdRedact(args) {
@@ -8323,15 +9266,15 @@ function cmdRedact(args) {
   }
   const mode = redactionModeConfigValue(getValue(parsed, "--mode", DEFAULT_REDACTION_MODE), "--mode");
   const rulesPath = parsed.values.get("--rules");
-  const effective = checkoutPolicy ? checkoutRedactionPolicy(process.cwd()) : { mode, rules: rulesPath ? readRules(path12.resolve(rulesPath)) : [] };
+  const effective = checkoutPolicy ? checkoutRedactionPolicy(process.cwd()) : { mode, rules: rulesPath ? readRules(path13.resolve(rulesPath)) : [] };
   const relativePath = parsed.values.get("--path");
   if ((checkoutPolicy || rulesPath) && !relativePath)
     throw new SidecarError("redaction rules require --path");
   const effectiveMode = relativePath ? resolveFileRules(effective.rules, relativePath, { resolve: "fork", redaction: effective.mode }).redaction : effective.mode;
-  const output = redactBuffer(fs14.readFileSync(0), effectiveMode);
+  const output = redactBuffer(fs15.readFileSync(0), effectiveMode);
   let offset = 0;
   while (offset < output.length) {
-    offset += fs14.writeSync(1, output, offset, output.length - offset);
+    offset += fs15.writeSync(1, output, offset, output.length - offset);
   }
   return 0;
 }
@@ -8345,6 +9288,215 @@ var init_cmd_sync = __esm(() => {
   init_redaction();
   init_rules();
   init_ui();
+});
+
+// src/cmd-review.ts
+import fs16 from "node:fs";
+import path14 from "node:path";
+function cmdReview(args) {
+  const [subcommand = "list", ...rest] = args[0]?.startsWith("-") ? ["list", ...args] : args;
+  switch (subcommand) {
+    case "list":
+      return listCommand(rest);
+    case "show":
+      return showCommand(rest);
+    case "approve":
+    case "reject":
+      return decideCommand(subcommand, rest);
+    case "retry":
+      return retryCommand(rest);
+    case "reviewer":
+      return reviewerCommand(rest);
+    case "run":
+      return runCommand(rest);
+    default:
+      throw new SidecarError(`unknown review command ${JSON.stringify(subcommand)}; ${USAGE}`);
+  }
+}
+function listCommand(args) {
+  const parsed = parseOptions(args, { boolean: new Set(["--json"]), value: new Set(["--peer"]) });
+  if (parsed.positional.length)
+    throw new SidecarError(USAGE);
+  const peers = loadPeers(selectedPeer(parsed));
+  if (parsed.flags.has("--json")) {
+    console.log(JSON.stringify(peers.map((peer) => ({
+      peer: peer.name,
+      required: reviewRequired(peer.config),
+      reviews: peerReviews(peer).map(reviewPayload)
+    })), null, 2));
+    return 0;
+  }
+  for (const peer of peers) {
+    announcePeer(peer, peers);
+    if (!reviewRequired(peer.config)) {
+      console.log(paint("quiet", 'review is off for this peer; turn it on with review = "required" in its config'));
+      continue;
+    }
+    const reviews = peerReviews(peer);
+    if (!reviews.length) {
+      console.log(paint("quiet", "no reviews yet; the next sync with unpublished changes opens one"));
+      continue;
+    }
+    for (const review of reviews)
+      printReviewRow(review);
+  }
+  return 0;
+}
+function peerReviews(peer) {
+  const sidecarPath = resolveSidecarPath(peer.root, peer.config);
+  return hasGitMetadata(sidecarPath) ? listReviews(sidecarPath) : [];
+}
+function printReviewRow(review) {
+  const attention = reviewAttention(review);
+  const age = formatRelativeTime(review.record.createdAt) ?? review.record.createdAt;
+  const text = `${review.record.id}  ${review.state.padEnd(10)}  ${age}, ${review.record.files.length} file(s)`;
+  if (attention)
+    console.log(`${paint("attn", text)}  needs attention: ${attention}`);
+  else
+    console.log(isOpen(review) ? text : paint("quiet", text));
+}
+function reviewPayload(review) {
+  return {
+    id: review.record.id,
+    state: review.state,
+    attention: reviewAttention(review),
+    createdAt: review.record.createdAt,
+    files: review.record.files,
+    reason: review.verdict?.reason,
+    decidedAt: review.verdict?.decidedAt,
+    publishedAt: review.record.publishedAt,
+    publishedCommit: review.record.publishedCommit,
+    dir: review.dir
+  };
+}
+function showCommand(args) {
+  const parsed = parseOptions(args, { boolean: new Set(["--json"]), value: new Set(["--peer"]) });
+  if (parsed.positional.length > 1)
+    throw new SidecarError(USAGE);
+  const review = selectReview(parsed.positional[0], selectedPeer(parsed));
+  if (parsed.flags.has("--json")) {
+    console.log(JSON.stringify(reviewPayload(review), null, 2));
+    return 0;
+  }
+  const { record } = review;
+  const line = (label, value, role) => labelLine(LABEL_WIDTH, label, value, role);
+  const attention = reviewAttention(review);
+  line("review", record.id, "brand");
+  line("state", attention ? `${review.state} — needs attention: ${attention}` : review.state, attention ? "attn" : undefined);
+  line("repo", record.root, "repo");
+  if (record.peer !== "default")
+    line("peer", record.peer);
+  line("opened", formatRelativeTime(record.createdAt) ?? record.createdAt);
+  if (review.verdict)
+    line("decided", `${review.verdict.verdict} ${formatRelativeTime(review.verdict.decidedAt) ?? review.verdict.decidedAt}`);
+  if (review.verdict?.reason)
+    line("reason", review.verdict.reason);
+  if (review.run)
+    line("reviewer", review.run.command, "quiet");
+  line("packet", review.dir, "quiet");
+  console.log("");
+  for (const file of record.files) {
+    console.log(`  ${file.status}  ${file.path}${file.artifact ? paint("quiet", `  (not in the diff; full content: ${path14.join(review.dir, file.artifact)})`) : ""}`);
+  }
+  console.log("");
+  process.stdout.write(fs16.readFileSync(path14.join(review.dir, "diff.patch"), "utf8"));
+  if (isOpen(review)) {
+    console.log("");
+    console.log(paint("quiet", `decide with \`sidecar review approve ${record.id}\` or \`sidecar review reject ${record.id} --reason "..."\``));
+  }
+  return 0;
+}
+function decideCommand(verdict, args) {
+  const parsed = parseOptions(args, { boolean: new Set(["--no-sync"]), value: new Set(["--reason", "--peer"]) });
+  if (parsed.positional.length > 1)
+    throw new SidecarError(USAGE);
+  const selected = selectReview(parsed.positional[0], selectedPeer(parsed));
+  const reason = parsed.values.get("--reason")?.trim() || undefined;
+  const { id } = selected.record;
+  withLockedReview(selected, (review) => decideReview(review, verdict === "approve" ? "approved" : "rejected", reason));
+  if (verdict === "reject") {
+    console.log(`rejected review ${paint("brand", id)}; nothing it covers is published`);
+    console.log("change the files it flags and the next sync opens a new review, or approve it to override");
+    return 0;
+  }
+  console.log(`approved review ${paint("brand", id)}`);
+  if (parsed.flags.has("--no-sync")) {
+    console.log("it publishes on the next sync");
+    return 0;
+  }
+  const peer = loadPeer(selected.record.root, selected.record.peer);
+  syncPeer(peer, { lock: "wait", remote: true, snapshot: true });
+  return 0;
+}
+function retryCommand(args) {
+  const parsed = parseOptions(args, { boolean: new Set, value: new Set(["--peer"]) });
+  if (parsed.positional.length > 1)
+    throw new SidecarError(USAGE);
+  configuredReviewer();
+  const selected = selectReview(parsed.positional[0], selectedPeer(parsed));
+  const fresh = withLockedReview(selected, retryReview);
+  console.log(`retired review ${paint("brand", selected.record.id)}; review ${paint("brand", fresh.record.id)} covers the same change, and its reviewer is running`);
+  return 0;
+}
+function withLockedReview(selected, fn) {
+  const { id, root, peer } = selected.record;
+  let result;
+  withSyncLock(root, peer, "wait", () => {
+    const review = readReview(id);
+    if (!review)
+      throw new SidecarError(`review ${id} is gone`);
+    result = fn(review);
+  });
+  return result;
+}
+function reviewerCommand(args) {
+  const settings = readSettings();
+  if (!args.length) {
+    console.log(settings.reviewer ?? paint("quiet", "no reviewer configured"));
+    return 0;
+  }
+  if (args.length === 1 && args[0] === "--unset") {
+    writeSettings({ ...settings, reviewer: undefined });
+    console.log("reviewer unset; reviews now wait for `sidecar review approve`");
+    return 0;
+  }
+  if (args.length !== 1) {
+    throw new SidecarError('usage: sidecar review reviewer ["<command>"|--unset]; quote the command as one argument');
+  }
+  const command = args[0].trim();
+  if (!command)
+    throw new SidecarError("the reviewer command is empty");
+  writeSettings({ ...settings, reviewer: command });
+  console.log(`reviewer set to ${paint("brand", command)}`);
+  return 0;
+}
+function runCommand(args) {
+  if (args.length !== 1)
+    throw new SidecarError("usage: sidecar review run <id>");
+  return runReviewer(args[0]);
+}
+function selectReview(id, peer) {
+  if (id)
+    return findReview(id);
+  const open = loadPeers(peer).map((candidate) => resolveSidecarPath(candidate.root, candidate.config)).filter(hasGitMetadata).map(openReview).filter((review) => review !== undefined);
+  if (open.length === 1)
+    return open[0];
+  if (!open.length)
+    throw new SidecarError("no open review here; pass a review id (`sidecar review` lists them)");
+  throw new SidecarError(`more than one open review here (${open.map((review) => review.record.id).join(", ")}); pass the id`);
+}
+var USAGE = "usage: sidecar review [list|show|approve|reject|retry|reviewer] [id] [--reason text] [--no-sync] [--json] [--peer name]", LABEL_WIDTH;
+var init_cmd_review = __esm(() => {
+  init_color();
+  init_util();
+  init_git();
+  init_config();
+  init_state();
+  init_review();
+  init_sync();
+  init_cmd_sync();
+  init_ui();
+  LABEL_WIDTH = "reviewer:".length;
 });
 
 // src/commands.ts
@@ -8420,12 +9572,13 @@ var init_commands = __esm(() => {
   init_cmd_status();
   init_cmd_daemon();
   init_cmd_sync();
+  init_cmd_review();
   COMMANDS = [
     {
       name: "init",
       run: cmdInit,
       section: "common",
-      usage: "init [remote] [--peer name] [--path sidecar|.] [--branch main] [--inbox template] [--redaction none|secrets|secrets+pii] [--resolve fork|lww] [--debounce 10m] [--interval 1h] [--ignored] [--local-install]",
+      usage: "init [remote] [--peer name] [--path sidecar|.] [--branch main] [--inbox template] [--redaction none|secrets|secrets+pii] [--resolve fork|lww] [--review off|required] [--review-timeout 1h] [--debounce 10m] [--interval 1h] [--ignored] [--local-install]",
       notes: [
         "--path . makes this repo itself the sidecar (standalone)",
         "--peer name adds a second sidecar as .sidecar.name; --ignored keeps it out of the tree",
@@ -8446,6 +9599,16 @@ var init_commands = __esm(() => {
       section: "common",
       usage: "redactions [--peer name]",
       summary: "preview what redaction rewrites before content is pushed"
+    },
+    {
+      name: "review",
+      run: cmdReview,
+      section: "common",
+      usage: "review [show|approve|reject|retry] [id] [--reason text] [--no-sync] [--json] [--peer name]",
+      notes: [
+        'the reviews that gate a peer with review = "required"; approve publishes at once',
+        "review reviewer [<command>|--unset] sets who reviews on this machine"
+      ]
     },
     {
       name: "sync",
@@ -8517,7 +9680,7 @@ async function main(argv = process.argv.slice(2)) {
     if (command !== "redact" && command !== "deinit" && shouldUseGlobalRegistry()) {
       logSidecarEvent("failure", {
         command,
-        message: error instanceof Error ? error.message : String(error)
+        ...privateFailures() ? {} : { message: error instanceof Error ? error.message : String(error) }
       });
     }
     if (error instanceof SidecarError) {
@@ -8535,6 +9698,7 @@ var init_cli = __esm(() => {
   init_color();
   init_util();
   init_install();
+  init_config();
   init_state();
   init_commands();
   init_util();
@@ -8556,20 +9720,20 @@ var init_cli = __esm(() => {
 
 // src/bin.ts
 init_cli();
-import fs15 from "node:fs";
-import path13 from "node:path";
-import { spawnSync as spawnSync5 } from "node:child_process";
-import { fileURLToPath as fileURLToPath4 } from "node:url";
+import fs17 from "node:fs";
+import path15 from "node:path";
+import { spawnSync as spawnSync6 } from "node:child_process";
+import { fileURLToPath as fileURLToPath3 } from "node:url";
 var SKIP_LOCAL_EXEC_ENV3 = "SIDECAR_SKIP_LOCAL_EXEC";
 var GLOBAL_EXEC_ENV3 = "SIDECAR_GLOBAL_EXEC";
 var PACKAGE_NAME2 = "sidecarsync";
 var GLOBAL_ONLY_COMMANDS = new Set(["daemon", "deinit", "register-install", "set-install-source", "update"]);
 if (process.argv[2] !== "redact" && !process.env[SKIP_LOCAL_EXEC_ENV3]) {
-  const local = findLocalInstall(process.cwd(), fileURLToPath4(import.meta.url));
+  const local = findLocalInstall(process.cwd(), fileURLToPath3(import.meta.url));
   if (local) {
     process.env[GLOBAL_EXEC_ENV3] = "1";
     if (local.newer && !GLOBAL_ONLY_COMMANDS.has(process.argv[2])) {
-      const result = spawnSync5(process.execPath, [local.executable, ...process.argv.slice(2)], {
+      const result = spawnSync6(process.execPath, [local.executable, ...process.argv.slice(2)], {
         stdio: "inherit",
         env: {
           ...process.env,
@@ -8586,15 +9750,15 @@ if (process.argv[2] !== "redact" && !process.env[SKIP_LOCAL_EXEC_ENV3]) {
 }
 process.exit(await main());
 function findLocalInstall(start, self) {
-  let current = path13.resolve(start);
+  let current = path15.resolve(start);
   while (true) {
     if (projectDependsOnSidecar2(current)) {
-      const candidate = path13.join(current, "node_modules", PACKAGE_NAME2, "dist", "cli.js");
+      const candidate = path15.join(current, "node_modules", PACKAGE_NAME2, "dist", "cli.js");
       if (isFile2(candidate) && !sameFile(candidate, self)) {
         return { executable: candidate, newer: localIsNewer(current) };
       }
     }
-    const parent = path13.dirname(current);
+    const parent = path15.dirname(current);
     if (parent === current)
       return;
     current = parent;
@@ -8605,11 +9769,11 @@ function localIsNewer(projectRoot) {
   return localVersion !== undefined && compareVersions(localVersion, packageVersion()) > 0;
 }
 function projectDependsOnSidecar2(projectRoot) {
-  const manifestPath = path13.join(projectRoot, "package.json");
+  const manifestPath = path15.join(projectRoot, "package.json");
   if (!isFile2(manifestPath))
     return false;
   try {
-    const manifest = JSON.parse(fs15.readFileSync(manifestPath, "utf8"));
+    const manifest = JSON.parse(fs17.readFileSync(manifestPath, "utf8"));
     return Boolean(manifest.dependencies?.[PACKAGE_NAME2] || manifest.devDependencies?.[PACKAGE_NAME2] || manifest.optionalDependencies?.[PACKAGE_NAME2] || manifest.peerDependencies?.[PACKAGE_NAME2]);
   } catch {
     return false;
@@ -8617,14 +9781,14 @@ function projectDependsOnSidecar2(projectRoot) {
 }
 function isFile2(filePath) {
   try {
-    return fs15.statSync(filePath).isFile();
+    return fs17.statSync(filePath).isFile();
   } catch {
     return false;
   }
 }
 function sameFile(first, second) {
   try {
-    return fs15.realpathSync(first) === fs15.realpathSync(second);
+    return fs17.realpathSync(first) === fs17.realpathSync(second);
   } catch {
     return false;
   }

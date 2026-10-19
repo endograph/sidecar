@@ -6,6 +6,7 @@
 import { colorLevel, paint } from "./color.js";
 import { SidecarError } from "./util.js";
 import { shouldUseGlobalRegistry } from "./install.js";
+import { privateFailures } from "./config.js";
 import { logSidecarEvent } from "./state.js";
 import { run } from "./commands.js";
 
@@ -40,7 +41,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     if (command !== "redact" && command !== "deinit" && shouldUseGlobalRegistry()) {
       logSidecarEvent("failure", {
         command,
-        message: error instanceof Error ? error.message : String(error),
+        // The terminal still gets the message below.
+        ...(privateFailures() ? {} : { message: error instanceof Error ? error.message : String(error) }),
       });
     }
     if (error instanceof SidecarError) {

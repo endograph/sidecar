@@ -128,6 +128,17 @@ describe("nextHealthRecord", () => {
   });
 });
 
+describe("carried fields", () => {
+  test("only timestamps carry forward from a previous record", () => {
+    const forged = { ...ok(T0), lastSuccessAt: "PRIVATE text", lastFailureAt: "2026-07-26T08:00:00.000Z", consecutiveFailures: 2.7 };
+    const record = nextHealthRecord(forged, identity, { status: "failed", stage: "merge", message: "x" }, T1);
+    expect(record.lastSuccessAt).toBeUndefined();
+    expect(record.lastFailureAt).toBe(T1);
+    expect(record.consecutiveFailures).toBe(3);
+    expect(nextHealthRecord(forged, identity, { status: "ok" }, T1).lastFailureAt).toBe("2026-07-26T08:00:00.000Z");
+  });
+});
+
 describe("shouldPublishHealth", () => {
   const heartbeatAgo = (ms: number): number => Date.parse(T0) + ms;
 
@@ -143,6 +154,18 @@ describe("shouldPublishHealth", () => {
   test("throttles unchanged healthy heartbeats to the refresh interval", () => {
     expect(shouldPublishHealth(ok(T0), ok(T1), heartbeatAgo(HEALTH_HEARTBEAT_MS - 1))).toBe(false);
     expect(shouldPublishHealth(ok(T0), ok(T1), heartbeatAgo(HEALTH_HEARTBEAT_MS))).toBe(true);
+  });
+
+  test("a review hold starting, changing, or clearing is a transition", () => {
+    const held = nextHealthRecord(ok(T0), identity, { status: "ok", review: "pending" }, T1);
+    const attention = nextHealthRecord(held, identity, { status: "ok", review: "attention" }, T1);
+    const clear = nextHealthRecord(attention, identity, { status: "ok" }, T1);
+    expect(held.review).toBe("pending");
+    expect(clear.review).toBeUndefined();
+    expect(shouldPublishHealth(ok(T0), held, heartbeatAgo(1000))).toBe(true);
+    expect(shouldPublishHealth(held, attention, heartbeatAgo(1000))).toBe(true);
+    expect(shouldPublishHealth(attention, clear, heartbeatAgo(1000))).toBe(true);
+    expect(shouldPublishHealth({ ...attention, updatedAt: T0 }, attention, heartbeatAgo(1000))).toBe(false);
   });
 
   test("publishes rather than waiting forever when a clock runs behind the branch", () => {
@@ -184,6 +207,12 @@ describe("record round-tripping", () => {
     const record = parseHealthRecord(JSON.stringify({ status: "ok", updatedAt: T0 }));
     expect(record?.machine).toBe("unknown");
     expect(record?.consecutiveFailures).toBe(0);
+  });
+
+  test("keeps a review hold and drops an unknown one", () => {
+    const held = nextHealthRecord(ok(T0), identity, { status: "ok", review: "attention" }, T1);
+    expect(parseHealthRecord(serializeHealthRecord(held))?.review).toBe("attention");
+    expect(parseHealthRecord(JSON.stringify({ status: "ok", updatedAt: T0, review: "maybe" }))?.review).toBeUndefined();
   });
 
   test("rejects what isn't a record at all", () => {

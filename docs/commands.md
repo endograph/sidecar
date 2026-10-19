@@ -16,6 +16,8 @@ sidecar clone              # clone or update the configured sidecar repo
 sidecar refresh            # delete the sidecar checkout and clone it again
 sidecar merge --fork-files # merge inbox branches and preserve conflicts
 sidecar redactions         # preview what redaction changes on the next push
+sidecar review             # list the reviews gating a review-required peer
+sidecar review approve <id>   # publish what a review covers
 sidecar instances          # list known local sidecar checkouts
 sidecar daemon status      # report daemon health, service state, settings paths
 sidecar daemon restart     # restart the background auto-sync process
@@ -51,9 +53,11 @@ repository yet becomes one when a remote is named: `sidecar init <remote>
 | `--inbox <template>` | inbox branch template (default `sidecar-inbox/{user}/{random}`) |
 | `--redaction <mode>` | what gets redacted on push: `secrets+pii`, `secrets`, or `none` — defaults to `secrets`; see [redaction.md](redaction.md) |
 | `--resolve <mode>` | `fork` (default) uses Git's clean merges and preserves conflicting versions as separate files; `lww` keeps the newest whole file without combining contents — see [Conflicts](sync.md#conflicts) |
+| `--review <mode>` | `required` holds everything this peer would publish until a review approves it; `off` (default) — see [review.md](review.md) |
+| `--review-timeout <duration>` | how long a review may sit undecided before it needs attention (default `1h`) |
 | `--debounce <duration>` | this repo's least time between remote round trips once edits land (`90s`, `10m`, `1h`, or seconds); the daemon's `--debounce` otherwise — see [Cadence](sync.md#cadence) |
 | `--interval <duration>` | this repo's most time between round trips while it is quiet, to within one daemon cycle; the daemon's `--interval` otherwise, which is also the floor |
-| `--ignored` | keep this peer out of the tree: its config, rules file, and checkout go in `.git/info/exclude` instead of the committed `.gitignore` |
+| `--ignored` | keep this peer out of the tree: its config, rules file, review guidelines, and checkout go in `.git/info/exclude` instead of the committed `.gitignore` |
 | `--no-clone` | write config and registration only; skip cloning |
 | `--no-bootstrap-main` | don't create the canonical branch on an empty remote |
 | `--local-install` | add `sidecarsync` to `devDependencies` (plus the bun/pnpm trust entry) so fresh clones self-register on install |
@@ -73,8 +77,8 @@ optional prompt defaults to no.
 
 ### `sidecar deinit [--yes] [--peer <name>]`
 
-Removes Sidecar from the current Git repository: the peer's config and rules, the
-configured checkout, Sidecar-owned `.gitignore`, Zed search, and daemon
+Removes Sidecar from the current Git repository: the peer's config, rules, and
+review guidelines, the configured checkout, Sidecar-owned `.gitignore`, Zed search, and daemon
 registry entries. Lines in `.git/info/exclude` are left in place: that file
 is shared by every working copy of the repo, and another may still declare
 the ignored peer. It preserves unrelated settings and does not touch
@@ -128,10 +132,16 @@ the daemon's) holds the repo's sync lock, `sync` fails immediately with
 no-ops and exits 0. That's what the daemon uses, since its next trigger
 retries anyway.
 
+For a peer with [review](review.md) required, the remote phase publishes an
+approved review instead of pushing the inbox, then opens or advances the
+review of whatever is still unpublished. A sync that leaves work held says
+so, and still succeeds: holding is the policy working, not a failure.
+
 ### `sidecar snapshot [--push] [-m|--message <text>] [--peer <name>]`
 
 Commit local sidecar changes to the inbox branch without merging anything.
-`--push` also pushes the inbox branch. Takes the same sync lock as `sync`.
+`--push` also pushes the inbox branch; a peer with review required refuses
+it, since only an approved review publishes. Takes the same sync lock as `sync`.
 
 ### `sidecar merge [--fork-files] [--no-push] [--peer <name>]`
 
@@ -145,6 +155,26 @@ immediately if another operation holds it.
 
 The peer's [rules file](rules.md) can select `fork` or `lww` per path. A
 mixed merge requires `--fork-files` if any conflicting path uses `fork`.
+
+For a peer with review required, the pushed merge combines only what the
+remote already has — every inbox as published — and local main is rebuilt on
+it; see [review.md](review.md#what-gets-published).
+
+### `sidecar review [<subcommand>] [<id>] [--peer <name>]`
+
+The reviews that gate a peer with `review = "required"`. See
+[review.md](review.md). Where an id is optional, it defaults to the repo's one
+open review.
+
+| command | effect |
+|---|---|
+| `sidecar review [--json]` | this repo's reviews, newest first, with any that need attention |
+| `sidecar review show [<id>] [--json]` | state, reason, changed files, and the diff exactly as it would be published |
+| `sidecar review approve [<id>] [--no-sync]` | approve, then publish it now unless `--no-sync`; also overrides a rejection |
+| `sidecar review reject [<id>] [--reason <text>]` | hold publishing until the content changes |
+| `sidecar review retry [<id>]` | retire it and open a new review of the same change, with a fresh reviewer run (not once approved) |
+| `sidecar review reviewer ["<command>"\|--unset]` | show or set this machine's reviewer, a shell command quoted as one argument |
+| `sidecar review run <id>` | the background runner a sync starts; not for direct use |
 
 ### `sidecar redactions [--peer <name>]`
 
@@ -295,7 +325,7 @@ colored is worth reading:
 | dim | labels, and values that mean "nothing here" (`no`, `none`, `never`) |
 | purple | your repo |
 | yellow | the sidecar — its checkout path and the remote it syncs with |
-| **bold yellow** | something is waiting on you: `dirty: yes`, a pending inbox count, a detached checkout, or a checkout parked off its inbox branch |
+| **bold yellow** | something is waiting on you: `dirty: yes`, a pending inbox count, a detached checkout, a checkout parked off its inbox branch, or a review that needs attention |
 | green | `daemon: running` |
 | red | the daemon should be running and isn't, no global install owns one, or the checkout is missing |
 
@@ -310,6 +340,8 @@ lines together are what a fresh clone sees when its `bun install`/`npm install`
 found no global sidecar to clone for (see [install.md](install.md)).
 `last sync:` comes from the machine-level instance registry and is never colored
 by age: a sidecar only syncs when something changed, so a quiet week is normal.
+A peer with review required adds a `review:` line: the open review, if any,
+and why it needs attention when it does (see [review.md](review.md#needs-attention)).
 
 Color is off automatically when output is not a terminal, so `sidecar status |
 grep dirty` stays clean. `NO_COLOR=1` (or `FORCE_COLOR=0`, or `TERM=dumb`) turns

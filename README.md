@@ -43,6 +43,10 @@ while a background daemon keeps every clone in sync.
 - **Secrets stay home.** Pasted API keys and tokens are redacted from pushes
   while your local files stay untouched; PII redaction is one flag away —
   [how redaction works](docs/redaction.md).
+- **Optional review before publishing.** Turn on `review = "required"` and
+  nothing leaves the machine until a coding agent (or you) approves it, for
+  the sensitive content that pattern matching can't see —
+  [how review works](docs/review.md).
 
 ## Quickstart
 
@@ -102,6 +106,7 @@ Every command acts on all peers unless `--peer` names one —
 - [Peers](docs/sync.md#peers-several-sidecars-in-one-repo) — several sidecars in one repo, one committed and one ignored
 - [Per-file rules](docs/rules.md) — glob-based merge and redaction policy for each peer
 - [Redaction](docs/redaction.md) — what's stripped from pushes and how to review it
+- [Review before publishing](docs/review.md) — gate a peer's pushes on an agent's or your approval
 - [Editor search visibility](docs/editors.md) — making gitignored files searchable
 - [Global vs local installs](docs/install.md) — the newest install wins
 - [All commands](docs/commands.md)

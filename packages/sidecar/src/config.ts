@@ -35,6 +35,14 @@ const branchValidity = new Map<string, boolean>();
 export const DEFAULT_PEER = "default";
 /** How the daemon names the peer a spawned sync is for; commands read it as `--peer`. */
 export const PEER_ENV = "SIDECAR_PEER";
+// An env var rather than a flag so the daemon can request soft syncs from
+// older pinned project-local CLIs, which ignore it instead of rejecting an
+// unknown option.
+export const SOFT_SYNC_ENV = "SIDECAR_SYNC_SOFT";
+// Likewise a variable rather than a flag: the daemon settles this machine far
+// more often than it talks to the remote, and a pinned older CLI has to be able
+// to ignore the request instead of rejecting an option it never heard of.
+export const LOCAL_SYNC_ENV = "SIDECAR_SYNC_LOCAL";
 const PEER_NAME = /^[a-z0-9][a-z0-9-]*$/;
 // Suffixes an editor or a cautious hand puts on a copy of `.sidecar`. A swap
 // file or a backup must never be read as a peer, so these names are refused at
@@ -166,6 +174,26 @@ export const RESOLVE_MODES = ["fork", "lww"] as const;
 export type ResolveMode = (typeof RESOLVE_MODES)[number];
 export const DEFAULT_RESOLVE: ResolveMode = "fork";
 
+/**
+ * `required` holds everything this peer would publish until a review approves
+ * it; see review.ts. The policy is committed with the config, while the
+ * command that performs a review is machine-local: a committed command would
+ * be one a cloned repo could make every machine's daemon run.
+ */
+export const REVIEW_MODES = ["off", "required"] as const;
+export type ReviewMode = (typeof REVIEW_MODES)[number];
+const DEFAULT_REVIEW_TIMEOUT_SECONDS = 60 * 60;
+
+/** The only .sidecar format this version reads. */
+const CONFIG_VERSION = 1;
+// Every key the config may carry. Anything else is refused rather than
+// ignored: a policy key this version does not understand — review is the
+// first — would otherwise be silently dropped, and a sync that drops a
+// publishing gate fails open.
+const CONFIG_KEYS = new Set([
+  "version", "remote", "path", "branch", "inbox", "redaction", "resolve", "debounce", "interval", "review", "review-timeout",
+]);
+
 export type SidecarConfig = {
   /** Which peer this is — derived from the file name, never written into it. */
   peer: string;
@@ -187,7 +215,44 @@ export type SidecarConfig = {
    */
   debounce?: number;
   interval?: number;
+  /** Absent means off. */
+  review?: ReviewMode;
+  /** Seconds a review may stay undecided before it needs attention. */
+  reviewTimeout?: number;
 };
+
+export function reviewRequired(config: SidecarConfig): boolean {
+  return config.review === "required";
+}
+
+let failuresArePrivate = false;
+
+/**
+ * Whether this process has touched a peer that requires review — or one whose
+ * policy it could not tell. Its failures then stay out of the event log (see
+ * cli.ts): git's messages quote paths, a gated peer's paths can be content
+ * nobody has reviewed, and the log is something people paste into bug
+ * reports. Every command reaches a peer through readConfig, a config it is
+ * about to write (notePeerPolicy), or a review packet (readReview), and each
+ * marks the process before anything else can fail.
+ */
+export function privateFailures(): boolean {
+  return failuresArePrivate;
+}
+
+/** Marks this process's failures private: it holds, or may hold, unreviewed content. */
+export function keepFailuresPrivate(): void {
+  failuresArePrivate = true;
+}
+
+/** Marks this process's failures private when `config` requires review. */
+export function notePeerPolicy(config: SidecarConfig): void {
+  if (reviewRequired(config)) keepFailuresPrivate();
+}
+
+export function reviewTimeoutSeconds(config: SidecarConfig): number {
+  return config.reviewTimeout ?? DEFAULT_REVIEW_TIMEOUT_SECONDS;
+}
 
 export function findConfigRoot(start: string): string {
   const root = findConfigRootOptional(start);
@@ -207,7 +272,13 @@ export function findConfigRootOptional(start: string): string | undefined {
 }
 
 export function writeConfig(configPath: string, config: SidecarConfig): void {
-  const text = [
+  notePeerPolicy(config);
+  fs.writeFileSync(configPath, configText(config), "utf8");
+}
+
+/** A config as its file holds it: what two configs must share to be the same. */
+export function configText(config: SidecarConfig): string {
+  return [
     `version = ${config.version}`,
     `remote = ${JSON.stringify(config.remote)}`,
     `path = ${JSON.stringify(config.path)}`,
@@ -217,9 +288,10 @@ export function writeConfig(configPath: string, config: SidecarConfig): void {
     `resolve = ${JSON.stringify(config.resolve ?? DEFAULT_RESOLVE)}`,
     ...(config.debounce === undefined ? [] : [`debounce = ${config.debounce}`]),
     ...(config.interval === undefined ? [] : [`interval = ${config.interval}`]),
+    ...(reviewRequired(config) ? [`review = "required"`] : []),
+    ...(config.reviewTimeout === undefined ? [] : [`review-timeout = ${config.reviewTimeout}`]),
     "",
   ].join("\n");
-  fs.writeFileSync(configPath, text, "utf8");
 }
 
 export function readConfig(configPath: string, options: { loadRules?: boolean } = {}): SidecarConfig {
@@ -231,8 +303,26 @@ export function readConfig(configPath: string, options: { loadRules?: boolean } 
     }
     values = parsed as Record<string, unknown>;
   } catch (error) {
+    // A config that exists but cannot be read may be a gated peer's.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") keepFailuresPrivate();
     if (error instanceof SidecarError) throw error;
     throw new SidecarError(`${configPath} is not valid TOML: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  // Before anything else is validated or loaded: anything but a plain "off"
+  // may be a gated peer, so its failures are private from here on.
+  if (values.review !== undefined && values.review !== "off") keepFailuresPrivate();
+
+  const unknown = Object.keys(values).filter((key) => !CONFIG_KEYS.has(key));
+  if (unknown.length) {
+    throw new SidecarError(
+      `${configPath}: unknown key${unknown.length > 1 ? "s" : ""} ${unknown.map((key) => JSON.stringify(key)).join(", ")}; this sidecar may be older than the config — update it with \`sidecar update\``,
+    );
+  }
+  const version = numberConfigValue(configPath, values, "version", CONFIG_VERSION);
+  if (version !== CONFIG_VERSION) {
+    throw new SidecarError(
+      `${configPath}: config version ${version} is not supported by this sidecar (expected ${CONFIG_VERSION}); update it with \`sidecar update\``,
+    );
   }
 
   const remote = optionalStringConfigValue(configPath, values, "remote");
@@ -243,7 +333,7 @@ export function readConfig(configPath: string, options: { loadRules?: boolean } 
   const config = {
     peer,
     remote,
-    version: numberConfigValue(configPath, values, "version", 1),
+    version,
     path: stringConfigValue(configPath, values, "path", DEFAULT_PATH),
     branch: stringConfigValue(configPath, values, "branch", DEFAULT_BRANCH),
     inbox: stringConfigValue(configPath, values, "inbox", DEFAULT_INBOX),
@@ -254,6 +344,8 @@ export function readConfig(configPath: string, options: { loadRules?: boolean } 
     resolve: resolveModeConfigValue(stringConfigValue(configPath, values, "resolve", DEFAULT_RESOLVE), configPath),
     debounce: durationConfigValue(values.debounce, `${configPath} debounce`),
     interval: durationConfigValue(values.interval, `${configPath} interval`),
+    review: reviewModeConfigValue(stringConfigValue(configPath, values, "review", "off"), configPath),
+    reviewTimeout: durationConfigValue(values["review-timeout"], `${configPath} review-timeout`),
     rules: options.loadRules === false ? undefined : readRules(rulesPath),
     rulesPath,
   };
@@ -271,6 +363,13 @@ export function redactionModeConfigValue(value: string, source: string): Redacti
   if ((REDACTION_MODES as readonly string[]).includes(value)) return value as RedactionMode;
   throw new SidecarError(
     `${source}: invalid redaction mode ${JSON.stringify(value)}; expected one of ${REDACTION_MODES.join(", ")}`,
+  );
+}
+
+export function reviewModeConfigValue(value: string, source: string): ReviewMode {
+  if ((REVIEW_MODES as readonly string[]).includes(value)) return value as ReviewMode;
+  throw new SidecarError(
+    `${source}: invalid review mode ${JSON.stringify(value)}; expected one of ${REVIEW_MODES.join(", ")}`,
   );
 }
 
@@ -442,7 +541,15 @@ export function inboxPrefix(config: SidecarConfig): string {
   return inboxBranchPrefix(config.inbox);
 }
 
+/**
+ * Where a review-gated peer keeps the remote's branches as sidecar last
+ * fetched them; see the review-gated section of sync.ts.
+ */
+export const PUBLIC_REFS = "refs/sidecar-public/";
+
+/** A branch's own name from its remote-tracking or public ref. */
 export function remoteBranchName(remoteBranch: string): string {
+  if (remoteBranch.startsWith(PUBLIC_REFS)) return remoteBranch.slice(PUBLIC_REFS.length);
   return remoteBranch.startsWith("origin/") ? remoteBranch.slice("origin/".length) : remoteBranch;
 }
 

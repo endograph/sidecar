@@ -82,6 +82,22 @@ checkout: let that operation finish before retrying. Repeated failures need
 diagnosis using the reported error, `sidecar status`, `sidecar tail`, or
 `sidecar health`; force-refreshing or removing a lock is not routine recovery.
 
+## When publishing is held for review
+
+A peer with `review = "required"` publishes nothing until a review approves
+it. `sidecar sync` succeeds and says the work is held; that does not mean it
+reached the remote. Report a held sync as held. Check `sidecar status` for the
+review's state, and leave the decision to the reviewer or the person the user
+named.
+
+An agent acting as the reviewer reads the packet it was given (start with
+`$SIDECAR_REVIEW_PROMPT`). It decides with `sidecar review approve <id>` or
+`sidecar review reject <id> --reason "<file: what kind of content>"`, without
+repeating the sensitive value in the reason. When unsure, it leaves the review
+open and asks. It does not approve its own changes to get a handoff through
+faster, and it does not edit `.sidecar` to turn review off. See
+[review.md](review.md).
+
 ## Choose how concurrent work survives
 
 Use separate files for independent handoffs when possible. A single shared
