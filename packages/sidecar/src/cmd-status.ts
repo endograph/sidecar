@@ -15,6 +15,7 @@ import {
   loadPeers,
   requireSidecarCheckout,
   resolveSidecarPath,
+  reviewRequired,
   selectedPeer,
 } from "./config.js";
 import { instancePeer, instancesPath, listInstanceStatuses, readInstances, readSettings, sidecarLogPath } from "./state.js";
@@ -22,6 +23,7 @@ import { daemonServiceStatus } from "./service.js";
 import { checkoutIsUnlinkedFromFamily, pendingInboxBranches, readFleetHealth } from "./sync.js";
 import { announcePeer, formatRelativeTime, formatTimestampPair, labelLine } from "./ui.js";
 import { type HealthRecord, type HealthState, summarizeHealthStates } from "./health.js";
+import { openReview, reviewAttention } from "./review.js";
 
 // "pending inbox:" is the longest label; every value starts one space past it.
 const STATUS_LABEL_WIDTH = "pending inbox:".length;
@@ -61,6 +63,7 @@ function printPeerStatus({ root, config, configPath }: Peer): void {
   statusLine("main branch", config.branch);
   statusLine("inbox branch", inbox);
   statusLine("conflicts", config.resolve === "lww" ? "last writer wins" : "fork files");
+  if (reviewRequired(config)) printReviewLine(sidecarPath);
 
   if (!checkoutPresent) {
     // The state a fresh clone lands in when nothing cloned for it: say what to
@@ -100,6 +103,36 @@ function printPeerStatus({ root, config, configPath }: Peer): void {
   }
 }
 
+// What holds this checkout's publishing. Machine-local, so it needs no fetch:
+// the review records are the whole story.
+function printReviewLine(sidecarPath: string): void {
+  const review = hasGitMetadata(sidecarPath) ? openReview(sidecarPath) : undefined;
+  const reviewer = readSettings().reviewer;
+  if (!review) {
+    if (reviewer) statusLine("review", `required — nothing waiting (reviewer: ${reviewer})`, "quiet");
+    else statusLine("review", "required — no reviewer configured; reviews wait for `sidecar review approve`", "attn");
+    return;
+  }
+  const attention = reviewAttention(review);
+  const age = formatRelativeTime(review.record.createdAt) ?? review.record.createdAt;
+  const summary = `${review.state} ${review.record.id}, opened ${age}, ${review.record.files.length} file(s)`;
+  statusLine("review", attention ? `${summary} — needs attention: ${attention}` : summary, attention ? "attn" : undefined);
+  if (review.verdict?.reason) console.log(`  ${paint("quiet", review.verdict.reason)}`);
+  console.log(`  ${paint("quiet", `sidecar review show ${review.record.id}`)}`);
+}
+
+function openReviewPayload(sidecarPath: string): Record<string, unknown> | undefined {
+  const review = openReview(sidecarPath);
+  if (!review) return undefined;
+  return {
+    id: review.record.id,
+    state: review.state,
+    attention: reviewAttention(review),
+    createdAt: review.record.createdAt,
+    files: review.record.files.length,
+  };
+}
+
 function statusPayload({ root, name, config, configPath }: Peer): Record<string, unknown> {
   const sidecarPath = resolveSidecarPath(root, config);
   const checkoutPresent = hasGitMetadata(sidecarPath);
@@ -121,6 +154,7 @@ function statusPayload({ root, name, config, configPath }: Peer): Record<string,
     daemon: daemonHealth().text,
     lastSyncAt: readInstances().find((instance) => instance.configPath === configPath)?.lastSyncAt,
     pendingInbox: checkoutPresent ? pendingStatusInboxBranches(sidecarPath, config) : undefined,
+    review: reviewRequired(config) ? { required: true, open: checkoutPresent ? openReviewPayload(sidecarPath) : undefined } : undefined,
   };
 }
 
@@ -131,9 +165,12 @@ function pendingStatusInboxBranches(sidecarPath: string, config: SidecarConfig):
     : branchExists(sidecarPath, config.branch)
       ? config.branch
       : "HEAD";
-  return pendingInboxBranches(sidecarPath, config).filter(
-    (remoteBranch) => !isAncestor(sidecarPath, remoteBranch, base),
-  );
+  // A review-gated checkout's local inbox branches never reach main as such —
+  // only their published commits do — so only the remote's count as pending.
+  const candidates = reviewRequired(config)
+    ? pendingInboxBranches(sidecarPath, config).filter((branch) => branch.startsWith("origin/"))
+    : pendingInboxBranches(sidecarPath, config);
+  return candidates.filter((remoteBranch) => !isAncestor(sidecarPath, remoteBranch, base));
 }
 
 /**
@@ -256,6 +293,8 @@ function healthStatusLine(state: HealthState, record: HealthRecord): { text: str
     const age = formatRelativeTime(record.updatedAt) ?? record.updatedAt;
     return { text: `stale — last reported ${age}`, role: "attn" };
   }
+  if (record.review === "attention") return { text: "ok — publishing held, review needs attention", role: "attn" };
+  if (record.review === "pending") return { text: "ok — publishing held for review", role: "ok" };
   return { text: "ok", role: "ok" };
 }
 

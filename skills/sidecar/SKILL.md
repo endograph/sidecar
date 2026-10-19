@@ -1,6 +1,6 @@
 ---
 name: sidecar
-description: Use the sidecarsync CLI to read, update, and synchronize Sidecar notes or state in repos with .sidecar configurations. Covers peer selection, standalone repos, per-file rules, and fork recovery.
+description: Use the sidecarsync CLI to read, update, and synchronize Sidecar notes or state in repos with .sidecar configurations. Covers peer selection, standalone repos, per-file rules, fork recovery, and review-gated publishing.
 ---
 
 # Sidecar
@@ -62,6 +62,20 @@ A successful remote sync establishes publication to the remote, not receipt by
 another machine. If a sync reports a busy lock, allow the active operation to finish before
 retrying; do not remove the lock. Report persistent failures with the peer and
 error. Do not use `refresh --force`, `deinit`, reset, or clean as routine retries.
+
+## Review-gated peers
+
+A config with `review = "required"` holds publication until a review approves
+it. A sync that says publishing is held has not published. Report it as held,
+with the review state from `sidecar status --json` (`review.open`). Do not
+approve a review unless you were asked to review it, and never turn review
+off to get a sync through.
+
+When you are the reviewer, the packet is in `$SIDECAR_REVIEW_DIR`; follow
+`$SIDECAR_REVIEW_PROMPT`. Decide with `sidecar review approve ID` or
+`sidecar review reject ID --reason "<file: kind of content>"`. Keep the
+sensitive value out of the reason. If a person should weigh in, decide nothing
+and raise it with them.
 
 ## Policy and recovery
 

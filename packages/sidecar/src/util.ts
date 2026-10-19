@@ -118,6 +118,11 @@ export function currentHost(): string {
   return os.hostname().split(".", 1)[0] || "unknown";
 }
 
+/** `user@host`: how this machine names itself in commits and heartbeats. */
+export function currentMachine(): string {
+  return `${currentUser()}@${currentHost()}`;
+}
+
 /**
  * A duration as seconds: a bare number is seconds, a string takes an
  * `s`, `m`, or `h` suffix ("90s", "10m", "1h"). Undefined when unparseable.

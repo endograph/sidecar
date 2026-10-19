@@ -2361,11 +2361,12 @@ describe("sidecar peers", () => {
 
     const output = runSidecar(["init", privateRemote, "--peer", "private", "--ignored"], main);
 
-    expect(output).toContain("ignored .sidecar.private and .sidecar-rules.private via .git/info/exclude");
+    expect(output).toContain("ignored .sidecar.private, .sidecar-rules.private, and .sidecar-review.private via .git/info/exclude");
     expect(output).toContain("ignored private/ via .git/info/exclude");
     const excludePath = path.join(main, ".git", "info", "exclude");
     expect(fs.readFileSync(excludePath, "utf8")).toContain("/.sidecar.private\n");
     expect(fs.readFileSync(excludePath, "utf8")).toContain("/.sidecar-rules.private\n");
+    expect(fs.readFileSync(excludePath, "utf8")).toContain("/.sidecar-review.private\n");
     expect(fs.readFileSync(excludePath, "utf8")).toContain("/private/\n");
     fs.writeFileSync(path.join(main, ".sidecar-rules.private"), '[[rules]]\nglob = "**"\nresolve = "fork"\n');
     // The committed ignore file and the tree carry no trace of the peer.
@@ -2382,6 +2383,7 @@ describe("sidecar peers", () => {
     // may still declare the peer, so its lines are left where they are.
     expect(fs.readFileSync(excludePath, "utf8")).toContain("/.sidecar.private\n");
     expect(fs.readFileSync(excludePath, "utf8")).toContain("/.sidecar-rules.private\n");
+    expect(fs.readFileSync(excludePath, "utf8")).toContain("/.sidecar-review.private\n");
     expect(fs.readFileSync(excludePath, "utf8")).toContain("/private/\n");
     expect(fs.existsSync(path.join(main, ".sidecar"))).toBe(true);
   });
@@ -2456,6 +2458,161 @@ describe("sidecar peers", () => {
     expect(notesWorktrees).not.toContain(fs.realpathSync(path.join(worktree, "sidecar")));
   });
 });
+
+describe("review-gated publishing", () => {
+  test("publishes only approved trees, and a rejected state never reaches the remote", async () => {
+    const { main, remote, sidecar } = initSidecarProject(["--review", "required"]);
+    const env = reviewerEnv(main);
+    runSidecar(["review", "reviewer", env.reviewer], main, env.vars);
+
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "hello\n", "utf8");
+    const first = openedReview(runSidecar(["sync"], main, env.vars));
+    await waitForReview(main, first, "published", env.vars);
+    expect(remoteFile(remote, "notes.md")).toBe("hello\n");
+    // Publishing settles it: nothing is left to review, so no second review opens.
+    const afterPublish = JSON.parse(runSidecar(["review", "--json"], main, env.vars))[0].reviews;
+    expect(afterPublish.map((review: { id: string }) => review.id)).toEqual([first]);
+
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "hello\nCONFIDENTIAL acquisition of Initech\n", "utf8");
+    const rejected = openedReview(runSidecar(["sync"], main, env.vars));
+    await waitForReview(main, rejected, "rejected", env.vars);
+    expect(runSidecar(["sync"], main, env.vars)).toContain("needs attention: rejected");
+    expect(remoteObjectsContain(remote, "CONFIDENTIAL")).toBe(false);
+
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "hello\nan acquisition is planned\n", "utf8");
+    const fixed = openedReview(runSidecar(["sync"], main, env.vars));
+    expect(fixed).not.toBe(rejected);
+    await waitForReview(main, fixed, "published", env.vars);
+    expect(remoteFile(remote, "notes.md")).toBe("hello\nan acquisition is planned\n");
+    // The rejected snapshot stays in local history only.
+    expect(remoteObjectsContain(remote, "CONFIDENTIAL")).toBe(false);
+    expect(gitRaw(["--git-dir", remote, "log", "--all", "--format=%s"]).stdout).not.toContain("sidecar snapshot");
+  });
+
+  test("edits made during an open review, and a sibling worktree's, publish without forks", async () => {
+    const { main, worktree, remote, state } = initWorktreeFamily(["--review", "required"]);
+    const env = reviewerEnv(main, { SIDECAR_STATE_DIR: state });
+    runSidecar(["clone"], worktree, env.vars);
+    runSidecar(["review", "reviewer", env.reviewer], main, env.vars);
+    const sidecar = path.join(main, "sidecar");
+    const sibling = path.join(worktree, "sidecar");
+
+    fs.writeFileSync(env.defer, "", "utf8");
+    fs.writeFileSync(path.join(sidecar, "plan.md"), "v1\n", "utf8");
+    const first = openedReview(runSidecar(["sync"], main, env.vars));
+    await waitForReview(main, first, "pending", env.vars, (review) => fs.readFileSync(path.join(String(review.dir), "reviewer.log"), "utf8").includes("deferring"));
+    expect(fs.readFileSync(path.join(sibling, "plan.md"), "utf8")).toBe("v1\n");
+
+    fs.writeFileSync(path.join(sidecar, "plan.md"), "v1\nv2\n", "utf8");
+    const second = runSidecar(["sync"], main, env.vars);
+    expect(second).not.toContain("opened review");
+    fs.writeFileSync(path.join(sibling, "sibling.md"), "sibling note\n", "utf8");
+    runSidecar(["sync", "--local"], worktree, env.vars);
+
+    // A person approves what the review covered: v1 alone, not the edit after it.
+    fs.rmSync(env.defer);
+    const approved = runSidecar(["review", "approve", first], main, env.vars);
+    expect(remoteFile(remote, "plan.md")).toBe("v1\n");
+    await waitForReview(main, openedReview(approved), "published", env.vars);
+    runSidecar(["sync"], worktree, env.vars);
+    runSidecar(["sync"], main, env.vars);
+
+    expect(remoteFile(remote, "plan.md")).toBe("v1\nv2\n");
+    expect(remoteFile(remote, "sibling.md")).toBe("sibling note\n");
+    for (const tree of [sidecar, sibling]) {
+      expect(git(tree, ["ls-files"]).stdout).not.toMatch(/\.conflict\.|\.sidecar-conflicts\//);
+    }
+    expect(fs.readFileSync(path.join(sibling, "plan.md"), "utf8")).toBe("v1\nv2\n");
+  });
+
+  test("an undecided review needs attention after its timeout, and the heartbeat carries no reason", async () => {
+    const { main, remote, sidecar } = initSidecarProject(["--review", "required", "--review-timeout", "1s"]);
+    const env = reviewerEnv(main);
+    runSidecar(["review", "reviewer", env.reviewer], main, env.vars);
+    fs.writeFileSync(env.defer, "", "utf8");
+    fs.writeFileSync(path.join(sidecar, "later.md"), "decide later\n", "utf8");
+
+    const id = openedReview(runSidecar(["sync"], main, env.vars));
+    await waitForReview(main, id, "pending", env.vars, (review) => fs.readFileSync(path.join(String(review.dir), "reviewer.log"), "utf8").includes("deferring"));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(runSidecar(["sync"], main, env.vars)).toContain("needs attention: undecided for over 1s");
+    expect(runSidecar(["status"], main, env.vars)).toContain("needs attention");
+
+    const heartbeats = remoteBranches(remote).filter((branch) => branch.startsWith("sidecar-health/"))
+      .map((branch) => JSON.parse(gitRaw(["--git-dir", remote, "show", `${branch}:health.json`]).stdout));
+    expect(heartbeats.map((record) => record.review)).toContain("attention");
+
+    runSidecar(["review", "approve", id], main, env.vars);
+    expect(remoteFile(remote, "later.md")).toBe("decide later\n");
+  });
+
+  test("a gated peer refuses to push a snapshot directly", () => {
+    const { main, sidecar } = initSidecarProject(["--review", "required"]);
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "hello\n", "utf8");
+    const result = runSidecarRaw(["snapshot", "--push"], main);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("requires review");
+  });
+});
+
+// A reviewer that rejects anything CONFIDENTIAL, defers while `defer` exists,
+// and approves the rest — through a `sidecar` on PATH, as a real one would.
+function reviewerEnv(main: string, extra: Record<string, string> = {}): { reviewer: string; defer: string; vars: Record<string, string> } {
+  const dir = tempDir();
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "sidecar"), `#!/bin/sh\nexec "${process.execPath}" "${cliPath}" "$@"\n`, { mode: 0o755 });
+  const defer = path.join(dir, "defer");
+  const reviewer = path.join(dir, "reviewer.sh");
+  fs.writeFileSync(reviewer, `#!/bin/sh
+if grep -q CONFIDENTIAL "$SIDECAR_REVIEW_DIFF"; then
+  exec sidecar review reject "$SIDECAR_REVIEW_ID" --reason "notes.md: an internal plan"
+fi
+if [ -f "${defer}" ]; then echo deferring; exit 0; fi
+exec sidecar review approve "$SIDECAR_REVIEW_ID"
+`, { mode: 0o755 });
+  return {
+    reviewer,
+    defer,
+    vars: { PATH: `${bin}:${process.env.PATH}`, SIDECAR_STATE_DIR: path.join(main, ".sidecar-test-state"), ...extra },
+  };
+}
+
+function openedReview(output: string): string {
+  const id = /opened review ([0-9a-f]+)/.exec(output)?.[1];
+  if (!id) throw new Error(`no review opened:\n${output}`);
+  return id;
+}
+
+// "published" is recorded before the approving sync pushes main, so a wait
+// for it also waits for that sync to let go of the lock.
+async function waitForReview(
+  main: string,
+  id: string,
+  state: string,
+  env: Record<string, string>,
+  also: (review: Record<string, unknown>) => boolean = () => true,
+): Promise<void> {
+  const locks = path.join(env.SIDECAR_STATE_DIR, "locks");
+  await waitFor(() => {
+    const shown = runSidecarRaw(["review", "show", id, "--json"], main, env);
+    if (shown.status !== 0) return false;
+    const review = JSON.parse(shown.stdout) as Record<string, unknown>;
+    const idle = !fs.existsSync(locks) || fs.readdirSync(locks).length === 0;
+    return review.state === state && idle && also(review);
+  }, 60_000);
+}
+
+function remoteFile(remote: string, file: string): string | undefined {
+  const result = gitRaw(["--git-dir", remote, "show", `main:${file}`], { check: false });
+  return result.status === 0 ? result.stdout : undefined;
+}
+
+function remoteObjectsContain(remote: string, text: string): boolean {
+  const objects = gitRaw(["--git-dir", remote, "rev-list", "--all", "--objects"]).stdout
+    .split("\n").filter(Boolean).map((line) => line.split(" ")[0]);
+  return objects.some((oid) => gitRaw(["--git-dir", remote, "cat-file", "-p", oid]).stdout.includes(text));
+}
 
 function remoteBranches(remote: string): string[] {
   return gitRaw(["--git-dir", remote, "branch", "--format=%(refname:short)"])

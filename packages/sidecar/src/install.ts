@@ -18,6 +18,17 @@ export type InstallSource = "npm" | "bun" | "curl";
 
 export const INSTALL_SOURCES = new Set<InstallSource>(["npm", "bun", "curl"]);
 
+/**
+ * The built CLI bundle this process runs from, for anything that has to start
+ * this exact install outside the current process: git's clean filter, the
+ * background review runner. Run from TypeScript sources (tests), that is the
+ * sibling dist build.
+ */
+export function sidecarCliPath(): string {
+  const self = fileURLToPath(import.meta.url);
+  return self.endsWith(".ts") ? path.join(path.dirname(self), "..", "dist", "cli.js") : self;
+}
+
 export function packageVersion(): string {
   let current = path.dirname(fileURLToPath(import.meta.url));
   while (true) {

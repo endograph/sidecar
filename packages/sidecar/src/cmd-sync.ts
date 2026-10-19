@@ -9,30 +9,33 @@ import { colorLevel, stripColor } from "./color.js";
 import { SidecarError, getValue, nowIso, parseOptions } from "./util.js";
 import { ensureCommitIdentity, git, gitRaw } from "./git.js";
 import {
+  LOCAL_SYNC_ENV,
   type Peer,
+  SOFT_SYNC_ENV,
   expandInbox,
   loadPeers,
   redactionModeConfigValue,
   requireSidecarCheckout,
   resolveSidecarPath,
+  reviewRequired,
   selectedPeer,
 } from "./config.js";
-import { registerCurrentInstance, withSyncLock } from "./state.js";
+import { logSidecarEvent, registerCurrentInstance, withSyncLock } from "./state.js";
 import {
-  LOCAL_SYNC_ENV,
-  SOFT_SYNC_ENV,
   checkoutIsUnlinkedFromFamily,
   checkoutRedactionPolicy,
   ensureInboxBranch,
   ensureRedactionFilter,
   fileRedactionDelta,
   mergeInboxBranches,
+  mergePublishedInboxes,
   pushBranch,
   redactBuffer,
   reportSyncHealth,
   snapshot,
   syncBranchBeforePush,
   syncProject,
+  type SyncOutcome,
 } from "./sync.js";
 import { DEFAULT_REDACTION_MODE } from "./redaction.js";
 import { readRules, resolveFileRules } from "./rules.js";
@@ -66,6 +69,10 @@ export function cmdSnapshot(args: string[]): number {
         config,
       );
       if (committed && parsed.flags.has("--push")) {
+        // A gated peer's snapshots are local history; only a review publishes.
+        if (reviewRequired(config)) {
+          throw new SidecarError("this peer requires review before anything is published; `sidecar sync` opens or advances the review");
+        }
         syncBranchBeforePush(sidecarPath, inbox, config);
         pushBranch(sidecarPath, inbox);
       }
@@ -87,11 +94,21 @@ export function cmdSync(args: string[]): number {
   // gets its turn, and the failures are reported together at the end.
   const peers = loadPeers(selectedPeer(parsed), { loadRules: false });
   const failed: string[] = [];
+  const soft = parsed.flags.has("--soft") || process.env[SOFT_SYNC_ENV] === "1";
+  const options: PeerSyncOptions = {
+    // A soft sync is a request, not a demand: the daemon issues them, and one
+    // that loses the lock to a running sync can no-op because the interval or
+    // watcher will simply request again. A manual sync must never pretend.
+    lock: soft ? "skip" : "throw",
+    remote: !parsed.flags.has("--local") && process.env[LOCAL_SYNC_ENV] !== "1",
+    snapshot: !parsed.flags.has("--no-snapshot"),
+    message: getValue(parsed, "--message", getValue(parsed, "-m", "")) || undefined,
+  };
   for (const peer of peers) {
     announcePeer(peer, peers);
     try {
       if (peer.config.rulesPath) peer.config.rules = readRules(peer.config.rulesPath);
-      syncPeer(peer, parsed);
+      syncPeer(peer, options);
     } catch (error) {
       if (peers.length === 1) throw error;
       failed.push(peer.name);
@@ -104,25 +121,30 @@ export function cmdSync(args: string[]): number {
   return 0;
 }
 
-function syncPeer(peer: Peer, parsed: ReturnType<typeof parseOptions>): void {
+export type PeerSyncOptions = {
+  lock: "throw" | "skip" | "wait";
+  // false settles this machine and stops there: no fetch, no push, and
+  // nothing that can fail because a remote is unreachable.
+  remote: boolean;
+  snapshot: boolean;
+  message?: string;
+};
+
+export function syncPeer(peer: Peer, options: PeerSyncOptions): void {
   const { root, config } = peer;
-  // A soft sync is a request, not a demand: the daemon issues them, and one
-  // that loses the lock to a running sync can no-op because the interval or
-  // watcher will simply request again. A manual sync must never pretend.
-  const soft = parsed.flags.has("--soft") || process.env[SOFT_SYNC_ENV] === "1";
-  const remote = !parsed.flags.has("--local") && process.env[LOCAL_SYNC_ENV] !== "1";
+  const { remote } = options;
+  const soft = options.lock === "skip";
   // Which step was in flight when a sync threw, so the heartbeat can say
   // "failed at snapshot" rather than only "failed".
   let stage = "start";
+  let outcome: SyncOutcome = {};
   let synced: boolean;
   try {
-    synced = withSyncLock(root, peer.name, soft ? "skip" : "throw", () => {
-      syncProject(root, config, {
-        snapshot: !parsed.flags.has("--no-snapshot"),
-        // --local settles this machine and stops there: no fetch, no push, and
-        // nothing that can fail because a remote is unreachable.
+    synced = withSyncLock(root, peer.name, options.lock, () => {
+      outcome = syncProject(root, config, {
+        snapshot: options.snapshot,
         remote,
-        message: getValue(parsed, "--message", getValue(parsed, "-m", "")) || undefined,
+        message: options.message,
         onStage: (name) => {
           stage = name;
         },
@@ -134,17 +156,29 @@ function syncPeer(peer: Peer, parsed: ReturnType<typeof parseOptions>): void {
         : { event: "sync-local" });
     });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     if (remote) reportSyncHealth(root, config, {
       status: "failed",
       stage,
-      message: error instanceof Error ? error.message : String(error),
+      // Git's diagnostics quote paths, and on a gated peer a path is content
+      // nobody has reviewed yet. The heartbeat says where it failed; the
+      // details stay in this machine's log.
+      message: reviewRequired(config) ? "details are kept on this machine; see `sidecar tail` there" : message,
     });
+    if (reviewRequired(config)) logSidecarEvent("failure", { command: "sync", root, stage, message });
     throw error;
   }
   // A soft sync that lost the lock never attempted anything, so it has nothing
   // to report; the sync holding the lock will report for this checkout.
   if (synced) {
-    if (remote) reportSyncHealth(root, config, { status: "ok" });
+    const held = outcome.held;
+    if (held) {
+      const { id } = held.review.record;
+      console.log(held.attention
+        ? `sidecar: publishing is held — review ${id} needs attention: ${held.attention}; \`sidecar review show ${id}\``
+        : `sidecar: publishing is held for review ${id}; \`sidecar review show ${id}\``);
+    }
+    if (remote) reportSyncHealth(root, config, held ? { status: "ok", review: held.attention ? "attention" : "pending" } : { status: "ok" });
     // Only on a sync someone asked for. The daemon runs the same command on its
     // interval, where a standing note about a working checkout is log noise.
     if (!soft) {
@@ -176,11 +210,16 @@ export function cmdMerge(args: string[]): number {
       // Filter wiring mutates the shared Git config too, so keep it under
       // the same lock as the merge and its temporary worktree cleanup.
       ensureRedactionFilter(sidecarPath, config.redaction, config);
-      mergeInboxBranches(sidecarPath, config, {
-        forkFiles: parsed.flags.has("--fork-files"),
-        push: !parsed.flags.has("--no-push"),
-        remote: true,
-      });
+      const forkFiles = parsed.flags.has("--fork-files");
+      const push = !parsed.flags.has("--no-push");
+      // A gated peer's local main holds unpublished merges, so the pushed main
+      // is built from published inboxes alone, and local main rebuilt on it.
+      if (reviewRequired(config) && push) {
+        mergePublishedInboxes(sidecarPath, config, { forkFiles });
+        mergeInboxBranches(sidecarPath, config, { forkFiles, push: false, remote: false });
+        return;
+      }
+      mergeInboxBranches(sidecarPath, config, { forkFiles, push, remote: true });
     });
   }
   return 0;

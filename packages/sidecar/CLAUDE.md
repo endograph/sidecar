@@ -16,8 +16,10 @@ automatically by `export *`.
 - `state.ts` — machine-local state dir: settings.json, instances.json registry, event log, per-family sync lock.
 - `service.ts` — OS service wrapper for the daemon (launchd/systemd/Startup), pid liveness. The loop itself is `daemon.ts`.
 - `ui.ts` — label/value output rows, human timestamps, blocking TTY prompts.
+- `review.ts` — the review gate's records and packets (machine-local, in the state dir), the detached reviewer runner, and review state. The publishing it gates lives in `sync.ts`.
 - `sync.ts` — the engine: snapshot, inbox merge + conflict forking, clone/settle, redaction filter wiring, health heartbeat.
 - `cmd-init.ts` / `cmd-status.ts` / `cmd-daemon.ts` / `cmd-sync.ts` — command handlers, thin over the modules above.
+- `cmd-review.ts` — `sidecar review`: list, show, decide, retry, set the machine's reviewer, and the `review run` runner entry.
 - `cmd-refresh.ts` — the exception to "thin": `sidecar refresh` owns its own engine code, because it is the only path that deletes a checkout and the guards keeping that safe belong next to it rather than beside the clone/settle functions they resemble.
 - `commands.ts` — the COMMANDS table + dispatch. **Adding a command = one table entry here plus a handler in a cmd-\*.ts**; usage text and typo suggestions derive from the table.
 - `bin.ts` — entry point; resolves which install runs the command (newest wins between global and project-local) before `main()` does any work.
@@ -58,11 +60,38 @@ automatically by `export *`.
   and is how a `(root, config)` pair knows which file it came from. A command
   fans out over `loadPeers(selectedPeer(parsed))`; the daemon names the peer
   through `SIDECAR_PEER`, an env var like every other request it makes.
+- **Review gating.** A peer with `review = "required"` never pushes local
+  history: only one commit per approved review, whose tree is the reviewed
+  tree, and canonical merges built from public refs alone
+  (`mergePublishedInboxes`). Never route a gated peer through
+  `syncBranchBeforePush`/`pushBranch` or push local main. Reviews are per repo
+  family and cover local main, which a gated peer never resets (each publish
+  is joined to it by a link merge — dropping links brings back spurious
+  forks). The reviewer command is machine-local (`settings.json`), never read
+  from committed config. Review reasons stay out of logs and heartbeats, and
+  so do a gated peer's git failure messages (they quote unreviewed paths).
+  Verdicts change only under the peer's sync lock; runners write only their
+  own attempt's file. Anything a publish commit carries beyond the reviewed
+  tree is sidecar-generated, never copied from local commit messages.
+- **Public git.** Every git operation that builds or sends what a gated peer
+  publishes — and every health heartbeat, including reading the previous one —
+  runs under `withPublicGit`, which replaces all injected config and fixes
+  identity, encoding, hooks, rerere, signing, push options, replacement
+  objects, and attributes (`GIT_ATTR_SOURCE` = empty tree). Reviewers launch
+  outside it. "Already public" means `refs/sidecar-public/*`, written only by
+  `fetchPublic` inside the wrapper, never `origin/*`; a push does not move
+  them, so refetch after any push a later step measures from. Every push passes
+  `--no-follow-tags`. Gated bootstrap uses plumbing (empty tree), never the
+  index. Packet enumeration uses `diff-tree` with explicit options, never
+  porcelain `git diff`, whose config can hide paths.
+- **Strict config.** `readConfig` refuses unknown keys and other versions, so
+  a policy key an older CLI doesn't know fails closed. A new `.sidecar` key
+  goes in `CONFIG_KEYS`.
 
 ## Build & test
 
 - `bun run build` bundles `src/bin.ts` into the single committed `dist/cli.js`;
-  `import.meta.url` tricks (`redactCliPath`, `packageVersion`) resolve against
+  `import.meta.url` tricks (`sidecarCliPath`, `packageVersion`) resolve against
   that bundle at runtime, so keep the one-file output.
 - `bun run check` typechecks. `bun run test` is the fast suite and does not
   build or spawn the real CLI. `bun run test:integration` rebuilds `dist` and

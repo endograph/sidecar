@@ -39,6 +39,7 @@ beforeEach(() => {
   vi.stubEnv("SIDECAR_SYNC_LOCAL", "");
   vi.stubEnv("SIDECAR_SYNC_SOFT", "");
   vi.mocked(loadPeers).mockReturnValue([peer]);
+  vi.mocked(syncProject).mockReturnValue({});
   vi.mocked(withSyncLock).mockImplementation((_root, _peer, _mode, callback) => {
     locked = true;
     try { callback(); } finally { locked = false; }

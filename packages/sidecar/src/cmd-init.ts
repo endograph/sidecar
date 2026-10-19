@@ -51,6 +51,7 @@ import {
   durationConfigValue,
   redactionModeConfigValue,
   resolveModeConfigValue,
+  reviewModeConfigValue,
   selectedPeer,
   validateBranch,
   validateInboxTemplate,
@@ -64,6 +65,7 @@ import { cloneOrUpdate, removeRedactionFilter, syncProject } from "./sync.js";
 import { announcePeer, promptLine, promptYesNo, promptYesNoDefaultNo } from "./ui.js";
 import { DEFAULT_REDACTION_MODE, REDACTION_MODES, type RedactionMode } from "./redaction.js";
 import { peerRulesFileName, peerRulesPath, readRules, rulesMayRedact } from "./rules.js";
+import { peerReviewGuidelinesFileName, peerReviewGuidelinesPath, pruneOrphanedReviews } from "./review.js";
 
 export function cmdDeinit(args: string[]): number {
   const parsed = parseOptions(args, { boolean: new Set(["--yes", "-y"]), value: new Set(["--peer"]) });
@@ -148,6 +150,8 @@ export function cmdDeinit(args: string[]): number {
     }
     fs.rmSync(configPath, { force: true });
     fs.rmSync(peerRulesPath(root, name), { force: true });
+    fs.rmSync(peerReviewGuidelinesPath(root, name), { force: true });
+    pruneOrphanedReviews();
     unregisterInstance(configPath);
   });
 
@@ -221,11 +225,11 @@ function removeCheckout(checkoutPath: string): void {
 export function cmdInit(args: string[]): number {
   const parsed = parseOptions(args, {
     boolean: new Set(["--no-clone", "--no-bootstrap-main", "--local-install", "--ignored"]),
-    value: new Set(["--path", "--branch", "--inbox", "--redaction", "--resolve", "--debounce", "--interval", "--peer"]),
+    value: new Set(["--path", "--branch", "--inbox", "--redaction", "--resolve", "--review", "--review-timeout", "--debounce", "--interval", "--peer"]),
   });
   if (parsed.positional.length > 1) {
     throw new SidecarError(
-      "usage: sidecar init [remote] [--peer name] [--path sidecar] [--branch main] [--inbox template] [--redaction mode] [--resolve fork|lww] [--debounce 10m] [--interval 1h] [--ignored]",
+      "usage: sidecar init [remote] [--peer name] [--path sidecar] [--branch main] [--inbox template] [--redaction mode] [--resolve fork|lww] [--review off|required] [--review-timeout 1h] [--debounce 10m] [--interval 1h] [--ignored]",
     );
   }
 
@@ -297,7 +301,9 @@ function configurePeer(root: string, name: string, remote: string | undefined, p
       existing.redaction === getValue(parsed, "--redaction", existing.redaction) &&
       existing.resolve === getValue(parsed, "--resolve", existing.resolve) &&
       existing.debounce === durationConfigValue(parsed.values.get("--debounce") ?? existing.debounce, "--debounce") &&
-      existing.interval === durationConfigValue(parsed.values.get("--interval") ?? existing.interval, "--interval");
+      existing.interval === durationConfigValue(parsed.values.get("--interval") ?? existing.interval, "--interval") &&
+      existing.review === getValue(parsed, "--review", existing.review ?? "off") &&
+      existing.reviewTimeout === durationConfigValue(parsed.values.get("--review-timeout") ?? existing.reviewTimeout, "--review-timeout");
     reuse = unchanged || !promptOverwriteConfig(configPath, existing.remote, remote);
   }
   const config = reuse ? readConfig(configPath) : buildInitConfig(root, name, remote, parsed);
@@ -312,7 +318,7 @@ function configurePeer(root: string, name: string, remote: string | undefined, p
     if (isStandalone(config)) {
       throw new SidecarError("--ignored cannot apply to a standalone sidecar: its .sidecar is part of the tree it syncs");
     }
-    for (const file of [peerFileName(name), peerRulesFileName(name)]) {
+    for (const file of [peerFileName(name), peerRulesFileName(name), peerReviewGuidelinesFileName(name)]) {
       if (isGitTracked(root, file)) {
         throw new SidecarError(`${file} is tracked by git; \`git rm --cached ${file}\` before ignoring it`);
       }
@@ -355,9 +361,11 @@ function excludePeerFile(root: string, name: string): void {
     throw new SidecarError(`--ignored needs a git exclude file, and ${root} has none; ignore ${configFile} in your own VCS config`);
   }
   const rulesFile = peerRulesFileName(name);
+  const guidelinesFile = peerReviewGuidelinesFileName(name);
   ensureIgnoreLine(exclude, `/${configFile}`);
   ensureIgnoreLine(exclude, `/${rulesFile}`);
-  console.log(`ignored ${configFile} and ${rulesFile} via .git/info/exclude`);
+  ensureIgnoreLine(exclude, `/${guidelinesFile}`);
+  console.log(`ignored ${configFile}, ${rulesFile}, and ${guidelinesFile} via .git/info/exclude`);
 }
 
 /**
@@ -420,6 +428,8 @@ function buildInitConfig(root: string, name: string, remote: string | undefined,
       : DEFAULT_RESOLVE,
     debounce: durationConfigValue(parsed.values.get("--debounce"), "--debounce"),
     interval: durationConfigValue(parsed.values.get("--interval"), "--interval"),
+    review: reviewModeConfigValue(getValue(parsed, "--review", "off"), "--review"),
+    reviewTimeout: durationConfigValue(parsed.values.get("--review-timeout"), "--review-timeout"),
   };
 }
 

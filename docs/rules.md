@@ -90,7 +90,8 @@ shared ignore entries remain in place for other working copies.
 ## Who controls policy
 
 In a nested sidecar, the rules live in the host repo beside its config,
-outside the checkout that Sidecar syncs. A `.sidecar-rules` file arriving
+outside the checkout that Sidecar syncs. So does a peer's review guidance,
+`.sidecar-review` or `.sidecar-review.<name>` (see [review.md](review.md)). A `.sidecar-rules` file arriving
 inside that checkout does not override the host policy. Review host policy
 changes through the same process as changes to `.sidecar`.
 

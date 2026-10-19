@@ -44,6 +44,12 @@ export type SidecarSettings = {
   autoUpdate: boolean;
   lastUpdateCheckAt?: string;
   installSource?: InstallSource;
+  /**
+   * The shell command that reviews what a review-gated peer would publish.
+   * Machine-local by design: .sidecar says a review is required, this says
+   * who on this machine performs it. See review.ts.
+   */
+  reviewer?: string;
 };
 
 const DEFAULT_SETTINGS: SidecarSettings = { daemonEnabled: true, autoUpdate: true };
@@ -62,6 +68,7 @@ export function readSettings(): SidecarSettings {
       installSource: INSTALL_SOURCES.has(record.installSource as InstallSource)
         ? (record.installSource as InstallSource)
         : undefined,
+      reviewer: typeof record.reviewer === "string" && record.reviewer.trim() ? record.reviewer : undefined,
     };
   } catch (error) {
     logSidecarEvent("failure", {
@@ -80,6 +87,7 @@ export function writeSettings(settings: SidecarSettings): void {
   };
   if (settings.lastUpdateCheckAt) record.lastUpdateCheckAt = settings.lastUpdateCheckAt;
   if (settings.installSource) record.installSource = settings.installSource;
+  if (settings.reviewer) record.reviewer = settings.reviewer;
   fs.writeFileSync(settingsPath(), `${JSON.stringify(record, null, 2)}\n`, "utf8");
 }
 
@@ -413,11 +421,34 @@ export function acquireSyncLockOrThrow(root: string, peer: string): () => void {
   throw new SidecarError("another sidecar sync is already running; try again once it finishes");
 }
 
+// As long as the daemon lets one sync run: a decision waiting on a slow sync
+// must outlast it rather than fail and lose the verdict.
+const SYNC_LOCK_WAIT_MS = 10 * 60 * 1000;
+
+// Waits out a running sync rather than failing against it. For follow-ups to
+// something that already happened — an approved review publishing — where the
+// sync that launched it may still be finishing.
+function acquireSyncLockWaiting(root: string, peer: string): () => void {
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + SYNC_LOCK_WAIT_MS;
+  while (true) {
+    const release = acquireSyncLock(root, peer);
+    if (release) return release;
+    if (Date.now() >= deadline) {
+      throw new SidecarError("another sidecar sync is still running; try again once it finishes");
+    }
+    Atomics.wait(sleeper, 0, 0, 250);
+  }
+}
+
 // The one place that decides what a busy lock means: "throw" for commands the
 // user demanded, "skip" for soft requests that can no-op because their trigger
-// will fire again. Returns whether the work ran.
-export function withSyncLock(root: string, peer: string, onBusy: "throw" | "skip", fn: () => void): boolean {
-  const releaseLock = onBusy === "skip" ? acquireSyncLock(root, peer) : acquireSyncLockOrThrow(root, peer);
+// will fire again, "wait" for follow-ups that must run but can be late.
+// Returns whether the work ran.
+export function withSyncLock(root: string, peer: string, onBusy: "throw" | "skip" | "wait", fn: () => void): boolean {
+  const releaseLock = onBusy === "skip"
+    ? acquireSyncLock(root, peer)
+    : onBusy === "wait" ? acquireSyncLockWaiting(root, peer) : acquireSyncLockOrThrow(root, peer);
   if (!releaseLock) {
     console.log("another sidecar sync is already running; skipping this soft sync");
     return false;

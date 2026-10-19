@@ -86,6 +86,15 @@ export function isAncestor(repo: string, maybeAncestor: string, descendant: stri
   return git(repo, ["merge-base", "--is-ancestor", maybeAncestor, descendant], { check: false }).status === 0;
 }
 
+export function treeOf(repo: string, ref: string): string {
+  return git(repo, ["rev-parse", `${ref}^{tree}`]).stdout.trim();
+}
+
+/** The empty tree, written to the object store so plumbing can name it. */
+export function emptyTree(repo: string): string {
+  return git(repo, ["mktree"], { input: "" }).stdout.trim();
+}
+
 export function gitToplevel(cwd: string): string {
   const root = gitToplevelOptional(cwd);
   if (!root) throw new SidecarError("not inside a Git repository");
@@ -148,12 +157,18 @@ export function ensureClean(repo: string): void {
   if (isDirty(repo)) throw new SidecarError("sidecar checkout has uncommitted changes");
 }
 
+/** The identity sidecar commits as when nothing else is configured. */
+export function sidecarIdentity(): { name: string; email: string } {
+  return { name: currentUser(), email: `${slug(currentUser())}@${slug(currentHost())}.local` };
+}
+
 export function ensureCommitIdentity(repo: string): void {
+  const { name, email } = sidecarIdentity();
   if (git(repo, ["config", "user.name"], { check: false }).status !== 0) {
-    git(repo, ["config", "user.name", currentUser()]);
+    git(repo, ["config", "user.name", name]);
   }
   if (git(repo, ["config", "user.email"], { check: false }).status !== 0) {
-    git(repo, ["config", "user.email", `${slug(currentUser())}@${slug(currentHost())}.local`]);
+    git(repo, ["config", "user.email", email]);
   }
 }
 

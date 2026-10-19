@@ -134,6 +134,36 @@ describe("config", () => {
     expect(() => readConfig(configPath)).toThrow(/interval: invalid duration "soon"/);
   });
 
+  test("refuses keys it does not know rather than dropping them", () => {
+    const configPath = path.join(tempDir(), ".sidecar");
+    fs.writeFileSync(configPath, 'remote = "git@github.com:org/repo.git"\nreveiw = "required"\n', "utf8");
+    expect(() => readConfig(configPath)).toThrow(/unknown key "reveiw"/);
+  });
+
+  test("refuses a config version it does not read", () => {
+    const configPath = path.join(tempDir(), ".sidecar");
+    fs.writeFileSync(configPath, 'version = 2\nremote = "git@github.com:org/repo.git"\n', "utf8");
+    expect(() => readConfig(configPath)).toThrow(/config version 2 is not supported/);
+  });
+
+  test("reads review policy and its timeout, and writes them back only when set", () => {
+    const configPath = path.join(tempDir(), ".sidecar");
+    fs.writeFileSync(configPath, 'remote = "git@github.com:org/repo.git"\n', "utf8");
+    expect(readConfig(configPath)).toMatchObject({ review: "off", reviewTimeout: undefined });
+    writeConfig(configPath, readConfig(configPath));
+    expect(fs.readFileSync(configPath, "utf8")).not.toContain("review");
+
+    fs.writeFileSync(configPath, 'remote = "git@github.com:org/repo.git"\nreview = "required"\nreview-timeout = "30m"\n', "utf8");
+    const config = readConfig(configPath);
+    expect(config).toMatchObject({ review: "required", reviewTimeout: 1800 });
+    writeConfig(configPath, config);
+    expect(fs.readFileSync(configPath, "utf8")).toContain('review = "required"\nreview-timeout = 1800\n');
+    expect(readConfig(configPath)).toMatchObject({ review: "required", reviewTimeout: 1800 });
+
+    fs.writeFileSync(configPath, 'remote = "git@github.com:org/repo.git"\nreview = "agent"\n', "utf8");
+    expect(() => readConfig(configPath)).toThrow(/invalid review mode "agent"; expected one of off, required/);
+  });
+
   test("parses TOML strings with comments and escapes", () => {
     const root = tempDir();
     const configPath = path.join(root, ".sidecar");

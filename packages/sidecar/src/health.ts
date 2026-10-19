@@ -52,9 +52,17 @@ const MESSAGE_LIMIT = 500;
 
 export type HealthStatus = "ok" | "failed";
 
+/**
+ * A review-gated checkout whose unpublished work is held: `pending` while a
+ * review is in progress, `attention` once it needs a person. Only the state
+ * is published — never a reviewer's reason, which describes what was
+ * sensitive.
+ */
+export type HealthReview = "pending" | "attention";
+
 /** What a sync attempt turned out to be, before it becomes a record. */
 export type HealthOutcome =
-  | { status: "ok" }
+  | { status: "ok"; review?: HealthReview }
   | { status: "failed"; stage: string; message: string };
 
 /** Who is reporting — the parts of a record that don't depend on the outcome. */
@@ -82,6 +90,8 @@ export type HealthRecord = HealthIdentity & {
   /** Which step of the sync threw; only present on a failing record. */
   stage?: string;
   message?: string;
+  /** Present while a review holds this checkout's publishing. */
+  review?: HealthReview;
 };
 
 /** How the fleet view reads a record — `stale` is derived, never stored. */
@@ -143,6 +153,7 @@ export function parseHealthRecord(text: string): HealthRecord | undefined {
         : 0,
     stage: typeof record.stage === "string" ? record.stage : undefined,
     message: typeof record.message === "string" ? record.message : undefined,
+    review: record.review === "pending" || record.review === "attention" ? record.review : undefined,
   };
 }
 
@@ -164,20 +175,23 @@ export function nextHealthRecord(
   outcome: HealthOutcome,
   now: string,
 ): HealthRecord {
+  // Only what parses as a timestamp carries forward. The previous record is
+  // read back from a ref, and a heartbeat is published for every peer before
+  // any review: nothing but sidecar's own values may ride along.
   const base: HealthRecord = {
     schema: HEALTH_SCHEMA,
     ...identity,
     status: outcome.status,
     updatedAt: now,
-    lastSuccessAt: previous?.lastSuccessAt,
-    lastFailureAt: previous?.lastFailureAt,
+    lastSuccessAt: isoTimestamp(previous?.lastSuccessAt),
+    lastFailureAt: isoTimestamp(previous?.lastFailureAt),
     consecutiveFailures: 0,
   };
-  if (outcome.status === "ok") return { ...base, lastSuccessAt: now };
+  if (outcome.status === "ok") return { ...base, lastSuccessAt: now, ...(outcome.review ? { review: outcome.review } : {}) };
   return {
     ...base,
     lastFailureAt: now,
-    consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
+    consecutiveFailures: Math.max(0, Math.floor(previous?.consecutiveFailures ?? 0)) + 1,
     stage: outcome.stage,
     // The message is a git failure verbatim, and git quotes remote URLs — which
     // carry tokens. Redacting here rather than at the call site means the
@@ -185,6 +199,10 @@ export function nextHealthRecord(
     // filter, so nothing downstream would catch it.
     message: redactText(outcome.message).trim().slice(-MESSAGE_LIMIT),
   };
+}
+
+function isoTimestamp(value: string | undefined): string | undefined {
+  return value && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(value) ? value : undefined;
 }
 
 /**
@@ -198,7 +216,7 @@ export function shouldPublishHealth(
   now = Date.now(),
 ): boolean {
   if (!previous) return true;
-  if (next.status === "failed" || previous.status !== next.status) return true;
+  if (next.status === "failed" || previous.status !== next.status || previous.review !== next.review) return true;
   const last = Date.parse(previous.updatedAt);
   if (!Number.isFinite(last)) return true;
   // A clock behind the branch's own timestamp would otherwise defer forever.
