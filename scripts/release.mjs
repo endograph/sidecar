@@ -1,24 +1,20 @@
 #!/usr/bin/env node
 /**
- * Cut a release: bump, verify, commit, tag, push, then publish.
+ * Cut a release: bump, verify, commit, tag, push. Pushing the tag publishes:
+ * .github/workflows/release.yml publishes to npm through trusted publishing,
+ * then creates the GitHub release.
  *
- *   bun run release patch|minor|major|<version> [--otp <code>] [--skip-tests] [--dry-run]
+ *   bun run release patch|minor|major|<version> [--skip-tests] [--dry-run]
  *
- * The order is the point. Publishing is last and irreversible — a version can
- * never be re-published — so everything that can fail cheaply fails first, and
- * the commit is tagged and pushed before npm ever sees it. A release on the
+ * The order is the point. Publishing is irreversible — a version can never be
+ * re-published — so everything that can fail cheaply fails here first, and
+ * only a tag on a pushed, verified commit ever reaches npm. A release on the
  * registry therefore always has a tag behind it, which is the invariant that
  * hand-editing package.json kept breaking.
  *
- * Bump every workspace manifest together, then use Git to commit and tag the
- * verified result on main.
- *
- * Verification is a smoke test (scripts/smoke.mjs), not the full suite: the
- * suite is timing-flaky, and an npm OTP passed via --otp expires in ~30
- * seconds — everything between preflight and publish has to fit inside that
- * window. Run `bun run test` before releasing; `--skip-tests` skips even the
- * smoke test. A missing npm login is caught in preflight and runs `npm login`
- * right there instead of dying.
+ * Verification is a smoke test (scripts/smoke.mjs), not the full suite, which
+ * is timing-flaky. Run `bun run test` before releasing; `--skip-tests` skips
+ * even the smoke test.
  */
 
 import { execFileSync } from 'node:child_process'
@@ -66,15 +62,6 @@ const args = process.argv.slice(2)
 const DRY = args.includes('--dry-run')
 const SKIP_TESTS = args.includes('--skip-tests')
 
-// --otp takes a value, so it has to come out of args before the bump is
-// found: `--otp 123456` would otherwise read as bump "123456".
-let OTP
-const otpIndex = args.findIndex((a) => a === '--otp' || a.startsWith('--otp='))
-if (otpIndex !== -1) {
-  const arg = args[otpIndex]
-  OTP = arg.includes('=') ? arg.slice('--otp='.length) : args[otpIndex + 1]
-  args.splice(otpIndex, arg.includes('=') ? 1 : 2)
-}
 const bump = args.find((a) => !a.startsWith('--'))
 
 const die = (msg) => {
@@ -102,8 +89,7 @@ function nextVersion(current, kind) {
   return die(`unknown bump "${kind}" — expected patch, minor, major, or an explicit version`)
 }
 
-if (!bump) die('usage: bun run release patch|minor|major|<version> [--otp <code>] [--skip-tests] [--dry-run]')
-if (otpIndex !== -1 && (!OTP || OTP.startsWith('--'))) die('--otp requires a code')
+if (!bump) die('usage: bun run release patch|minor|major|<version> [--skip-tests] [--dry-run]')
 
 const root = read(ROOT_PKG)
 const published = read(PKG)
@@ -135,23 +121,6 @@ if (remoteAt !== mainAt) die('main and origin/main differ — push or pull first
 const existingTag = run('git', ['tag', '-l', tag])
 if (existingTag) die(`tag ${tag} already exists`)
 
-// A dead npm token is the failure that used to surface as a bogus 404 from the
-// registry, after the tag had already been pushed. Catch it up front — and
-// since the fix is always `npm login`, just run it here rather than dying and
-// making the user restart the release.
-const whoami = () => run('npm', ['whoami'], { stdio: ['ignore', 'pipe', 'ignore'] })
-try {
-  console.log(`  npm: ${whoami()}`)
-} catch {
-  if (DRY) {
-    console.log('  npm: not logged in (dry run continues; a real release would run `npm login` here)')
-  } else {
-    console.log('  npm: not logged in — running `npm login`')
-    runLoud('npm', ['login'])
-    console.log(`  npm: ${whoami()}`)
-  }
-}
-
 try {
   run('npm', ['view', `${published.name}@${version}`, 'version'], { stdio: ['ignore', 'pipe', 'ignore'] })
   die(`${version} is already published — versions cannot be replaced`)
@@ -181,7 +150,7 @@ if (SKIP_TESTS) {
 }
 else runLoud('node', [join(ROOT, 'scripts/smoke.mjs')])
 
-// ---------------------------------------------------------------- publish
+// ---------------------------------------------------------------- push
 // Past this line the steps are visible to other people, so they go in the order
 // that leaves the least mess if one of them fails.
 step('Commit and push')
@@ -191,6 +160,7 @@ mutate(`commit and push ${tag}`, () => {
   runLoud('git', ['push', 'origin', 'main'])
 })
 
+// The tag push is the publish: the release workflow takes it from here.
 step(`Tag ${tag}`)
 mutate(`tag and push ${tag}`, () => {
   const released = run('git', ['rev-parse', 'HEAD'])
@@ -198,11 +168,8 @@ mutate(`tag and push ${tag}`, () => {
   runLoud('git', ['push', 'origin', tag])
 })
 
-step('Publish')
-mutate(`publish ${published.name}@${version}`, () => {
-  // prepack builds dist and copies README/LICENSE; prepublishOnly typechecks.
-  // Without --otp, npm prompts for the code itself on a TTY.
-  runLoud('npm', ['publish', ...(OTP ? [`--otp=${OTP}`] : [])], { cwd: PKG_DIR })
-})
-
-console.log(`\n  ${DRY ? 'dry run complete' : `released ${published.name}@${version}`}\n`)
+console.log(
+  DRY
+    ? '\n  dry run complete\n'
+    : `\n  pushed ${tag}; the release workflow publishes ${published.name}@${version} — follow it with \`gh run watch\`\n`,
+)
