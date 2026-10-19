@@ -26,6 +26,7 @@ vi.mock("../src/rules.js", async (original) => ({
 import { cmdMerge, cmdSync } from "../src/cmd-sync.js";
 import { readRules } from "../src/rules.js";
 import { loadPeers, type Peer } from "../src/config.js";
+import { SidecarError } from "../src/util.js";
 import { registerCurrentInstance, withSyncLock } from "../src/state.js";
 import { ensureRedactionFilter, mergeInboxBranches, reportSyncHealth, syncProject } from "../src/sync.js";
 
@@ -116,4 +117,43 @@ test("invalid rules fail only their peer and leave healthy peers running", () =>
     expect(syncProject).toHaveBeenCalledWith(healthy.root, healthy.config, expect.objectContaining({ remote: false }));
     expect(output).toHaveBeenCalledWith("sidecar: bad: rules are not valid TOML");
   } finally { output.mockRestore(); }
+});
+
+describe("failure reasons", () => {
+  const second = { ...peer, name: "second", config: { ...peer.config, peer: "second" } };
+  function failWith(errors: Error[]): unknown {
+    vi.mocked(loadPeers).mockReturnValue([peer, second]);
+    let call = 0;
+    vi.mocked(syncProject).mockImplementation(() => { throw errors[call++]; });
+    const output = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      cmdSync([]);
+    } catch (error) {
+      return error;
+    } finally { output.mockRestore(); }
+    throw new Error("cmdSync did not fail");
+  }
+  const dirty = () => new SidecarError("sidecar checkout has uncommitted changes", { reason: "dirty-checkout" });
+
+  test("carry the stage a sync failed at", () => {
+    vi.mocked(syncProject).mockImplementation((_root, _config, options) => {
+      options.onStage?.("merge");
+      throw dirty();
+    });
+    let thrown: unknown;
+    try { cmdSync([]); } catch (error) { thrown = error; }
+    expect(thrown).toMatchObject({ reason: "dirty-checkout", stage: "merge" });
+  });
+
+  test("say dirty-checkout across peers only when every failure was one", () => {
+    expect(failWith([dirty(), dirty()])).toMatchObject({ reason: "dirty-checkout" });
+    expect((failWith([dirty(), new SidecarError("push rejected")]) as SidecarError).reason).toBeUndefined();
+  });
+
+  test("hold the daemon's syncs to the review floor and not ones run by hand", () => {
+    cmdSync([]);
+    expect(syncProject).toHaveBeenLastCalledWith(peer.root, peer.config, expect.objectContaining({ reviewFloor: false }));
+    cmdSync(["--soft"]);
+    expect(syncProject).toHaveBeenLastCalledWith(peer.root, peer.config, expect.objectContaining({ reviewFloor: true }));
+  });
 });

@@ -100,7 +100,7 @@ export function cmdSync(args: string[]): number {
   // Peers never interact, so one failing must not stop the rest: every peer
   // gets its turn, and the failures are reported together at the end.
   const peers = loadPeers(selectedPeer(parsed), { loadRules: false });
-  const failed: string[] = [];
+  const failed: Array<{ name: string; error: unknown }> = [];
   const soft = parsed.flags.has("--soft") || process.env[SOFT_SYNC_ENV] === "1";
   const options: PeerSyncOptions = {
     // A soft sync is a request, not a demand: the daemon issues them, and one
@@ -110,6 +110,9 @@ export function cmdSync(args: string[]): number {
     remote: !parsed.flags.has("--local") && process.env[LOCAL_SYNC_ENV] !== "1",
     snapshot: !parsed.flags.has("--no-snapshot"),
     message: getValue(parsed, "--message", getValue(parsed, "-m", "")) || undefined,
+    // The daemon's syncs open reviews at its cadence; one run by hand opens
+    // the review it was run for.
+    reviewFloor: soft,
   };
   for (const peer of peers) {
     announcePeer(peer, peers);
@@ -118,12 +121,17 @@ export function cmdSync(args: string[]): number {
       syncPeer(peer, options);
     } catch (error) {
       if (peers.length === 1) throw error;
-      failed.push(peer.name);
+      failed.push({ name: peer.name, error });
       console.error(`sidecar: ${peer.name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   if (failed.length) {
-    throw new SidecarError(`${failed.length} of ${peers.length} peers failed to sync: ${failed.join(", ")}`);
+    // Only "ask again" when asking again is all any of them needs.
+    const dirty = failed.every(({ error }) => error instanceof SidecarError && error.reason === "dirty-checkout");
+    throw new SidecarError(
+      `${failed.length} of ${peers.length} peers failed to sync: ${failed.map(({ name }) => name).join(", ")}`,
+      dirty ? { reason: "dirty-checkout" } : {},
+    );
   }
   return 0;
 }
@@ -135,6 +143,7 @@ export type PeerSyncOptions = {
   remote: boolean;
   snapshot: boolean;
   message?: string;
+  reviewFloor?: boolean;
 };
 
 export function syncPeer(peer: Peer, options: PeerSyncOptions): void {
@@ -152,6 +161,7 @@ export function syncPeer(peer: Peer, options: PeerSyncOptions): void {
         snapshot: options.snapshot,
         remote,
         message: options.message,
+        reviewFloor: options.reviewFloor,
         onStage: (name) => {
           stage = name;
         },
@@ -163,6 +173,7 @@ export function syncPeer(peer: Peer, options: PeerSyncOptions): void {
         : { event: "sync-local" });
     });
   } catch (error) {
+    if (error instanceof SidecarError) error.stage ??= stage;
     if (remote) reportSyncHealth(root, config, {
       status: "failed",
       stage,
@@ -185,7 +196,11 @@ export function syncPeer(peer: Peer, options: PeerSyncOptions): void {
         ? `sidecar: publishing is held — review ${id} needs attention: ${held.attention}; \`sidecar review show ${id}\``
         : `sidecar: publishing is held for review ${id}; \`sidecar review show ${id}\``);
     }
-    if (remote) reportSyncHealth(root, config, held ? { status: "ok", review: held.attention ? "attention" : "pending" } : { status: "ok" });
+    if (remote) {
+      reportSyncHealth(root, config, held
+        ? { status: "ok", review: held.attention ? "attention" : "pending" }
+        : outcome.reviewDue ? { status: "ok", review: "pending" } : { status: "ok" });
+    }
     // Only on a sync someone asked for. The daemon runs the same command on its
     // interval, where a standing note about a working checkout is log noise.
     if (!soft) {

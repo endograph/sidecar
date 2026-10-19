@@ -31,6 +31,7 @@ import {
 } from "./git.js";
 import { packageVersion, sidecarCliPath } from "./install.js";
 import {
+  DEFAULT_DEBOUNCE_SECONDS,
   DEFAULT_PEER,
   PUBLIC_REFS,
   type SidecarConfig,
@@ -49,13 +50,14 @@ import {
   resolveSidecarPath,
   reviewRequired,
 } from "./config.js";
-import { logSidecarEvent, readSettings } from "./state.js";
+import { clearReviewDue, logSidecarEvent, readSettings, writeReviewDue } from "./state.js";
 import {
   type Review,
   type ReviewRecord,
   createReview,
   isOpen,
   launchReviewer,
+  listReviews,
   markPublished,
   markPublishing,
   markSuperseded,
@@ -87,9 +89,10 @@ import {
 /**
  * What a sync left undone on purpose. `held` is a review-gated peer whose
  * unpublished work is waiting on a review; `attention` says why a person is
- * needed, when one is.
+ * needed, when one is. `reviewDue` is when the review floor lets the next
+ * review open (epoch ms), for unpublished work that has none yet.
  */
-export type SyncOutcome = { held?: { review: Review; attention?: string } };
+export type SyncOutcome = { held?: { review: Review; attention?: string }; reviewDue?: number };
 
 /**
  * A sync in two phases, local first. Runs inside the repo's sync lock —
@@ -106,7 +109,14 @@ export type SyncOutcome = { held?: { review: Review; attention?: string } };
 export function syncProject(
   root: string,
   config: SidecarConfig,
-  options: { snapshot: boolean; remote: boolean; message?: string; onStage?: (stage: string) => void },
+  options: {
+    snapshot: boolean;
+    remote: boolean;
+    message?: string;
+    onStage?: (stage: string) => void;
+    /** Holds a review-gated peer's next review to the review floor; see gateUnpublished. */
+    reviewFloor?: boolean;
+  },
 ): SyncOutcome {
   const stage = (name: string): void => options.onStage?.(name);
 
@@ -145,7 +155,9 @@ export function syncProject(
     settleCheckouts(sidecarPath, config, inbox, siblings);
   }
   if (!options.remote) return {};
-  if (reviewRequired(config)) return publishReviewed(root, sidecarPath, config, inbox, siblings, stage);
+  if (reviewRequired(config)) {
+    return publishReviewed(root, sidecarPath, config, inbox, siblings, stage, options.reviewFloor ?? false);
+  }
 
   stage("push-inbox");
   syncBranchBeforePush(sidecarPath, inbox, config);
@@ -324,6 +336,7 @@ function publishReviewed(
   inbox: string,
   siblings: string[],
   stage: (name: string) => void,
+  reviewFloor: boolean,
 ): SyncOutcome {
   stage("fetch");
   withPublicGit(sidecarPath, () => {
@@ -346,9 +359,11 @@ function publishReviewed(
   stage("review");
   // Inside withPublicGit so the packet shows the blobs an approval would
   // publish; the reviewer starts outside it, in the caller's environment.
-  const gate = withPublicGit(sidecarPath, () => gateUnpublished(root, sidecarPath, config));
-  if (gate?.launch) launchReviewer(gate.review);
-  return gate ? { held: { review: gate.review, attention: reviewAttention(gate.review) } } : {};
+  const gate = withPublicGit(sidecarPath, () => gateUnpublished(root, sidecarPath, config, reviewFloor));
+  if (!gate) return {};
+  if ("due" in gate) return { reviewDue: gate.due };
+  if (gate.launch) launchReviewer(gate.review);
+  return { held: { review: gate.review, attention: reviewAttention(gate.review) } };
 }
 
 /**
@@ -356,9 +371,38 @@ function publishReviewed(
  * main holds and the remote does not. One review is open at a time: work that
  * lands while one is undecided waits for the next, which batches review the
  * way the debounce batches pushes. Returns the review holding publication, if
- * any, and whether its reviewer should be launched.
+ * any, and whether its reviewer should be launched — or, under the review
+ * floor, when the next review may open.
+ *
+ * The floor: with `floor`, a review opens no sooner than the peer's debounce
+ * after the family's previous one opened or launched. Without it, an approval
+ * — whose sync runs this gate straight after publishing — opened the next
+ * review at once, so under steady editing reviewers ran back to back, each
+ * one's approval launching the next. Held to the floor, they run at most once
+ * per remote round trip however they are triggered, and each covers whatever
+ * accumulated in the meantime. A held review is recorded as due (see
+ * writeReviewDue) so the daemon comes back for it when nothing else will.
+ * Commands someone ran by hand skip the floor: they asked for it now.
  */
-function gateUnpublished(root: string, sidecarPath: string, config: SidecarConfig): { review: Review; launch: boolean } | undefined {
+function gateUnpublished(
+  root: string,
+  sidecarPath: string,
+  config: SidecarConfig,
+  floor: boolean,
+): { review: Review; launch: boolean } | { due: number } | undefined {
+  const configPath = peerConfigPath(root, config.peer);
+  const result = gateReview(root, sidecarPath, config, floor);
+  if (result && "due" in result) writeReviewDue(configPath, result.due);
+  else clearReviewDue(configPath);
+  return result;
+}
+
+function gateReview(
+  root: string,
+  sidecarPath: string,
+  config: SidecarConfig,
+  floor: boolean,
+): { review: Review; launch: boolean } | { due: number } | undefined {
   const head = git(sidecarPath, ["rev-parse", `refs/heads/${config.branch}`]).stdout.trim();
   const headTree = treeOf(sidecarPath, head);
   const publicMain = publicTip(sidecarPath, config.branch);
@@ -386,9 +430,25 @@ function gateUnpublished(root: string, sidecarPath: string, config: SidecarConfi
     if (open.record.tree === headTree) return { review: open, launch: false };
     markSuperseded(open);
   }
+  if (floor) {
+    const due = reviewFloorEndsAt(sidecarPath, config);
+    if (due > Date.now()) {
+      console.log(`the next review opens in ${Math.ceil((due - Date.now()) / 1000)}s; reviews open at most once per debounce`);
+      return { due };
+    }
+  }
   const review = createReview({ root, config, sidecarPath, base, head });
   console.log(`opened review ${paint("brand", review.record.id)} for ${review.record.files.length} changed file(s)`);
   return { review, launch: hasReviewer };
+}
+
+/** When the family's previous review opened or launched, whichever was later, plus the peer's debounce (epoch ms). */
+function reviewFloorEndsAt(sidecarPath: string, config: SidecarConfig): number {
+  const previous = listReviews(sidecarPath)[0];
+  if (!previous) return 0;
+  const { createdAt, launchedAt } = previous.record;
+  const started = Math.max(Date.parse(createdAt), launchedAt ? Date.parse(launchedAt) : 0);
+  return started + (config.debounce ?? DEFAULT_DEBOUNCE_SECONDS) * 1000;
 }
 
 /**
@@ -830,7 +890,10 @@ export function mergeInboxBranches(
   config: SidecarConfig,
   options: { forkFiles: boolean; push: boolean; remote: boolean },
 ): number {
-  ensureClean(sidecarPath);
+  // No clean checkout required: the merge runs in a scratch worktree, and a
+  // sync's snapshot has already captured what this one is merging. An edit
+  // landing since is the next sync's to capture — failing this one for it
+  // meant a sync could never finish while someone kept typing.
   ensureCommitIdentity(sidecarPath);
 
   // Most syncs have no merge work. Detect that from refs alone, before paying
@@ -867,15 +930,18 @@ export function mergeInboxBranches(
   // originals, so the branch dance happens in a throwaway linked worktree
   // and the checkout never leaves the inbox branch.
   // No commits means no worktree to protect (`worktree add` refuses an
-  // unborn HEAD), and nothing to rewrite either.
+  // unborn HEAD), and nothing to rewrite either — but the merge runs in the
+  // checkout itself, so it must hold nothing uncaptured.
   if (!hasAnyCommit(sidecarPath)) {
+    ensureClean(sidecarPath);
     return mergeInboxBranchesAt(sidecarPath, config, options);
   }
   // A checkout parked on the main branch would block the worktree from
-  // switching to it. Sidecar owns this checkout's branch, and ensureClean
-  // above proved there is no uncommitted work, so move back to the inbox
-  // branch rather than merging in place and rewriting the user's files.
+  // switching to it. Sidecar owns this checkout's branch, so move back to the
+  // inbox branch rather than merging in place and rewriting the user's files —
+  // once nothing uncommitted rides along.
   if (git(sidecarPath, ["branch", "--show-current"]).stdout.trim() === config.branch) {
+    ensureClean(sidecarPath);
     ensureInboxBranch(sidecarPath, config, expandInbox(config, sidecarPath));
   }
   return withScratchWorktree(sidecarPath, config, "HEAD", (worktree) => mergeInboxBranchesAt(worktree, config, options));
@@ -1738,6 +1804,7 @@ export function syncBranchBeforePush(repo: string, branch: string, config: Sidec
   if (isDirty(repo)) {
     throw new SidecarError(
       `${remoteBranch} has commits not in local ${branch}, and the sidecar checkout has uncommitted changes`,
+      { reason: "dirty-checkout" },
     );
   }
 
@@ -1752,14 +1819,32 @@ export function syncBranchBeforePush(repo: string, branch: string, config: Sidec
 
 }
 
+/**
+ * Fast-forwards this checkout's inbox to main, the one step of a sync that
+ * writes the user's files. A checkout holding edits no sync has captured is
+ * left where it is: they landed after this sync's snapshot, the next sync
+ * snapshots them onto the inbox as it stands, and its merge reconciles that
+ * with main. Moving the tree under them instead would bet the user's
+ * unredacted originals on git's overwrite check, which compares through the
+ * clean filter and so can count an original as already committed.
+ */
 function refreshInboxFromMain(repo: string, config: SidecarConfig, inbox: string): void {
   if (!branchExists(repo, inbox) || !branchExists(repo, config.branch)) return;
-  ensureClean(repo);
+  if (isDirty(repo)) {
+    logSidecarEvent("settle-deferred", { sidecarPath: repo });
+    return;
+  }
   git(repo, ["switch", inbox]);
   const result = git(repo, ["merge", "--ff-only", config.branch], { check: false });
-  if (result.status !== 0) {
-    throw new SidecarError(result.stderr.trim() || `could not fast-forward ${inbox} to ${config.branch}`);
+  if (result.status === 0) return;
+  // An edit that landed between the check and the merge can stop it, and is
+  // deferred the same way. A checkout still clean means the merge
+  // failed for a reason of its own.
+  if (isDirty(repo)) {
+    logSidecarEvent("settle-deferred", { sidecarPath: repo });
+    return;
   }
+  throw new SidecarError(result.stderr.trim() || `could not fast-forward ${inbox} to ${config.branch}`);
 }
 
 export function pushBranch(repo: string, branch: string): void {

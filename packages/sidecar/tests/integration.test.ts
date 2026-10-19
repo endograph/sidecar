@@ -2510,10 +2510,12 @@ describe("review-gated publishing", () => {
     runSidecar(["sync", "--local"], worktree, env.vars);
 
     // A person approves what the review covered: v1 alone, not the edit after it.
+    // The edit after it waits for the review floor; a sync by hand reviews it now.
     fs.rmSync(env.defer);
     const approved = runSidecar(["review", "approve", first], main, env.vars);
     expect(remoteFile(remote, "plan.md")).toBe("v1\n");
-    await waitForReview(main, openedReview(approved), "published", env.vars);
+    expect(approved).toContain("the next review opens in");
+    await waitForReview(main, openedReview(runSidecar(["sync"], main, env.vars)), "published", env.vars);
     runSidecar(["sync"], worktree, env.vars);
     runSidecar(["sync"], main, env.vars);
 
@@ -2593,6 +2595,217 @@ describe("review-gated publishing", () => {
     expect(again.stderr).toContain("is approved");
   });
 });
+
+describe("edits landing mid-sync", () => {
+  test("a sync finishes when the checkout changes under it, and leaves the edit for the next", async () => {
+    const { main, remote, sidecar } = initSidecarProject();
+    // Another machine moves main, so settling this checkout has files to write.
+    const other = cloneRemoteMain(remote);
+    fs.writeFileSync(path.join(other, "other.md"), "from elsewhere\n", "utf8");
+    git(other, ["add", "other.md"]);
+    git(other, ["commit", "-m", "Other machine"]);
+    git(other, ["push", "origin", "HEAD:refs/heads/main"]);
+    const barrier = hookBarrier(sidecar, "post-commit", 0);
+
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "one\n", "utf8");
+    barrier.arm();
+    const sync = runSidecarAsync(["sync"], main);
+    await barrier.entered();
+    // Lands between the snapshot and everything after it, secret and all.
+    const edit = "one\ntwo\napi_key = sk-test-0123456789abcdefghijklmnop\n";
+    fs.writeFileSync(path.join(sidecar, "notes.md"), edit, "utf8");
+    fs.writeFileSync(path.join(sidecar, "new.md"), "untracked\n", "utf8");
+    barrier.release();
+    const result = await sync;
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(remoteFile(remote, "notes.md")).toBe("one\n");
+    // Untouched, byte for byte, and still waiting to be captured.
+    expect(fs.readFileSync(path.join(sidecar, "notes.md"), "utf8")).toBe(edit);
+    expect(git(sidecar, ["status", "--porcelain"]).stdout).toMatch(/notes\.md[\s\S]*new\.md/);
+
+    runSidecar(["sync"], main);
+    expect(remoteFile(remote, "new.md")).toBe("untracked\n");
+    expect(remoteFile(remote, "notes.md")).toContain("two\n");
+    expect(fs.readFileSync(path.join(sidecar, "notes.md"), "utf8")).toBe(edit);
+    expect(fs.readFileSync(path.join(sidecar, "other.md"), "utf8")).toBe("from elsewhere\n");
+    expect(git(sidecar, ["status", "--porcelain"]).stdout.trim()).toBe("");
+  });
+
+  test("the daemon captures an edit that lands mid-sync, without logging a failure", async () => {
+    const { main, remote, sidecar } = initSidecarProject();
+    const barrier = hookBarrier(sidecar, "post-commit", 0);
+    const daemon = await startDaemon(main, ["--interval", "3600", "--debounce", "1"]);
+    try {
+      barrier.arm();
+      fs.writeFileSync(path.join(sidecar, "notes.md"), "one\n", "utf8");
+      await barrier.entered();
+      fs.writeFileSync(path.join(sidecar, "notes.md"), "one\ntwo\n", "utf8");
+      barrier.release();
+
+      await waitFor(() => remoteFile(remote, "notes.md") === "one\ntwo\n", 30_000);
+      expect(daemon.log()).not.toContain('"event":"failure"');
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("the daemon captures an edit that lands during a remote sync that fails", async () => {
+    const { main, sidecar } = initSidecarProject();
+    // The remote refuses every push; the barrier holds one of them open.
+    const barrier = hookBarrier(sidecar, "pre-push", 1);
+    const daemon = await startDaemon(main, ["--interval", "3600", "--debounce", "1"]);
+    try {
+      // Past the debounce, so the edit leads with a round trip.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      barrier.arm();
+      fs.writeFileSync(path.join(sidecar, "notes.md"), "one\n", "utf8");
+      await barrier.entered();
+      fs.writeFileSync(path.join(sidecar, "notes.md"), "one\ntwo\n", "utf8");
+      barrier.release();
+
+      await waitFor(() =>
+        git(sidecar, ["show", "HEAD:notes.md"], { check: false }).stdout === "one\ntwo\n" &&
+        git(sidecar, ["status", "--porcelain"]).stdout.trim() === "", 30_000);
+      expect(daemon.log()).toContain('"reason":"exit-1"');
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("an approval succeeds once it publishes, even when the checkout changes under its sync", async () => {
+    const { main, remote, sidecar } = initSidecarProject(["--review", "required"]);
+    const env = reviewerEnv(main);
+    runSidecar(["review", "reviewer", env.reviewer], main, env.vars);
+    fs.writeFileSync(env.defer, "", "utf8");
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "v1\n", "utf8");
+    const id = openedReview(runSidecar(["sync"], main, env.vars));
+    await waitForReview(main, id, "pending", env.vars, (review) => fs.readFileSync(path.join(String(review.dir), "reviewer.log"), "utf8").includes("deferring"));
+
+    const barrier = hookBarrier(sidecar, "post-commit", 0);
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "v1\nv2\n", "utf8");
+    barrier.arm();
+    const approve = runSidecarAsync(["review", "approve", id], main, env.vars);
+    await barrier.entered();
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "v1\nv2\nv3\n", "utf8");
+    barrier.release();
+    const result = await approve;
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(remoteFile(remote, "notes.md")).toBe("v1\n");
+    expect(JSON.parse(runSidecar(["review", "show", id, "--json"], main, env.vars)).state).toBe("published");
+  });
+});
+
+describe("review floor", () => {
+  test("an approval holds the next review to the floor, and the daemon opens it when the floor passes", async () => {
+    const { main, remote, sidecar } = initSidecarProject(["--review", "required", "--debounce", "20s"]);
+    const env = reviewerEnv(main);
+    runSidecar(["review", "reviewer", env.reviewer], main, env.vars);
+    fs.writeFileSync(env.defer, "", "utf8");
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "v1\n", "utf8");
+    const first = openedReview(runSidecar(["sync"], main, env.vars));
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "v1\nv2\n", "utf8");
+    runSidecar(["sync", "--local"], main, env.vars);
+    fs.rmSync(env.defer);
+
+    const approved = runSidecar(["review", "approve", first], main, env.vars);
+    expect(remoteFile(remote, "notes.md")).toBe("v1\n");
+    expect(approved).toContain("the next review opens in");
+    // The daemon's own syncs keep to the floor too.
+    const soft = runSidecar(["sync"], main, { ...env.vars, SIDECAR_SYNC_SOFT: "1" });
+    expect(soft).not.toContain("opened review");
+    const openedAt = Date.parse(JSON.parse(runSidecar(["review", "show", first, "--json"], main, env.vars)).createdAt);
+
+    // Nothing else is coming: the edit is captured and the daemon has no
+    // reason of its own to sync before the interval.
+    const daemon = await startDaemon(main, ["--interval", "3600"], env.vars);
+    try {
+      await waitFor(() => remoteFile(remote, "notes.md") === "v1\nv2\n", 60_000);
+      const reviews = JSON.parse(runSidecar(["review", "--json"], main, env.vars))[0].reviews as Array<{ id: string; createdAt: string }>;
+      const next = reviews.find((review) => review.id !== first)!;
+      expect(Date.parse(next.createdAt) - openedAt).toBeGreaterThanOrEqual(20_000);
+    } finally {
+      await daemon.stop();
+    }
+  }, 90_000);
+});
+
+/**
+ * A hook in `checkout` that, once armed, stops the git command running it until
+ * released, then exits with `exitCode`. Unarmed, it exits at once. Its marker
+ * files live outside the checkout, where no watcher sees them.
+ */
+function hookBarrier(checkout: string, hook: string, exitCode: number): { arm(): void; entered(): Promise<void>; release(): void } {
+  const dir = tempDir();
+  const [armed, entered, release] = ["armed", "entered", "release"].map((name) => path.join(dir, name));
+  const hooks = path.resolve(checkout, git(checkout, ["rev-parse", "--git-common-dir"]).stdout.trim(), "hooks");
+  fs.mkdirSync(hooks, { recursive: true });
+  fs.writeFileSync(path.join(hooks, hook), `#!/bin/sh
+if [ -f "${armed}" ]; then
+  rm -f "${armed}"
+  touch "${entered}"
+  i=0
+  while [ ! -f "${release}" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i + 1)); done
+fi
+exit ${exitCode}
+`, { mode: 0o755 });
+  return {
+    arm: () => fs.writeFileSync(armed, "", "utf8"),
+    entered: () => waitFor(() => fs.existsSync(entered), 20_000),
+    release: () => fs.writeFileSync(release, "", "utf8"),
+  };
+}
+
+function runSidecarAsync(args: string[], cwd: string, env: Record<string, string> = {}): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [cliPath, ...args], {
+      cwd,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", SIDECAR_STATE_DIR: path.join(cwd, ".sidecar-test-state"), ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+/** A daemon over `main`'s test state dir, started once its first cycle and watchers are up. */
+async function startDaemon(main: string, args: string[], env: Record<string, string> = {}): Promise<{ log(): string; stop(): Promise<void> }> {
+  const stateDir = env.SIDECAR_STATE_DIR ?? path.join(main, ".sidecar-test-state");
+  const logPath = path.join(stateDir, "sidecar.log");
+  const log = () => (fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "");
+  const before = log().length;
+  const daemon = spawn(process.execPath, [cliPath, "daemon", "run", ...args], {
+    cwd: main,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      SIDECAR_SKIP_SERVICE: "1",
+      SIDECAR_SKIP_UPDATE: "1",
+      ...env,
+      SIDECAR_STATE_DIR: stateDir,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const closed = new Promise<void>((resolve) => daemon.once("close", () => resolve()));
+  await waitFor(() => {
+    const fresh = log().slice(before);
+    return fresh.includes('"event":"daemon-cycle"') && fresh.includes('"event":"daemon-watch"');
+  }, 30_000);
+  return {
+    log: () => log().slice(before),
+    stop: async () => {
+      daemon.kill("SIGTERM");
+      await closed;
+      // Killing the daemon does not kill an in-flight sync, so wait for the
+      // lock to clear before cleanup.
+      await waitFor(() => !fs.existsSync(path.join(stateDir, "locks")) || fs.readdirSync(path.join(stateDir, "locks")).length === 0, 15_000);
+    },
+  };
+}
 
 // A reviewer that rejects anything CONFIDENTIAL, defers while `defer` exists,
 // and approves the rest — through a `sidecar` on PATH, as a real one would.

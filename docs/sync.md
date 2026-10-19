@@ -10,8 +10,12 @@ Windows) that:
   remote round trip once the 60-second debounce since the last one has
   passed, so a burst of edits reaches sibling checkouts almost immediately
   while the remote sees one sync a minute. A save that lands while a sync is
-  already running is not lost either: when the sync finishes, the daemon
-  checks the checkout and syncs again if that save left uncommitted work
+  already running is not lost either: when the sync finishes — or fails —
+  the daemon checks the checkout and syncs again if that save left
+  uncommitted work. The sync itself doesn't stop for it: what it snapshotted
+  it merges and pushes, and the newer save waits for the next sync rather
+  than failing this one. Only the checkout's own fast-forward to `main`
+  waits, so it never writes over an edit nobody has captured
 - syncs every registered repo on a 10-minute interval as a backstop — this is
   also the fallback on platforms where file watching is unreliable
 - runs each repo's project-local sidecar for the sync when it is newer than
@@ -21,7 +25,11 @@ Windows) that:
 - self-heals: it re-clones missing checkouts, restores its service definition,
   prunes registrations whose `.sidecar` config is gone, backs off repos that
   keep failing, and steps aside for a newer global install — whether updated
-  in place or reinstalled somewhere else on PATH
+  in place or reinstalled somewhere else on PATH. A sync stopped only by the
+  checkout changing under it (exit status 75) is not a failure for backoff:
+  it is retried at the settle cadence. Every failure the log records carries
+  a `reason` and, from the sync itself, the `stage` it stopped at — both safe
+  to log for a review-gated peer, whose messages are not
 
 ### Cadence
 

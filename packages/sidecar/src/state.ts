@@ -481,3 +481,53 @@ function syncLockIsStale(lockDir: string): boolean {
     return (error as NodeJS.ErrnoException).code !== "EPERM";
   }
 }
+
+// ---------------------------------------------------------------------------
+// Review due times
+//
+// A review-gated peer opens at most one review per debounce (see
+// gateUnpublished in sync.ts). Work that floor holds back needs something to
+// come back for it once the floor has passed, including when nothing else
+// will: the last edit already captured, the last review just approved. That
+// is the daemon's job, and this is how a sync tells it — one file per peer,
+// written and cleared by the gate under the peer's sync lock, read by the
+// daemon when it starts and whenever the directory changes.
+// ---------------------------------------------------------------------------
+
+export function reviewDueDir(): string {
+  return path.join(sidecarStateDir(), "review-due");
+}
+
+function reviewDuePath(configPath: string): string {
+  // The same peer under two spellings of its path must land on one file.
+  const key = `${realpathOr(path.dirname(configPath))}\0${path.basename(configPath)}`;
+  return path.join(reviewDueDir(), `${crypto.createHash("sha256").update(key).digest("hex").slice(0, 16)}.json`);
+}
+
+/** Records that the peer at `configPath` has work for a review that may open at `dueAt` (epoch ms). */
+export function writeReviewDue(configPath: string, dueAt: number): void {
+  const filePath = reviewDuePath(configPath);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify({ configPath, dueAt: new Date(dueAt).toISOString() })}\n`, "utf8");
+    fs.renameSync(temporary, filePath);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
+export function clearReviewDue(configPath: string): void {
+  fs.rmSync(reviewDuePath(configPath), { force: true });
+}
+
+/** When the peer at `configPath` has a review due (epoch ms), if it has one. */
+export function readReviewDue(configPath: string): number | undefined {
+  try {
+    const { dueAt } = JSON.parse(fs.readFileSync(reviewDuePath(configPath), "utf8")) as { dueAt?: unknown };
+    const time = typeof dueAt === "string" ? Date.parse(dueAt) : Number.NaN;
+    return Number.isFinite(time) ? time : undefined;
+  } catch {
+    return undefined;
+  }
+}

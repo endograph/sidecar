@@ -4,7 +4,7 @@
 import { type Role } from "./color.js";
 import { SidecarError, getValue, parseOptions } from "./util.js";
 import { INSTALL_SOURCES, type InstallSource, PACKAGE_NAME, currentExecutablePath, isProjectLocalPath, shouldUseGlobalRegistry } from "./install.js";
-import { loadPeers } from "./config.js";
+import { DEFAULT_DEBOUNCE_SECONDS, loadPeers } from "./config.js";
 import { logSidecarEvent, readSettings, registerCurrentInstance, settingsPath, sidecarLogPath, writeSettings } from "./state.js";
 import { type DaemonServiceStatus, daemonServiceLabel, daemonServiceStatus, installDaemonService, stopDaemonService } from "./service.js";
 import { labelLine } from "./ui.js";
@@ -149,7 +149,7 @@ async function cmdDaemonRun(args: string[]): Promise<number> {
   if (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0) {
     throw new SidecarError("--interval must be > 0");
   }
-  const debounceSeconds = Number(getValue(parsed, "--debounce", "60"));
+  const debounceSeconds = Number(getValue(parsed, "--debounce", String(DEFAULT_DEBOUNCE_SECONDS)));
   if (!Number.isFinite(debounceSeconds) || debounceSeconds < 0) {
     throw new SidecarError("--debounce must be >= 0");
   }

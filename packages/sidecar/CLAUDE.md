@@ -32,7 +32,14 @@ automatically by `export *`.
 - **Old-CLI compatibility.** The daemon drives pinned project-local CLIs that
   may be older than it. New sync behaviors are requested via env vars
   (`SIDECAR_SYNC_SOFT`, `SIDECAR_SYNC_LOCAL`), never new flags — an old CLI
-  must ignore the request, not reject an unknown option.
+  must ignore the request, not reject an unknown option. Answers travel back
+  as exit statuses an older daemon reads as a plain failure: 75 is
+  `dirty-checkout`, a sync to retry rather than back off from.
+- **Uncaptured edits.** After its snapshot a sync runs to the end whatever the
+  user types: merges happen in scratch worktrees, and the one in-place write
+  (the checkout's fast-forward to main) is deferred while the checkout is
+  dirty. A step that must rewrite the checkout in place checks `ensureClean`,
+  which throws the `dirty-checkout` reason.
 - **Redaction fails closed.** The clean filter is wired with `required=true`,
   so a stale filter command breaks every `git add` in the checkout. That is why
   `ensureRedactionFilter` re-checks on every path and deinit must always unwire
@@ -84,6 +91,9 @@ automatically by `export *`.
   its reviewer once; retry opens a new review, so a stale reviewer can only
   decide a closed one. Anything a publish commit carries beyond the reviewed
   tree is sidecar-generated, never copied from local commit messages.
+  Automatic syncs (the daemon's, an approval's) hold a new review to the
+  review floor; every hold writes a review-due record (state dir) the daemon
+  wakes on, and every other gate outcome clears it.
 - **Public git.** Every git operation that builds or sends what a gated peer
   publishes — and every health heartbeat, including reading the previous one —
   runs under `withPublicGit`, which replaces all injected config and fixes

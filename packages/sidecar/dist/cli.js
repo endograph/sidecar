@@ -216,12 +216,15 @@ function utcTimestamp() {
 function nowIso() {
   return new Date().toISOString();
 }
-var SidecarError;
+var DIRTY_CHECKOUT_EXIT = 75, SidecarError;
 var init_util = __esm(() => {
   SidecarError = class SidecarError extends Error {
-    constructor(message) {
+    reason;
+    stage;
+    constructor(message, options = {}) {
       super(message);
       this.name = "SidecarError";
+      this.reason = options.reason;
     }
   };
 });
@@ -1402,7 +1405,7 @@ function isDirty(repo) {
 }
 function ensureClean(repo) {
   if (isDirty(repo))
-    throw new SidecarError("sidecar checkout has uncommitted changes");
+    throw new SidecarError("sidecar checkout has uncommitted changes", { reason: "dirty-checkout" });
 }
 function sidecarIdentity() {
   return { name: currentUser(), email: `${slug(currentUser())}@${slug(currentHost())}.local` };
@@ -3812,7 +3815,7 @@ function inboxBranchPrefix(template) {
   const slashIndex = staticPrefix.lastIndexOf("/");
   return slashIndex === -1 ? staticPrefix : staticPrefix.slice(0, slashIndex + 1);
 }
-var DEFAULT_PATH = "sidecar", DEFAULT_BRANCH = "main", DEFAULT_INBOX = "sidecar-inbox/{user}/{random}", branchValidity, DEFAULT_PEER = "default", PEER_ENV = "SIDECAR_PEER", SOFT_SYNC_ENV = "SIDECAR_SYNC_SOFT", LOCAL_SYNC_ENV = "SIDECAR_SYNC_LOCAL", PEER_NAME, RESERVED_PEER_SUFFIXES, RESOLVE_MODES, DEFAULT_RESOLVE = "fork", REVIEW_MODES, DEFAULT_REVIEW_TIMEOUT_SECONDS, CONFIG_VERSION = 1, CONFIG_KEYS, failuresArePrivate = false, PUBLIC_REFS = "refs/sidecar-public/";
+var DEFAULT_PATH = "sidecar", DEFAULT_BRANCH = "main", DEFAULT_INBOX = "sidecar-inbox/{user}/{random}", branchValidity, DEFAULT_PEER = "default", PEER_ENV = "SIDECAR_PEER", SOFT_SYNC_ENV = "SIDECAR_SYNC_SOFT", LOCAL_SYNC_ENV = "SIDECAR_SYNC_LOCAL", DEFAULT_DEBOUNCE_SECONDS = 60, PEER_NAME, RESERVED_PEER_SUFFIXES, RESOLVE_MODES, DEFAULT_RESOLVE = "fork", REVIEW_MODES, DEFAULT_REVIEW_TIMEOUT_SECONDS, CONFIG_VERSION = 1, CONFIG_KEYS, failuresArePrivate = false, PUBLIC_REFS = "refs/sidecar-public/";
 var init_config = __esm(() => {
   init_dist();
   init_util();
@@ -4198,6 +4201,37 @@ function syncLockIsStale(lockDir) {
     return false;
   } catch (error) {
     return error.code !== "EPERM";
+  }
+}
+function reviewDueDir() {
+  return path6.join(sidecarStateDir(), "review-due");
+}
+function reviewDuePath(configPath) {
+  const key = `${realpathOr(path6.dirname(configPath))}\x00${path6.basename(configPath)}`;
+  return path6.join(reviewDueDir(), `${crypto3.createHash("sha256").update(key).digest("hex").slice(0, 16)}.json`);
+}
+function writeReviewDue(configPath, dueAt) {
+  const filePath = reviewDuePath(configPath);
+  fs6.mkdirSync(path6.dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${crypto3.randomUUID()}.tmp`;
+  try {
+    fs6.writeFileSync(temporary, `${JSON.stringify({ configPath, dueAt: new Date(dueAt).toISOString() })}
+`, "utf8");
+    fs6.renameSync(temporary, filePath);
+  } finally {
+    fs6.rmSync(temporary, { force: true });
+  }
+}
+function clearReviewDue(configPath) {
+  fs6.rmSync(reviewDuePath(configPath), { force: true });
+}
+function readReviewDue(configPath) {
+  try {
+    const { dueAt } = JSON.parse(fs6.readFileSync(reviewDuePath(configPath), "utf8"));
+    const time = typeof dueAt === "string" ? Date.parse(dueAt) : Number.NaN;
+    return Number.isFinite(time) ? time : undefined;
+  } catch {
+    return;
   }
 }
 var STATE_DIR_ENV = "SIDECAR_STATE_DIR", DEFAULT_SETTINGS, LOG_ROTATE_BYTES, SYNC_LOCK_WAIT_MS;
@@ -4924,8 +4958,9 @@ function syncProject(root, config, options) {
   }
   if (!options.remote)
     return {};
-  if (reviewRequired(config))
-    return publishReviewed(root, sidecarPath, config, inbox, siblings, stage);
+  if (reviewRequired(config)) {
+    return publishReviewed(root, sidecarPath, config, inbox, siblings, stage, options.reviewFloor ?? false);
+  }
   stage("push-inbox");
   syncBranchBeforePush(sidecarPath, inbox, config);
   pushBranch(sidecarPath, inbox);
@@ -5025,7 +5060,7 @@ function publicTip(repo, branch) {
 function isPublic(repo, commit) {
   return Boolean(git(repo, ["for-each-ref", "--contains", commit, "--format=%(refname)", PUBLIC_REFS]).stdout.trim());
 }
-function publishReviewed(root, sidecarPath, config, inbox, siblings, stage) {
+function publishReviewed(root, sidecarPath, config, inbox, siblings, stage, reviewFloor) {
   stage("fetch");
   withPublicGit(sidecarPath, () => {
     fetchPublic(sidecarPath);
@@ -5043,12 +5078,25 @@ function publishReviewed(root, sidecarPath, config, inbox, siblings, stage) {
   stage("settle-remote");
   settleCheckouts(sidecarPath, config, inbox, siblings);
   stage("review");
-  const gate = withPublicGit(sidecarPath, () => gateUnpublished(root, sidecarPath, config));
-  if (gate?.launch)
+  const gate = withPublicGit(sidecarPath, () => gateUnpublished(root, sidecarPath, config, reviewFloor));
+  if (!gate)
+    return {};
+  if ("due" in gate)
+    return { reviewDue: gate.due };
+  if (gate.launch)
     launchReviewer(gate.review);
-  return gate ? { held: { review: gate.review, attention: reviewAttention(gate.review) } } : {};
+  return { held: { review: gate.review, attention: reviewAttention(gate.review) } };
 }
-function gateUnpublished(root, sidecarPath, config) {
+function gateUnpublished(root, sidecarPath, config, floor) {
+  const configPath = peerConfigPath(root, config.peer);
+  const result = gateReview(root, sidecarPath, config, floor);
+  if (result && "due" in result)
+    writeReviewDue(configPath, result.due);
+  else
+    clearReviewDue(configPath);
+  return result;
+}
+function gateReview(root, sidecarPath, config, floor) {
   const head = git(sidecarPath, ["rev-parse", `refs/heads/${config.branch}`]).stdout.trim();
   const headTree = treeOf(sidecarPath, head);
   const publicMain = publicTip(sidecarPath, config.branch);
@@ -5070,9 +5118,24 @@ function gateUnpublished(root, sidecarPath, config) {
       return { review: open, launch: false };
     markSuperseded(open);
   }
+  if (floor) {
+    const due = reviewFloorEndsAt(sidecarPath, config);
+    if (due > Date.now()) {
+      console.log(`the next review opens in ${Math.ceil((due - Date.now()) / 1000)}s; reviews open at most once per debounce`);
+      return { due };
+    }
+  }
   const review = createReview({ root, config, sidecarPath, base, head });
   console.log(`opened review ${paint("brand", review.record.id)} for ${review.record.files.length} changed file(s)`);
   return { review, launch: hasReviewer };
+}
+function reviewFloorEndsAt(sidecarPath, config) {
+  const previous = listReviews(sidecarPath)[0];
+  if (!previous)
+    return 0;
+  const { createdAt, launchedAt } = previous.record;
+  const started = Math.max(Date.parse(createdAt), launchedAt ? Date.parse(launchedAt) : 0);
+  return started + (config.debounce ?? DEFAULT_DEBOUNCE_SECONDS) * 1000;
 }
 function publishApprovedReview(sidecarPath, config, inbox, review) {
   const { record } = review;
@@ -5333,7 +5396,6 @@ function readFleetHealth(sidecarPath) {
   return entries.sort((left, right) => rank[left.state] - rank[right.state] || left.record.machine.localeCompare(right.record.machine) || left.branch.localeCompare(right.branch));
 }
 function mergeInboxBranches(sidecarPath, config, options) {
-  ensureClean(sidecarPath);
   ensureCommitIdentity(sidecarPath);
   if (options.remote)
     fetch(sidecarPath, false);
@@ -5353,9 +5415,11 @@ function mergeInboxBranches(sidecarPath, config, options) {
     }
   }
   if (!hasAnyCommit(sidecarPath)) {
+    ensureClean(sidecarPath);
     return mergeInboxBranchesAt(sidecarPath, config, options);
   }
   if (git(sidecarPath, ["branch", "--show-current"]).stdout.trim() === config.branch) {
+    ensureClean(sidecarPath);
     ensureInboxBranch(sidecarPath, config, expandInbox(config, sidecarPath));
   }
   return withScratchWorktree(sidecarPath, config, "HEAD", (worktree) => mergeInboxBranchesAt(worktree, config, options));
@@ -5915,7 +5979,7 @@ function syncBranchBeforePush(repo, branch, config) {
   if (isAncestor(repo, remoteBranch, "HEAD"))
     return;
   if (isDirty(repo)) {
-    throw new SidecarError(`${remoteBranch} has commits not in local ${branch}, and the sidecar checkout has uncommitted changes`);
+    throw new SidecarError(`${remoteBranch} has commits not in local ${branch}, and the sidecar checkout has uncommitted changes`, { reason: "dirty-checkout" });
   }
   if (isAncestor(repo, "HEAD", remoteBranch)) {
     git(repo, ["merge", "--ff-only", remoteBranch]);
@@ -5926,12 +5990,19 @@ function syncBranchBeforePush(repo, branch, config) {
 function refreshInboxFromMain(repo, config, inbox) {
   if (!branchExists(repo, inbox) || !branchExists(repo, config.branch))
     return;
-  ensureClean(repo);
+  if (isDirty(repo)) {
+    logSidecarEvent("settle-deferred", { sidecarPath: repo });
+    return;
+  }
   git(repo, ["switch", inbox]);
   const result = git(repo, ["merge", "--ff-only", config.branch], { check: false });
-  if (result.status !== 0) {
-    throw new SidecarError(result.stderr.trim() || `could not fast-forward ${inbox} to ${config.branch}`);
+  if (result.status === 0)
+    return;
+  if (isDirty(repo)) {
+    logSidecarEvent("settle-deferred", { sidecarPath: repo });
+    return;
   }
+  throw new SidecarError(result.stderr.trim() || `could not fast-forward ${inbox} to ${config.branch}`);
 }
 function pushBranch(repo, branch) {
   git(repo, ["push", "--no-follow-tags", "-u", "origin", `HEAD:refs/heads/${branch}`]);
@@ -8229,6 +8300,7 @@ __export(exports_daemon, {
   selectWatchTargets: () => selectWatchTargets,
   scheduleFor: () => scheduleFor,
   runDaemonLoop: () => runDaemonLoop,
+  reviewDueAt: () => reviewDueAt,
   refreshWatchers: () => refreshWatchers,
   compileGitignoreMatcher: () => compileGitignoreMatcher,
   checkAndInstallUpdate: () => checkAndInstallUpdate,
@@ -8299,6 +8371,7 @@ async function runDaemonLoop(options) {
   await acquireDaemonPid();
   installShutdownHandlers();
   await watchRegistry(state);
+  await watchReviewDue(state);
   const bootVersion = packageVersion();
   while (true) {
     maybeAdoptNewerInstall(state, bootVersion);
@@ -8411,10 +8484,11 @@ async function syncInstance(state, key, trigger, options = {}) {
   state.syncingFamilies.add(family);
   if (!options.localOnly) {
     state.lastRemoteSyncAt.set(key, Date.now());
-    clearTimeout(state.remoteTimers.get(key));
+    clearTimeout(state.remoteTimers.get(key)?.timer);
     state.remoteTimers.delete(key);
   }
   let succeeded = false;
+  let dirtyCheckout = false;
   try {
     const localCli = localSidecarCliPath(root);
     const cli = localCli ?? currentCliPath();
@@ -8431,19 +8505,27 @@ async function syncInstance(state, key, trigger, options = {}) {
       },
       timeoutMs: SYNC_TIMEOUT_MS
     });
+    dirtyCheckout = !result.timedOut && result.status === DIRTY_CHECKOUT_EXIT;
     if (result.status === 0) {
-      state.failures.delete(key);
-      state.skipUntilCycle.delete(key);
+      if (!options.localOnly) {
+        state.failures.delete(key);
+        state.skipUntilCycle.delete(key);
+      }
       logSidecarEvent("daemon-sync", { ...peerFields(key), trigger, local: Boolean(localCli) });
       succeeded = true;
     } else {
-      const failures = (state.failures.get(key) ?? 0) + 1;
-      state.failures.set(key, failures);
-      state.skipUntilCycle.set(key, state.cycleCount + Math.min(2 ** (failures - 1), MAX_BACKOFF_CYCLES));
+      if (!dirtyCheckout) {
+        const failures = (state.failures.get(key) ?? 0) + 1;
+        state.failures.set(key, failures);
+        state.skipUntilCycle.set(key, state.cycleCount + Math.min(2 ** (failures - 1), MAX_BACKOFF_CYCLES));
+      }
+      if (!options.localOnly)
+        state.lastRemoteSyncAt.set(key, Date.now());
       logSidecarEvent("failure", {
         command: "daemon",
         ...peerFields(key),
         trigger,
+        reason: result.timedOut ? "timeout" : dirtyCheckout ? "dirty-checkout" : `exit-${result.status}`,
         message: result.timedOut ? "sync timed out" : !outputIsPrivate(key) && result.output.trim().slice(-500) || `sync exited ${result.status}`
       });
     }
@@ -8453,11 +8535,23 @@ async function syncInstance(state, key, trigger, options = {}) {
     if (options.localOnly)
       armRemoteSync(state, key);
   }
-  if (succeeded)
+  if (succeeded) {
+    if (!options.localOnly)
+      armReviewDue(state, key, "after-sync");
     await followUpTrailingSync(state, key);
-  else
-    state.trailingPending.delete(key);
+  } else {
+    followUpFailedSync(state, key, { dirtyCheckout, remote: !options.localOnly });
+  }
   return succeeded;
+}
+function followUpFailedSync(state, key, failure) {
+  if (failure.dirtyCheckout) {
+    state.trailingPending.add(key);
+    if (failure.remote)
+      armRemoteSync(state, key);
+  }
+  if (state.trailingPending.has(key) && !state.pendingTimers.has(key))
+    openTrailingWindow(state, key, SETTLE_WINDOW_MS);
 }
 async function followUpTrailingSync(state, key) {
   if (!state.trailingPending.delete(key))
@@ -8474,7 +8568,9 @@ async function checkoutIsDirty(key) {
   if (!sidecarPath || !fs14.existsSync(sidecarPath))
     return false;
   const result = await runChild("git", ["-C", sidecarPath, "status", "--porcelain"], { timeoutMs: 30000 });
-  return result.status === 0 && Boolean(result.stdout.trim());
+  if (result.status !== 0)
+    return true;
+  return Boolean(result.stdout.trim());
 }
 function localSidecarCliPath(root) {
   if (!projectDependsOnSidecar(root))
@@ -8602,14 +8698,35 @@ async function beginWatchSync(state, key) {
     state.trailingPending.add(key);
 }
 function armRemoteSync(state, key) {
-  if (state.remoteTimers.has(key))
-    return;
   const elapsed = Date.now() - (state.lastRemoteSyncAt.get(key) ?? 0);
+  armRemoteAt(state, key, Date.now() + Math.max(SETTLE_WINDOW_MS, scheduleFor(key, state.options).debounceSeconds * 1000 - elapsed), "remote-due");
+}
+function armRemoteAt(state, key, at, trigger) {
+  const booked = state.remoteTimers.get(key);
+  if (booked && booked.at <= at)
+    return;
+  clearTimeout(booked?.timer);
   const timer = setTimeout(() => {
     state.remoteTimers.delete(key);
-    syncInstance(state, key, "remote-due");
-  }, Math.max(SETTLE_WINDOW_MS, scheduleFor(key, state.options).debounceSeconds * 1000 - elapsed));
-  state.remoteTimers.set(key, timer);
+    syncInstance(state, key, trigger);
+  }, Math.max(0, at - Date.now()));
+  state.remoteTimers.set(key, { timer, at });
+}
+function armReviewDue(state, key, when) {
+  const at = reviewDueAt(readReviewDue(key), when, Date.now(), scheduleFor(key, state.options).debounceSeconds * 1000);
+  if (at !== undefined)
+    armRemoteAt(state, key, at, "review-due");
+}
+function reviewDueAt(due, when, now, debounceMs) {
+  if (due === undefined)
+    return;
+  if (due > now)
+    return due;
+  if (when === "start")
+    return now;
+  if (when === "after-sync")
+    return now + Math.max(SETTLE_WINDOW_MS, debounceMs);
+  return;
 }
 function remoteIsDue(state, key) {
   const last = state.lastRemoteSyncAt.get(key) ?? 0;
@@ -8650,6 +8767,34 @@ async function watchRegistry(state) {
     logSidecarEvent("failure", {
       command: "daemon",
       message: `could not watch registry: ${error instanceof Error ? error.message : String(error)}`
+    });
+  }
+}
+async function watchReviewDue(state) {
+  const scan = (when) => {
+    for (const instance of readInstances())
+      armReviewDue(state, instance.configPath, when);
+  };
+  scan("start");
+  const chokidar = await loadChokidar();
+  if (!chokidar)
+    return;
+  try {
+    fs14.mkdirSync(reviewDueDir(), { recursive: true });
+    const watcher = chokidar.watch(reviewDueDir(), { ignoreInitial: true, depth: 0 });
+    let timer;
+    watcher.on("all", () => {
+      if (timer)
+        return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        scan("change");
+      }, 500);
+    });
+  } catch (error) {
+    logSidecarEvent("failure", {
+      command: "daemon",
+      message: `could not watch review due times: ${error instanceof Error ? error.message : String(error)}`
     });
   }
 }
@@ -8978,7 +9123,7 @@ async function cmdDaemonRun(args) {
   if (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0) {
     throw new SidecarError("--interval must be > 0");
   }
-  const debounceSeconds = Number(getValue(parsed, "--debounce", "60"));
+  const debounceSeconds = Number(getValue(parsed, "--debounce", String(DEFAULT_DEBOUNCE_SECONDS)));
   if (!Number.isFinite(debounceSeconds) || debounceSeconds < 0) {
     throw new SidecarError("--debounce must be >= 0");
   }
@@ -9102,7 +9247,8 @@ function cmdSync(args) {
     lock: soft ? "skip" : "throw",
     remote: !parsed.flags.has("--local") && process.env[LOCAL_SYNC_ENV] !== "1",
     snapshot: !parsed.flags.has("--no-snapshot"),
-    message: getValue(parsed, "--message", getValue(parsed, "-m", "")) || undefined
+    message: getValue(parsed, "--message", getValue(parsed, "-m", "")) || undefined,
+    reviewFloor: soft
   };
   for (const peer of peers) {
     announcePeer(peer, peers);
@@ -9113,12 +9259,13 @@ function cmdSync(args) {
     } catch (error) {
       if (peers.length === 1)
         throw error;
-      failed.push(peer.name);
+      failed.push({ name: peer.name, error });
       console.error(`sidecar: ${peer.name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   if (failed.length) {
-    throw new SidecarError(`${failed.length} of ${peers.length} peers failed to sync: ${failed.join(", ")}`);
+    const dirty = failed.every(({ error }) => error instanceof SidecarError && error.reason === "dirty-checkout");
+    throw new SidecarError(`${failed.length} of ${peers.length} peers failed to sync: ${failed.map(({ name }) => name).join(", ")}`, dirty ? { reason: "dirty-checkout" } : {});
   }
   return 0;
 }
@@ -9135,6 +9282,7 @@ function syncPeer(peer, options) {
         snapshot: options.snapshot,
         remote,
         message: options.message,
+        reviewFloor: options.reviewFloor,
         onStage: (name) => {
           stage = name;
         }
@@ -9142,6 +9290,8 @@ function syncPeer(peer, options) {
       registerCurrentInstance(root, config, remote ? { event: "sync", lastSyncAt: nowIso() } : { event: "sync-local" });
     });
   } catch (error) {
+    if (error instanceof SidecarError)
+      error.stage ??= stage;
     if (remote)
       reportSyncHealth(root, config, {
         status: "failed",
@@ -9156,8 +9306,9 @@ function syncPeer(peer, options) {
       const { id } = held.review.record;
       console.log(held.attention ? `sidecar: publishing is held — review ${id} needs attention: ${held.attention}; \`sidecar review show ${id}\`` : `sidecar: publishing is held for review ${id}; \`sidecar review show ${id}\``);
     }
-    if (remote)
-      reportSyncHealth(root, config, held ? { status: "ok", review: held.attention ? "attention" : "pending" } : { status: "ok" });
+    if (remote) {
+      reportSyncHealth(root, config, held ? { status: "ok", review: held.attention ? "attention" : "pending" } : outcome.reviewDue ? { status: "ok", review: "pending" } : { status: "ok" });
+    }
     if (!soft) {
       const sidecarPath = resolveSidecarPath(root, config);
       if (checkoutIsUnlinkedFromFamily(root, config, sidecarPath)) {
@@ -9425,7 +9576,20 @@ function decideCommand(verdict, args) {
     return 0;
   }
   const peer = loadPeer(selected.record.root, selected.record.peer);
-  syncPeer(peer, { lock: "wait", remote: true, snapshot: true });
+  try {
+    syncPeer(peer, { lock: "wait", remote: true, snapshot: true, reviewFloor: true });
+  } catch (error) {
+    if (readReview(id)?.state !== "published") {
+      console.error(`sidecar: review ${id} is approved, but this sync could not confirm it published; the next sync finishes publishing it`);
+      throw error;
+    }
+    logSidecarEvent("review-followup-failure", {
+      id,
+      ...error instanceof SidecarError && error.reason ? { reason: error.reason } : {},
+      ...error instanceof SidecarError && error.stage ? { stage: error.stage } : {}
+    });
+    console.error(`sidecar: published review ${id}; the sync after it stopped early and the next sync finishes it: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return 0;
 }
 function retryCommand(args) {
@@ -9680,12 +9844,14 @@ async function main(argv = process.argv.slice(2)) {
     if (command !== "redact" && command !== "deinit" && shouldUseGlobalRegistry()) {
       logSidecarEvent("failure", {
         command,
+        ...error instanceof SidecarError && error.reason ? { reason: error.reason } : {},
+        ...error instanceof SidecarError && error.stage ? { stage: error.stage } : {},
         ...privateFailures() ? {} : { message: error instanceof Error ? error.message : String(error) }
       });
     }
     if (error instanceof SidecarError) {
       console.error(`${paint("bad", "sidecar:", colorLevel(process.stderr))} ${error.message}`);
-      return 1;
+      return error.reason === "dirty-checkout" ? DIRTY_CHECKOUT_EXIT : 1;
     }
     if (error instanceof Error && error.name === "AbortError") {
       console.error("sidecar: stopped");
