@@ -1,6 +1,6 @@
 {
   "name": "sidecarsync",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "A Git-backed sidecar inbox for repo-local development metadata.",
   "license": "MIT",
   "repository": {
