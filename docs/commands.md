@@ -172,7 +172,7 @@ open review.
 | `sidecar review show [<id>] [--json]` | state, reason, changed files, and the diff exactly as it would be published |
 | `sidecar review approve [<id>] [--no-sync]` | approve, then publish it now unless `--no-sync`; also overrides a rejection |
 | `sidecar review reject [<id>] [--reason <text>]` | hold publishing until the content changes |
-| `sidecar review retry [<id>]` | retire it and open a new review of the same change, with a fresh reviewer run |
+| `sidecar review retry [<id>]` | retire it and open a new review of the same change, with a fresh reviewer run (not once approved) |
 | `sidecar review reviewer ["<command>"\|--unset]` | show or set this machine's reviewer, a shell command quoted as one argument |
 | `sidecar review run <id>` | the background runner a sync starts; not for direct use |
 

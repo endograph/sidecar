@@ -5111,6 +5111,8 @@ function retryReview(review) {
     throw new SidecarError(`review ${record.id} is already ${review.state}`);
   if (record.publishing)
     throw new SidecarError(`review ${record.id} is already being published`);
+  if (review.state === "approved")
+    throw new SidecarError(`review ${record.id} is approved and publishes on the next sync`);
   const config = loadPeer(record.root, record.peer).config;
   const sidecarPath = requireSidecarCheckout(record.root, config);
   markSuperseded(review);

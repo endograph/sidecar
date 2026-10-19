@@ -97,7 +97,7 @@ The exit status says only whether the reviewer itself worked:
 - **Nonzero:** the reviewer broke. The review needs attention;
   `sidecar review retry` retires it and opens a new review of the same change
   with a fresh run of the reviewer. A reviewer still working on the old review
-  can no longer decide it.
+  can no longer decide it. An approved review can't be retried; it publishes.
 
 That middle case is what makes discussion possible. A reviewer can open a
 thread in your agent tool with the packet, exit, and let the agent there

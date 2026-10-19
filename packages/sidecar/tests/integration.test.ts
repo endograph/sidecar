@@ -2586,6 +2586,11 @@ describe("review-gated publishing", () => {
     const late = runSidecarRaw(["review", "approve", first, "--no-sync"], main, env.vars);
     expect(late.status).not.toBe(0);
     expect(late.stderr).toContain("already superseded");
+
+    runSidecar(["review", "approve", retried!, "--no-sync"], main, env.vars);
+    const again = runSidecarRaw(["review", "retry", retried!], main, env.vars);
+    expect(again.status).not.toBe(0);
+    expect(again.stderr).toContain("is approved");
   });
 });
 

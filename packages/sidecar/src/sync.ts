@@ -449,6 +449,9 @@ export function retryReview(review: Review): Review {
   const { record } = review;
   if (!isOpen(review)) throw new SidecarError(`review ${record.id} is already ${review.state}`);
   if (record.publishing) throw new SidecarError(`review ${record.id} is already being published`);
+  // An approval is a decision, not a reviewer that broke; retrying would
+  // quietly withdraw it.
+  if (review.state === "approved") throw new SidecarError(`review ${record.id} is approved and publishes on the next sync`);
   const config = loadPeer(record.root, record.peer).config;
   const sidecarPath = requireSidecarCheckout(record.root, config);
   // Retired first: a retry that dies partway leaves no review open, and the
