@@ -38,8 +38,10 @@ import {
   expandInbox,
   inboxPrefix,
   isStandalone,
+  loadPeer,
   matchesInboxPrefix,
   peerConfigPath,
+  peerFileName,
   readConfig,
   redactionModeConfigValue,
   remoteBranchName,
@@ -52,6 +54,7 @@ import {
   type Review,
   type ReviewRecord,
   createReview,
+  isOpen,
   launchReviewer,
   markPublished,
   markPublishing,
@@ -117,6 +120,7 @@ export function syncProject(
   if (!options.remote && !hasAnyCommit(sidecarPath)) {
     throw new SidecarError(`local sync requires an initialized sidecar checkout at ${sidecarPath}; run \`sidecar sync\` first`);
   }
+  bindReviewPolicy(sidecarPath, config);
   const inbox = expandInbox(config, sidecarPath);
   ensureCommitIdentity(sidecarPath);
   ensureRedactionFilter(sidecarPath, config.redaction, config);
@@ -295,7 +299,6 @@ function publicRef(branch: string): string {
   return `${PUBLIC_REFS}${branch}`;
 }
 
-/** The remote's tip of `branch` as last fetched, if it has one. */
 /**
  * Brings the public refs current for a caller outside the publish path —
  * refresh, deciding what deleting a checkout would lose.
@@ -304,6 +307,7 @@ export function refreshPublicRefs(repo: string): void {
   withPublicGit(repo, () => fetchPublic(repo));
 }
 
+/** The remote's tip of `branch` as last fetched, if it has one. */
 function publicTip(repo: string, branch: string): string | undefined {
   return git(repo, ["rev-parse", "--verify", "--quiet", publicRef(branch)], { check: false }).stdout.trim() || undefined;
 }
@@ -332,7 +336,7 @@ function publishReviewed(
     if (open?.state === "approved") publishApprovedReview(sidecarPath, config, inbox, open);
   });
   stage("merge");
-  mergePublishedInboxes(sidecarPath, config, { forkFiles: true });
+  withPublicGit(sidecarPath, () => mergeFetchedInboxes(sidecarPath, config, { forkFiles: true }));
   // Takes the remote's new main into local main, and this checkout's latest
   // snapshot with it, so the review below sees the whole family.
   stage("merge-local");
@@ -358,19 +362,23 @@ function gateUnpublished(root: string, sidecarPath: string, config: SidecarConfi
   const head = git(sidecarPath, ["rev-parse", `refs/heads/${config.branch}`]).stdout.trim();
   const headTree = treeOf(sidecarPath, head);
   const publicMain = publicTip(sidecarPath, config.branch);
-  const base = publicMain ? git(sidecarPath, ["merge-base", head, publicMain], { check: false }).stdout.trim() || undefined : undefined;
+  // ensureMainBranch joins local main to the remote's, so this always finds
+  // one. Failing that, nothing here has a public base to publish onto.
+  const base = publicMain && git(sidecarPath, ["merge-base", head, publicMain], { check: false }).stdout.trim();
+  if (!base) throw new SidecarError(`local ${config.branch} shares no history with the remote's; nothing is reviewed or published until it does`);
   const open = openReview(sidecarPath);
   const hasReviewer = Boolean(readSettings().reviewer);
 
-  if (base && treeOf(sidecarPath, base) === headTree) {
+  if (treeOf(sidecarPath, base) === headTree) {
     // Whatever an undecided review was waiting to publish is gone or already
     // public. An approval still publishes: it was given, and its tree is safe.
     if (open && open.state !== "approved") markSuperseded(open);
     return undefined;
   }
   if (open?.state === "pending" || open?.state === "approved") {
-    // A reviewer configured after the review opened takes it from here.
-    return { review: open, launch: open.state === "pending" && !open.run && hasReviewer };
+    // Each review launches its reviewer once. One configured after the review
+    // opened takes it from here.
+    return { review: open, launch: open.state === "pending" && !open.record.launchedAt && hasReviewer };
   }
   if (open) {
     // Rejected or failed: it holds until the content changes, and the change
@@ -389,20 +397,29 @@ function gateUnpublished(root: string, sidecarPath: string, config: SidecarConfi
  */
 function publishApprovedReview(sidecarPath: string, config: SidecarConfig, inbox: string, review: Review): void {
   const { record } = review;
-  // The base becomes the publish commit's parent, so it must already be on
-  // the remote: anything else would push its history along with it.
-  if (!record.publishing && record.base && !isPublic(sidecarPath, record.base)) {
-    markSuperseded(review);
-    console.log(`review ${paint("brand", record.id)} was measured from a commit the remote does not have; reviewing again`);
-    return;
-  }
-  assertPublishDestination(sidecarPath);
   // A sync that recorded its commit and then died — in this checkout or a
   // sibling — left the one commit this review may publish. Push that again,
   // to the inbox it was cut for, rather than cutting a second one.
   const target = record.publishing ?? { inbox, commit: cutPublishCommit(sidecarPath, config, inbox, record) };
-  if (!record.publishing) markPublishing(review, target.inbox, target.commit);
-  if (!isAncestor(sidecarPath, target.commit, publicRef(target.inbox))) {
+  const protectRef = publishingRef(record.id);
+  if (!isPublic(sidecarPath, target.commit)) {
+    // The commit's parents must already be on the remote: anything else would
+    // push their history along with it. A remote rewritten since the commit
+    // was cut can drop one, so this holds for a resumed publish too.
+    const parents = git(sidecarPath, ["rev-list", "--parents", "-n", "1", target.commit]).stdout.trim().split(" ").slice(1);
+    if (!parents.every((parent) => isPublic(sidecarPath, parent))) {
+      markSuperseded(review);
+      git(sidecarPath, ["update-ref", "-d", protectRef], { check: false });
+      console.log(`review ${paint("brand", record.id)} was measured from a commit the remote does not have; reviewing again`);
+      return;
+    }
+    assertPublishDestination(sidecarPath);
+    if (!record.publishing) {
+      // Reachable from a ref before it is recorded, so gc cannot prune the
+      // one commit a resumed publish would push.
+      git(sidecarPath, ["update-ref", protectRef, target.commit]);
+      markPublishing(review, target.inbox, target.commit);
+    }
     // Never forced: the family is the inbox's only writer, so a rejection
     // means something is wrong, and overwriting would hide it.
     const push = git(sidecarPath, ["push", "--no-follow-tags", "origin", `${target.commit}:refs/heads/${target.inbox}`], { check: false });
@@ -414,6 +431,33 @@ function publishApprovedReview(sidecarPath: string, config: SidecarConfig, inbox
   }
   linkPublished(sidecarPath, config, review, target.commit);
   markPublished(review, target.commit);
+  git(sidecarPath, ["update-ref", "-d", protectRef], { check: false });
+}
+
+/** Keeps a review's prepared publish commit reachable until it is published or retired. Never pushed or fetched. */
+function publishingRef(id: string): string {
+  return `refs/sidecar-publishing/${id}`;
+}
+
+/**
+ * Retires a review and opens a new one of the same change, with its own
+ * reviewer launch. The retired review is closed, so its reviewer — still
+ * running, perhaps — can no longer decide anything. Call under the peer's
+ * sync lock.
+ */
+export function retryReview(review: Review): Review {
+  const { record } = review;
+  if (!isOpen(review)) throw new SidecarError(`review ${record.id} is already ${review.state}`);
+  if (record.publishing) throw new SidecarError(`review ${record.id} is already being published`);
+  const config = loadPeer(record.root, record.peer).config;
+  const sidecarPath = requireSidecarCheckout(record.root, config);
+  // Retired first: a retry that dies partway leaves no review open, and the
+  // next sync opens one of whatever local main holds — never two.
+  markSuperseded(review);
+  const fresh = withPublicGit(sidecarPath, () =>
+    createReview({ root: record.root, config, sidecarPath, base: record.base, head: record.head }));
+  launchReviewer(fresh);
+  return fresh;
 }
 
 /**
@@ -425,10 +469,7 @@ function publishApprovedReview(sidecarPath: string, config: SidecarConfig, inbox
  */
 function cutPublishCommit(sidecarPath: string, config: SidecarConfig, inbox: string, record: ReviewRecord): string {
   const previous = publicTip(sidecarPath, inbox);
-  const parents = [
-    ...(record.base ? [record.base] : []),
-    ...(previous && !(record.base && isAncestor(sidecarPath, previous, record.base)) ? [previous] : []),
-  ];
+  const parents = [record.base, ...(previous && !isAncestor(sidecarPath, previous, record.base) ? [previous] : [])];
   const body = [
     "sidecar publish",
     "",
@@ -491,9 +532,7 @@ function linkPublished(sidecarPath: string, config: SidecarConfig, review: Revie
   }
   withScratchWorktree(sidecarPath, config, "HEAD", (worktree) => {
     git(worktree, ["switch", config.branch]);
-    // Unrelated when the review measured from nothing: the published commit
-    // is then a root of its own, and local main still holds its state.
-    git(worktree, ["merge", "--no-ff", "--allow-unrelated-histories", "-s", "ours", "-m", `sidecar: link published review ${review.record.id}`, published]);
+    git(worktree, ["merge", "--no-ff", "-s", "ours", "-m", `sidecar: link published review ${review.record.id}`, published]);
   });
 }
 
@@ -506,46 +545,51 @@ function linkPublished(sidecarPath: string, config: SidecarConfig, review: Revie
 export function mergePublishedInboxes(sidecarPath: string, config: SidecarConfig, options: { forkFiles: boolean }): number {
   return withPublicGit(sidecarPath, () => {
     fetchPublic(sidecarPath);
-    if (!publicTip(sidecarPath, config.branch)) return 0;
-    const publicMain = publicRef(config.branch);
-    if (publishedInboxBranches(sidecarPath, config).every((ref) => isAncestor(sidecarPath, ref, publicMain))) {
-      console.log("no published inbox branches to merge");
-      return 0;
-    }
-    assertPublishDestination(sidecarPath);
-    return withScratchWorktree(sidecarPath, config, publicMain, (worktree) => {
-      // Config can differ by worktree (includeIf gitdir), so check here too.
-      assertRedactionFilterIntact(worktree);
-      const maxAttempts = 3;
-      for (let attempt = 1; ; attempt += 1) {
-        if (attempt > 1) {
-          fetchPublic(sidecarPath);
-          git(worktree, ["reset", "--hard", publicMain]);
-        }
-        const pending = publishedInboxBranches(worktree, config).filter((ref) => !isAncestor(worktree, ref, "HEAD"));
-        if (!pending.length) {
-          console.log("no published inbox branches to merge");
-          return 0;
-        }
-        const merged: string[] = [];
-        for (const ref of pending) {
-          console.log(`merging ${paint("brand", remoteBranchName(ref))}`);
-          if (mergeInboxBranch(worktree, config, ref, options)) merged.push(ref);
-        }
-        const push = git(worktree, ["push", "--no-follow-tags", "origin", `HEAD:refs/heads/${config.branch}`], { check: false });
-        if (push.status !== 0) {
-          if (attempt >= maxAttempts) throw new SidecarError(push.stderr.trim() || `could not push ${config.branch}`);
-          console.log(`push of ${config.branch} was rejected; refetching and retrying`);
-          continue;
-        }
-        // A push does not move the public refs, and the gate measures from
-        // them: without this, it would see what was just merged as unpublished.
+    return mergeFetchedInboxes(sidecarPath, config, options);
+  });
+}
+
+/** mergePublishedInboxes over the public refs as already fetched. Call inside withPublicGit. */
+function mergeFetchedInboxes(sidecarPath: string, config: SidecarConfig, options: { forkFiles: boolean }): number {
+  if (!publicTip(sidecarPath, config.branch)) return 0;
+  const publicMain = publicRef(config.branch);
+  if (publishedInboxBranches(sidecarPath, config).every((ref) => isAncestor(sidecarPath, ref, publicMain))) {
+    console.log("no published inbox branches to merge");
+    return 0;
+  }
+  assertPublishDestination(sidecarPath);
+  return withScratchWorktree(sidecarPath, config, publicMain, (worktree) => {
+    // Config can differ by worktree (includeIf gitdir), so check here too.
+    assertRedactionFilterIntact(worktree);
+    const maxAttempts = 3;
+    for (let attempt = 1; ; attempt += 1) {
+      if (attempt > 1) {
         fetchPublic(sidecarPath);
-        console.log(`pushed ${config.branch}`);
-        console.log(`merged ${merged.length} inbox branch(es)`);
-        return merged.length;
+        git(worktree, ["reset", "--hard", publicMain]);
       }
-    });
+      const pending = publishedInboxBranches(worktree, config).filter((ref) => !isAncestor(worktree, ref, "HEAD"));
+      if (!pending.length) {
+        console.log("no published inbox branches to merge");
+        return 0;
+      }
+      const merged: string[] = [];
+      for (const ref of pending) {
+        console.log(`merging ${paint("brand", remoteBranchName(ref))}`);
+        if (mergeInboxBranch(worktree, config, ref, options)) merged.push(ref);
+      }
+      const push = git(worktree, ["push", "--no-follow-tags", "origin", `HEAD:refs/heads/${config.branch}`], { check: false });
+      if (push.status !== 0) {
+        if (attempt >= maxAttempts) throw new SidecarError(push.stderr.trim() || `could not push ${config.branch}`);
+        console.log(`push of ${config.branch} was rejected; refetching and retrying`);
+        continue;
+      }
+      // A push does not move the public refs, and the gate measures from
+      // them: without this, it would see what was just merged as unpublished.
+      fetchPublic(sidecarPath);
+      console.log(`pushed ${config.branch}`);
+      console.log(`merged ${merged.length} inbox branch(es)`);
+      return merged.length;
+    }
   });
 }
 
@@ -590,7 +634,8 @@ export function settleCheckouts(
     } catch (error) {
       logSidecarEvent("settle-skip", {
         sidecarPath: sibling,
-        message: error instanceof Error ? error.message : String(error),
+        // Git's message can quote a path nobody has reviewed yet.
+        ...(reviewRequired(config) ? {} : { message: error instanceof Error ? error.message : String(error) }),
       });
     }
   }
@@ -675,14 +720,24 @@ export function reportSyncHealth(root: string, config: SidecarConfig, outcome: H
     logSidecarEvent("failure", {
       command: "health",
       root,
-      message: `could not publish health: ${error instanceof Error ? error.message : String(error)}`,
+      message: reviewRequired(config)
+        ? "could not publish health"
+        : `could not publish health: ${error instanceof Error ? error.message : String(error)}`,
     });
   }
 }
 
 function publishHealth(root: string, config: SidecarConfig, sidecarPath: string, outcome: HealthOutcome): void {
   const branch = healthBranchFor(sidecarPath);
-  const previous = readHealthRecordAt(sidecarPath, `origin/${branch}`);
+  const gated = reviewRequired(config);
+  // A gated peer reads the remote's own record, as fetchPublic saw it. A
+  // completed sync fetched after its last push; a failed one may not have
+  // fetched at all, so it does here — and when it cannot, the push below
+  // most likely cannot either.
+  if (gated && outcome.status === "failed") {
+    try { fetchPublic(sidecarPath); } catch { /* offline: as last fetched */ }
+  }
+  const previous = readHealthRecordAt(sidecarPath, gated ? publicRef(branch) : `origin/${branch}`);
   const identity: HealthIdentity = {
     machine: currentMachine(),
     root,
@@ -692,7 +747,7 @@ function publishHealth(root: string, config: SidecarConfig, sidecarPath: string,
   };
   const record = nextHealthRecord(previous, identity, outcome, nowIso());
   if (!shouldPublishHealth(previous, record)) return;
-  if (reviewRequired(config)) assertPublishDestination(sidecarPath);
+  if (gated) assertPublishDestination(sidecarPath);
   publishHealthRecord(sidecarPath, branch, record);
   logSidecarEvent("health", {
     branch,
@@ -1019,7 +1074,7 @@ export function familySidecarCheckout(root: string, config: SidecarConfig): stri
   } catch {
     return undefined;
   }
-  if (primaryConfig.remote !== config.remote) return undefined;
+  if (!sharesFamilyCheckout(primaryConfig, config)) return undefined;
 
   const primaryPath = resolveSidecarPath(primary, primaryConfig);
   if (path.resolve(primaryPath) === path.resolve(primary)) return undefined;
@@ -1076,10 +1131,42 @@ export function checkoutIsUnlinkedFromFamily(
   const primary = familyPrimaryRoot(root);
   if (!primary) return false;
   try {
-    const primaryConfig = readConfig(peerConfigPath(primary, config.peer));
-    return primaryConfig.remote === config.remote;
+    return sharesFamilyCheckout(readConfig(peerConfigPath(primary, config.peer)), config);
   } catch {
     return false;
+  }
+}
+
+/**
+ * Whether a working copy may share the family primary's checkout. A shared
+ * store's local history is every sharer's to publish, so a peer that requires
+ * review never shares one with a peer that does not: see bindReviewPolicy.
+ */
+function sharesFamilyCheckout(primaryConfig: SidecarConfig, config: SidecarConfig): boolean {
+  return primaryConfig.remote === config.remote && reviewRequired(primaryConfig) === reviewRequired(config);
+}
+
+const REVIEW_POLICY_KEY = "sidecar.review";
+
+/**
+ * Binds a checkout's shared store to review, or refuses a peer that would
+ * publish it unreviewed. Sibling checkouts share one store, local inbox
+ * branches and local main included, and an ungated sync merges and pushes
+ * all of it — so once a gated peer has used a store, the store says so, and
+ * every peer that writes through it must be gated too. A family whose
+ * policies drift apart after linking fails closed here, on whichever side
+ * syncs first. Call before anything is snapshotted, merged, or pushed.
+ */
+export function bindReviewPolicy(sidecarPath: string, config: SidecarConfig): void {
+  const bound = git(sidecarPath, ["config", "--local", "--get", REVIEW_POLICY_KEY], { check: false }).stdout.trim();
+  if (reviewRequired(config)) {
+    if (bound !== "required") git(sidecarPath, ["config", "--local", REVIEW_POLICY_KEY, "required"]);
+    return;
+  }
+  if (bound === "required") {
+    throw new SidecarError(
+      `${sidecarPath} holds work from a peer that requires review, and this peer would publish it unreviewed; set review = "required" in this repo's ${peerFileName(config.peer)} too — or, to publish that work without review, \`git -C ${sidecarPath} config --unset ${REVIEW_POLICY_KEY}\``,
+    );
   }
 }
 
@@ -1137,6 +1224,7 @@ export function cloneOrUpdate(
 
   ensureCommitIdentity(sidecarPath);
   ensureRedactionFilter(sidecarPath, config.redaction, config);
+  bindReviewPolicy(sidecarPath, config);
   if (bootstrapMain) bootstrapMainBranch(sidecarPath, config);
 
   const inbox = expandInbox(config, sidecarPath);
@@ -1250,6 +1338,15 @@ export function ensureMainBranch(repo: string, config: SidecarConfig): void {
   // (see linkPublished). Resetting it would discard those links, so it takes
   // the remote's side in as a merge instead.
   if (reviewRequired(config)) {
+    if (git(repo, ["merge-base", "HEAD", remoteBranch], { check: false }).status !== 0) {
+      // The remote's main was started over. Join it the way bootstrap does: a
+      // commit of local main's own tree, so nothing local is lost and the
+      // next review measures everything here from the new public base.
+      const link = git(repo, ["commit-tree", treeOf(repo, "HEAD"), "-p", "HEAD", "-p", remoteBranch, "-m", `sidecar: link the remote's new ${config.branch}`]).stdout.trim();
+      git(repo, ["merge", "--ff-only", link]);
+      console.log(`${remoteBranch} was started over; local ${config.branch} is joined to it and reviewed from there`);
+      return;
+    }
     mergeInboxBranch(repo, config, remoteBranch, { forkFiles: true });
     return;
   }

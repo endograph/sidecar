@@ -13,19 +13,19 @@
 //
 // A review's files each have one writer. The sync and the decision commands
 // write under the peer's sync lock, so a verdict can never change while a sync
-// is acting on it; a runner writes only the file for its own attempt, so a
-// superseded runner can never overwrite the current one:
-//   review.json           the sync: opened, publishing, published, superseded
-//   verdict.json          `sidecar review approve|reject`
-//   attempt               whoever launches a runner: the current attempt's id
-//   run-<attempt>.json    that attempt's runner, around the reviewer command
+// is acting on it. A review launches its reviewer at most once; a retry opens
+// a new review, so a reviewer that outlives its review can only ever decide
+// one that is closed:
+//   review.json   the sync: opened, launched, publishing, published, superseded
+//   verdict.json  `sidecar review approve|reject`
+//   run.json      the runner, around the reviewer command
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
 import { SidecarError, nowIso, realpathOr } from "./util.js";
-import { emptyTree, git, gitBytes, gitCommonDir, treeOf } from "./git.js";
+import { git, gitBytes, gitCommonDir, treeOf } from "./git.js";
 import { GLOBAL_EXEC_ENV, SKIP_LOCAL_EXEC_ENV, sidecarCliPath } from "./install.js";
 import {
   DEFAULT_PEER,
@@ -33,6 +33,7 @@ import {
   PEER_ENV,
   SOFT_SYNC_ENV,
   type SidecarConfig,
+  keepFailuresPrivate,
   peerConfigPath,
   reviewTimeoutSeconds,
 } from "./config.js";
@@ -42,8 +43,10 @@ import { redactText } from "./redaction.js";
 const REVIEW_SCHEMA = 1;
 /** Closed reviews kept per family, newest first; older packets are deleted. */
 const KEEP_CLOSED_REVIEWS = 10;
-/** Review and attempt ids: generated hex, so never a path outside the reviews dir. */
+/** Review ids: generated hex, so never a path outside the reviews dir. */
 const ID_PATTERN = /^[0-9a-f]+$/;
+/** How long a launched runner has to record itself before the review counts as failed. */
+const LAUNCH_GRACE_SECONDS = 60;
 
 function newId(): string {
   return crypto.randomBytes(4).toString("hex");
@@ -69,10 +72,10 @@ export type ReviewRecord = {
   peer: string;
   /**
    * The public commit the diff is measured from — the newest remote main
-   * commit the reviewed head contains. Absent when the head shares no history
-   * with the remote, in which case the diff is against the empty tree.
+   * commit the reviewed head contains. Always present: a gated peer's local
+   * main is joined to the remote's main before anything is reviewed.
    */
-  base?: string;
+  base: string;
   /** Local main when the review opened. */
   head: string;
   /** The tree an approval publishes: the head's, pinned at review time. */
@@ -80,6 +83,8 @@ export type ReviewRecord = {
   files: ReviewFile[];
   createdAt: string;
   timeoutSeconds: number;
+  /** When the sync started this review's one runner. */
+  launchedAt?: string;
   /**
    * The commit this review publishes and where, recorded before the push so a
    * sync that dies mid-publish — or a sibling resuming after it — pushes that
@@ -94,7 +99,6 @@ export type ReviewRecord = {
 export type ReviewVerdict = { verdict: "approved" | "rejected"; reason?: string; decidedAt: string };
 
 type ReviewRun = {
-  attempt: string;
   pid: number;
   command: string;
   startedAt: string;
@@ -148,27 +152,19 @@ function readJson<T>(filePath: string): T | undefined {
 }
 
 export function readReview(id: string): Review | undefined {
+  // A packet holds unreviewed content, so any failure near one is private.
+  keepFailuresPrivate();
   if (!ID_PATTERN.test(id)) return undefined;
   const dir = reviewDir(id);
   const record = readJson<ReviewRecord>(path.join(dir, "review.json"));
   if (!record || record.id !== id) return undefined;
   const verdict = readJson<ReviewVerdict>(path.join(dir, "verdict.json"));
-  const attempt = currentAttempt(dir);
-  const run = attempt ? readJson<ReviewRun>(runPath(dir, attempt)) : undefined;
+  const run = readJson<ReviewRun>(runPath(dir));
   return { record, verdict, run, state: reviewState(record, verdict, run), dir };
 }
 
-function currentAttempt(dir: string): string | undefined {
-  try {
-    const attempt = fs.readFileSync(path.join(dir, "attempt"), "utf8").trim();
-    return ID_PATTERN.test(attempt) ? attempt : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function runPath(dir: string, attempt: string): string {
-  return path.join(dir, `run-${attempt}.json`);
+function runPath(dir: string): string {
+  return path.join(dir, "run.json");
 }
 
 /** The key a checkout's reviews are filed under: its family's shared git dir. */
@@ -221,8 +217,10 @@ function reviewState(record: ReviewRecord, verdict?: ReviewVerdict, run?: Review
   if (verdict) return verdict.verdict;
   if (run?.finishedAt && run.exitCode !== 0) return "failed";
   // A runner that died without finishing never recorded an exit; it is as
-  // failed as one that exited nonzero.
+  // failed as one that exited nonzero. So is one that never started: the
+  // review launches only once, so nothing else will.
   if (run && !run.finishedAt && !pidAlive(run.pid)) return "failed";
+  if (!run && record.launchedAt && (Date.now() - Date.parse(record.launchedAt)) / 1000 > LAUNCH_GRACE_SECONDS) return "failed";
   return "pending";
 }
 
@@ -246,13 +244,14 @@ export function reviewAttention(review: Review, now = Date.now()): string | unde
   if (review.state === "rejected") return "rejected";
   if (review.state === "failed") {
     const run = review.run;
-    if (run?.finishedAt) {
+    if (!run) return "reviewer never started";
+    if (run.finishedAt) {
       return run.signal ? `reviewer stopped by ${run.signal} without a verdict` : `reviewer exited ${run.exitCode} without a verdict`;
     }
     return "reviewer stopped without a verdict";
   }
   if (review.state !== "pending") return undefined;
-  if (!review.run && !readSettings().reviewer) return "no reviewer is configured on this machine";
+  if (!review.record.launchedAt && !readSettings().reviewer) return "no reviewer is configured on this machine";
   const age = (now - Date.parse(review.record.createdAt)) / 1000;
   if (age > review.record.timeoutSeconds) return `undecided for over ${formatDuration(review.record.timeoutSeconds)}`;
   return undefined;
@@ -302,7 +301,7 @@ const PACKET_DIFF_OPTIONS = ["-r", "--no-renames", "--ignore-submodules=none"];
  * blobs, so already redacted), the changed paths, the repo's guidelines, and
  * instructions that say how to decide.
  */
-export function createReview(options: { root: string; config: SidecarConfig; sidecarPath: string; base?: string; head: string }): Review {
+export function createReview(options: { root: string; config: SidecarConfig; sidecarPath: string; base: string; head: string }): Review {
   const { root, config, sidecarPath, base, head } = options;
   const guidelines = readGuidelines(root, config.peer);
   const id = newId();
@@ -310,12 +309,11 @@ export function createReview(options: { root: string; config: SidecarConfig; sid
   fs.mkdirSync(reviewsDir(), { recursive: true, mode: 0o700 });
   fs.mkdirSync(dir, { mode: 0o700 });
 
-  const from = base ?? emptyTree(sidecarPath);
-  const fields = git(sidecarPath, ["diff-tree", ...PACKET_DIFF_OPTIONS, "--name-status", "-z", from, head]).stdout.split("\0").filter(Boolean);
+  const fields = git(sidecarPath, ["diff-tree", ...PACKET_DIFF_OPTIONS, "--name-status", "-z", base, head]).stdout.split("\0").filter(Boolean);
   const files: ReviewFile[] = [];
   for (let index = 0; index + 1 < fields.length; index += 2) files.push({ status: fields[index], path: fields[index + 1] });
-  writeOpaqueArtifacts(sidecarPath, dir, from, head, files);
-  const diff = git(sidecarPath, ["diff-tree", ...PACKET_DIFF_OPTIONS, "-p", "--no-color", "--no-ext-diff", "--no-textconv", from, head]).stdout;
+  writeOpaqueArtifacts(sidecarPath, dir, base, head, files);
+  const diff = git(sidecarPath, ["diff-tree", ...PACKET_DIFF_OPTIONS, "-p", "--no-color", "--no-ext-diff", "--no-textconv", base, head]).stdout;
 
   const record: ReviewRecord = {
     schema: REVIEW_SCHEMA,
@@ -323,7 +321,7 @@ export function createReview(options: { root: string; config: SidecarConfig; sid
     family: reviewFamily(sidecarPath),
     root,
     peer: config.peer,
-    ...(base ? { base } : {}),
+    base,
     head,
     tree: treeOf(sidecarPath, head),
     files,
@@ -495,15 +493,12 @@ export function configuredReviewer(): string {
 /**
  * Starts the runner for a review in the background and returns at once. A
  * review takes minutes; the sync that opened it holds the sync lock and must
- * not wait for one.
+ * not wait for one. Call under that lock: the launch is recorded first, so no
+ * later sync launches a second runner for the same review.
  */
 export function launchReviewer(review: Review): void {
-  // A fresh attempt id retires whatever runner came before: it can still
-  // finish, but its record is no longer the one this review reads.
-  const attempt = newId();
-  writePrivateFile(path.join(review.dir, "attempt"), `${attempt}\n`);
-  review.run = undefined;
-  const child = spawn(process.execPath, [sidecarCliPath(), "review", "run", review.record.id, attempt], {
+  updateRecord(review, { launchedAt: nowIso() });
+  const child = spawn(process.execPath, [sidecarCliPath(), "review", "run", review.record.id], {
     cwd: review.dir,
     detached: true,
     stdio: "ignore",
@@ -511,7 +506,7 @@ export function launchReviewer(review: Review): void {
     env: { ...process.env, [SKIP_LOCAL_EXEC_ENV]: "1" },
   });
   child.unref();
-  logSidecarEvent("review-launch", { id: review.record.id, attempt });
+  logSidecarEvent("review-launch", { id: review.record.id });
 }
 
 /**
@@ -521,16 +516,15 @@ export function launchReviewer(review: Review): void {
  * A zero exit without a verdict is a review still in progress somewhere else;
  * a nonzero one is a reviewer that broke.
  */
-export function runReviewer(idOrPrefix: string, attempt: string): number {
+export function runReviewer(idOrPrefix: string): number {
   const review = findReview(idOrPrefix);
   const { id } = review.record;
   assertOpen(review);
-  // Launched, then superseded by a retry before it got going.
-  if (currentAttempt(review.dir) !== attempt) return 0;
+  if (review.run) throw new SidecarError(`review ${id}'s reviewer already ran; \`sidecar review retry ${id}\` opens a new review of the same change`);
   const command = configuredReviewer();
 
-  const file = runPath(review.dir, attempt);
-  const run: ReviewRun = { attempt, pid: process.pid, command, startedAt: nowIso() };
+  const file = runPath(review.dir);
+  const run: ReviewRun = { pid: process.pid, command, startedAt: nowIso() };
   writePrivateJson(file, run);
   const log = fs.openSync(path.join(review.dir, "reviewer.log"), "a", 0o600);
   let result;
@@ -545,7 +539,7 @@ export function runReviewer(idOrPrefix: string, attempt: string): number {
   }
   const finished: ReviewRun = { ...run, finishedAt: nowIso(), exitCode: result.status, signal: result.signal };
   writePrivateJson(file, finished);
-  logSidecarEvent("review-run", { id, attempt, exitCode: result.status, signal: result.signal });
+  logSidecarEvent("review-run", { id, exitCode: result.status, signal: result.signal });
   return 0;
 }
 
@@ -587,13 +581,3 @@ export function decideReview(review: Review, verdict: ReviewVerdict["verdict"], 
   logSidecarEvent("review-decision", { id: review.record.id, verdict });
 }
 
-/** Clears a review's verdict and run so its reviewer can take it again. */
-export function resetReview(review: Review): void {
-  assertOpen(review);
-  if (review.record.publishing) throw new SidecarError(`review ${review.record.id} is already being published`);
-  fs.rmSync(path.join(review.dir, "verdict.json"), { force: true });
-  fs.rmSync(path.join(review.dir, "attempt"), { force: true });
-  review.verdict = undefined;
-  review.run = undefined;
-  review.state = "pending";
-}

@@ -67,11 +67,22 @@ automatically by `export *`.
   `syncBranchBeforePush`/`pushBranch` or push local main. Reviews are per repo
   family and cover local main, which a gated peer never resets (each publish
   is joined to it by a link merge — dropping links brings back spurious
-  forks). The reviewer command is machine-local (`settings.json`), never read
-  from committed config. Review reasons stay out of logs and heartbeats, and
-  so do a gated peer's git failure messages (they quote unreviewed paths).
-  Verdicts change only under the peer's sync lock; runners write only their
-  own attempt's file. Anything a publish commit carries beyond the reviewed
+  forks; a remote main that was started over is joined by a link commit too).
+  Every sharer of a store must be gated: `bindReviewPolicy` marks the store
+  before anything is snapshotted or merged and refuses an ungated peer, and
+  families never link across review modes. Every review has a public base,
+  and every parent of a publish commit must be public when it is pushed,
+  resumed publishes included; a prepared commit stays reachable under
+  `refs/sidecar-publishing/<id>`. The reviewer command is machine-local
+  (`settings.json`), never read from committed config. Review reasons stay
+  out of logs and heartbeats, and so do a gated peer's git failure messages
+  (they quote unreviewed paths): once a process has touched a gated (or
+  unreadable) config or a review packet (`privateFailures`), cli.ts logs its
+  failures without a message, the heartbeat carries the stage only, and the
+  daemon logs a gated peer's exit status, never its output. The terminal
+  still shows the details. Verdicts change only under the peer's sync lock. A review launches
+  its reviewer once; retry opens a new review, so a stale reviewer can only
+  decide a closed one. Anything a publish commit carries beyond the reviewed
   tree is sidecar-generated, never copied from local commit messages.
 - **Public git.** Every git operation that builds or sends what a gated peer
   publishes — and every health heartbeat, including reading the previous one —

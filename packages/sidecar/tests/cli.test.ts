@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import {
   DEFAULT_INBOX,
+  bindReviewPolicy,
   checkoutRandom,
   ensureMainBranch,
   expandInbox,
@@ -915,6 +916,22 @@ describe.skipIf(process.env.SIDECAR_INTEGRATION !== "1")("main branch reconcilia
     expect(isAncestor(loser, "origin/sidecar-inbox/test/r1", "origin/main")).toBe(true);
   });
 
+  test("joins a gated main to a remote main that was started over, keeping every local file", () => {
+    const { winner, loser } = divergedClones();
+    git(winner, ["switch", "--orphan", "fresh"]);
+    git(winner, ["commit", "--allow-empty", "-m", "started over"]);
+    git(winner, ["push", "--force", "origin", "fresh:main"]);
+    const before = git(loser, ["rev-parse", "HEAD"]).stdout.trim();
+    const tree = git(loser, ["rev-parse", "HEAD^{tree}"]).stdout.trim();
+
+    fetch(loser, true);
+    ensureMainBranch(loser, { ...config, review: "required" });
+
+    expect(git(loser, ["rev-parse", "HEAD^{tree}"]).stdout.trim()).toBe(tree);
+    expect(isAncestor(loser, before, "HEAD")).toBe(true);
+    expect(isAncestor(loser, "origin/main", "HEAD")).toBe(true);
+  });
+
   // A pushes after B last fetched, so B's main and origin/main diverge —
   // the state a lost push race leaves behind.
   function divergedClones(): { winner: string; loser: string } {
@@ -942,6 +959,23 @@ describe.skipIf(process.env.SIDECAR_INTEGRATION !== "1")("main branch reconcilia
 
     return { winner, loser };
   }
+});
+
+describe.skipIf(process.env.SIDECAR_INTEGRATION !== "1")("shared review policy", () => {
+  const config: SidecarConfig = { peer: "default", remote: "x", version: 1, path: "sidecar", branch: "main", inbox: DEFAULT_INBOX, redaction: "none", resolve: "fork" };
+
+  test("a store a gated peer has used refuses an ungated one, from any of its worktrees", () => {
+    const repo = initRepo();
+    const sibling = path.join(tempDir(), "sibling");
+    git(repo, ["commit", "--allow-empty", "-m", "base"]);
+    git(repo, ["worktree", "add", "--detach", sibling]);
+
+    bindReviewPolicy(repo, config);
+    bindReviewPolicy(sibling, { ...config, review: "required" });
+    bindReviewPolicy(repo, { ...config, review: "required" });
+    expect(() => bindReviewPolicy(repo, config)).toThrow(/requires review/);
+    expect(() => bindReviewPolicy(sibling, config)).toThrow(/requires review/);
+  });
 });
 
 describe("daemon pid identification", () => {

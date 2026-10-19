@@ -381,20 +381,25 @@ function refreshPeer({ root, config, name }: Peer, parsed: ParsedOptions): void 
   let inbox: string | undefined;
   if (readable) {
     inbox = expandInbox(config, sidecarPath);
-    // origin/<inbox> is what decides how much is unpushed, so it has to be as
-    // current as the network allows before anything is counted against it. A
-    // stale one over-counts, which errs toward refusing.
-    fetch(sidecarPath, true, false);
-    // A gated checkout is measured against the public refs, which only
-    // sidecar's own fetch writes; offline, they stay as last fetched, which
-    // errs toward refusing.
+    // What is held is measured against the remote, so it has to be as current
+    // as the network allows; offline, it stays as last fetched, which errs
+    // toward refusing. A gated checkout is measured against the public refs,
+    // which only sidecar's own fetch writes; an ungated one against
+    // origin/<inbox>, which decides how much is unpushed.
     if (reviewRequired(config)) {
       try { refreshPublicRefs(sidecarPath); } catch { /* offline: last fetched */ }
+    } else {
+      fetch(sidecarPath, true, false);
     }
     const held = heldWork(sidecarPath, config, inbox);
     if (held.length && !force) {
+      // A gated checkout's work leaves only through an approved review, which
+      // syncing alone does not give.
+      const publish = reviewRequired(config)
+        ? "approve its review (`sidecar review`) and sync to publish them"
+        : "run `sidecar sync` to push them";
       throw new SidecarError(
-        `this checkout still holds ${held.join(" and ")}; run \`sidecar sync\` to push them, then refresh — or \`sidecar refresh --force\` to discard them`,
+        `this checkout still holds ${held.join(" and ")}; ${publish}, then refresh — or \`sidecar refresh --force\` to discard them`,
       );
     }
   }

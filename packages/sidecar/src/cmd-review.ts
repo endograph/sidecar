@@ -16,14 +16,13 @@ import {
   decideReview,
   findReview,
   isOpen,
-  launchReviewer,
   listReviews,
   openReview,
   readReview,
-  resetReview,
   reviewAttention,
   runReviewer,
 } from "./review.js";
+import { retryReview } from "./sync.js";
 import { syncPeer } from "./cmd-sync.js";
 import { announcePeer, formatRelativeTime, labelLine } from "./ui.js";
 
@@ -172,11 +171,10 @@ function retryCommand(args: string[]): number {
   if (parsed.positional.length > 1) throw new SidecarError(USAGE);
   configuredReviewer();
   const selected = selectReview(parsed.positional[0], selectedPeer(parsed));
-  withLockedReview(selected, (review) => {
-    resetReview(review);
-    launchReviewer(review);
-  });
-  console.log(`relaunched the reviewer for review ${paint("brand", selected.record.id)}`);
+  // A new review rather than the old one reopened: whatever the old review's
+  // reviewer still does, it can only decide a review that is closed.
+  const fresh = withLockedReview(selected, retryReview);
+  console.log(`retired review ${paint("brand", selected.record.id)}; review ${paint("brand", fresh.record.id)} covers the same change, and its reviewer is running`);
   return 0;
 }
 
@@ -186,31 +184,34 @@ function retryCommand(args: string[]): number {
  * one runs. A reviewer often decides while the sync that launched it still
  * holds that lock, so this waits for it.
  */
-function withLockedReview(selected: Review, fn: (review: Review) => void): void {
+function withLockedReview<T>(selected: Review, fn: (review: Review) => T): T {
   const { id, root, peer } = selected.record;
+  let result: T | undefined;
   withSyncLock(root, peer, "wait", () => {
     const review = readReview(id);
     if (!review) throw new SidecarError(`review ${id} is gone`);
-    fn(review);
+    result = fn(review);
   });
+  return result as T;
 }
 
 function reviewerCommand(args: string[]): number {
-  const parsed = parseOptions(args, { boolean: new Set(["--unset"]), value: new Set() });
   const settings = readSettings();
-  if (parsed.flags.has("--unset")) {
-    if (parsed.positional.length) throw new SidecarError("usage: sidecar review reviewer [<command>|--unset]");
+  if (!args.length) {
+    console.log(settings.reviewer ?? paint("quiet", "no reviewer configured"));
+    return 0;
+  }
+  if (args.length === 1 && args[0] === "--unset") {
     writeSettings({ ...settings, reviewer: undefined });
     console.log("reviewer unset; reviews now wait for `sidecar review approve`");
     return 0;
   }
-  if (!parsed.positional.length) {
-    console.log(settings.reviewer ?? paint("quiet", "no reviewer configured"));
-    return 0;
+  // The one argument is the whole shell command, quoted as the shell will
+  // run it. Rejoining several would lose their quoting.
+  if (args.length !== 1) {
+    throw new SidecarError("usage: sidecar review reviewer [\"<command>\"|--unset]; quote the command as one argument");
   }
-  // One argument is the whole shell command; several are joined, so
-  // `sidecar review reviewer claude-sidecar --fast` also works unquoted.
-  const command = parsed.positional.join(" ").trim();
+  const command = args[0].trim();
   if (!command) throw new SidecarError("the reviewer command is empty");
   writeSettings({ ...settings, reviewer: command });
   console.log(`reviewer set to ${paint("brand", command)}`);
@@ -218,8 +219,8 @@ function reviewerCommand(args: string[]): number {
 }
 
 function runCommand(args: string[]): number {
-  if (args.length !== 2) throw new SidecarError("usage: sidecar review run <id> <attempt>");
-  return runReviewer(args[0], args[1]);
+  if (args.length !== 1) throw new SidecarError("usage: sidecar review run <id>");
+  return runReviewer(args[0]);
 }
 
 /**

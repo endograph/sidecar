@@ -24,7 +24,7 @@ Or `sidecar init <remote> --review required [--review-timeout 30m]`.
 Then tell this machine who reviews:
 
 ```sh
-sidecar review reviewer "claude-sidecar"   # any shell command
+sidecar review reviewer "claude-sidecar"   # any shell command, quoted as one argument
 sidecar review reviewer                     # show it
 sidecar review reviewer --unset
 ```
@@ -95,7 +95,9 @@ The exit status says only whether the reviewer itself worked:
 - **Exit 0 without one:** the review moved somewhere else, such as a thread or
   a person. It stays open until someone runs `approve` or `reject`.
 - **Nonzero:** the reviewer broke. The review needs attention;
-  `sidecar review retry` runs it again.
+  `sidecar review retry` retires it and opens a new review of the same change
+  with a fresh run of the reviewer. A reviewer still working on the old review
+  can no longer decide it.
 
 That middle case is what makes discussion possible. A reviewer can open a
 thread in your agent tool with the packet, exit, and let the agent there
@@ -134,7 +136,7 @@ my-agent-tool new-thread --title "sidecar review $SIDECAR_REVIEW_ID" \
 A review needs attention when it:
 
 - was rejected
-- has a reviewer that failed or stopped without a verdict
+- has a reviewer that failed, never started, or stopped without a verdict
 - has no reviewer on this machine
 - has stayed undecided for longer than `review-timeout`
 
@@ -144,8 +146,9 @@ Attention changes nothing about what's published. It makes the hold visible:
 `publishing held, review needs attention` to every machine. The heartbeat
 carries the state only, never a rejection's reason: the reason describes what
 was sensitive. For the same reason a gated peer's failure heartbeat names the
-stage that failed but not git's message, which can quote unreviewed file names;
-the details stay in `sidecar tail` on that machine.
+stage that failed but not git's message, which can quote unreviewed file names.
+Nor does the log, the daemon's included: run the command by hand on that machine
+to see the details.
 
 ```sh
 sidecar review                   # this repo's reviews, newest first
@@ -165,12 +168,17 @@ Reviews belong to the repo family, not to one checkout. Linked checkouts of a
 repo share one clone and one local `main` (see
 [One machine, many working copies](sync.md#one-machine-many-working-copies)),
 so they share one review of what that `main` holds. A rejection holds every
-sibling, and two siblings never race the same content to the remote. One
+sibling, and two siblings never race the same content to the remote. So every
+working copy sharing that clone must require review: a working copy with review
+off gets its own clone, and one whose config changes after linking refuses to
+sync through the shared clone rather than publish what its siblings hold. One
 review is open at a time. Edits made while it's open wait for the next one,
 which covers everything after what was approved.
 
 When the remote has no `main` yet, it starts as an empty commit, never as the
 checkout's history or anything staged in it, and the first review covers
+everything the checkout holds. When the remote's `main` was started over, local
+`main` is joined to the new one the same way, and the next review again covers
 everything the checkout holds.
 
 Nothing else rides along. Everything sidecar publishes — review commits, the
@@ -214,9 +222,11 @@ changes no file and is never pushed.
 - **The reviewer sees the redacted diff, not your working tree.** That keeps
   caught secrets away from it. It also means what redaction rewrote shows up
   as placeholders.
-- **Turning review off publishes local history.** The next sync pushes the
-  inbox branch as an ungated peer does, including snapshots that review kept
-  local. Turning it off is a decision about everything still on this machine.
+- **Turning review off publishes local history.** A clone a gated peer has used
+  remembers it, and sync refuses until you confirm with
+  `git -C <checkout> config --unset sidecar.review`. The next sync then pushes
+  as an ungated peer does, including snapshots that review kept local. Turning
+  it off is a decision about everything still on this machine.
 - **Anything published earlier stays in the remote's history.** Review gates
   what's published from now on.
 - **In [standalone mode](standalone.md), every writer controls the policy**,

@@ -48,7 +48,9 @@ import {
   peerFileName,
   readConfig,
   resolveSidecarPath,
+  configText,
   durationConfigValue,
+  notePeerPolicy,
   redactionModeConfigValue,
   resolveModeConfigValue,
   reviewModeConfigValue,
@@ -288,25 +290,17 @@ export function cmdInit(args: string[]): number {
 function configurePeer(root: string, name: string, remote: string | undefined, parsed: ParsedOptions): Peer {
   const configPath = peerConfigPath(root, name);
   let reuse = !remote && fs.existsSync(configPath);
+  let built: SidecarConfig | undefined;
   if (remote && fs.existsSync(configPath)) {
     const existing = readConfig(configPath);
-    // Omitted flags fall back to the EXISTING values, not the defaults — a
-    // plain re-init must not read as a request to reset settings (a non-TTY
-    // re-init would fail, and a prompted "y" would silently flip redaction).
-    const unchanged =
-      existing.remote === remote &&
-      existing.path === getValue(parsed, "--path", existing.path) &&
-      existing.branch === getValue(parsed, "--branch", existing.branch) &&
-      existing.inbox === getValue(parsed, "--inbox", existing.inbox) &&
-      existing.redaction === getValue(parsed, "--redaction", existing.redaction) &&
-      existing.resolve === getValue(parsed, "--resolve", existing.resolve) &&
-      existing.debounce === durationConfigValue(parsed.values.get("--debounce") ?? existing.debounce, "--debounce") &&
-      existing.interval === durationConfigValue(parsed.values.get("--interval") ?? existing.interval, "--interval") &&
-      existing.review === getValue(parsed, "--review", existing.review ?? "off") &&
-      existing.reviewTimeout === durationConfigValue(parsed.values.get("--review-timeout") ?? existing.reviewTimeout, "--review-timeout");
-    reuse = unchanged || !promptOverwriteConfig(configPath, existing.remote, remote);
+    // Omitted flags keep the EXISTING values, not the defaults: a re-init
+    // changes only what it names. Anything else would silently flip
+    // redaction, or drop a review gate, on a prompted "y".
+    built = buildInitConfig(root, name, remote, parsed, existing);
+    reuse = configText(built) === configText(existing) || !promptOverwriteConfig(configPath, existing.remote, remote);
   }
-  const config = reuse ? readConfig(configPath) : buildInitConfig(root, name, remote, parsed);
+  const config = reuse ? readConfig(configPath) : built ?? buildInitConfig(root, name, remote, parsed);
+  notePeerPolicy(config);
   if (!reuse) {
     config.rulesPath = peerRulesPath(root, name);
     config.rules = readRules(config.rulesPath);
@@ -394,13 +388,19 @@ function initRoot(remote: string | undefined, parsed: ParsedOptions): string {
 // Question order matters: the checkout path decides whether this is a
 // standalone sidecar, and that in turn changes the default answer to both of
 // the questions after it.
-function buildInitConfig(root: string, name: string, remote: string | undefined, parsed: ParsedOptions): SidecarConfig {
+function buildInitConfig(
+  root: string,
+  name: string,
+  remote: string | undefined,
+  parsed: ParsedOptions,
+  existing?: SidecarConfig,
+): SidecarConfig {
   // A named peer's checkout is named after it by default: `--peer research`
   // lives in `research/`, beside the default peer's `sidecar/`.
   const defaultPath = name === DEFAULT_PEER ? DEFAULT_PATH : name;
   const rawPath = parsed.values.has("--path")
     ? getValue(parsed, "--path", defaultPath)
-    : promptSidecarPath(root, name, defaultPath);
+    : existing?.path ?? promptSidecarPath(root, name, defaultPath);
   // `--path $PWD` and `--path foo/..` mean the same thing as `--path .`;
   // store them as "." so standalone detection — a string check on the config
   // — can't be dodged by spelling the root differently and land the repo in
@@ -418,18 +418,18 @@ function buildInitConfig(root: string, name: string, remote: string | undefined,
     remote: remote ?? (standalone ? standaloneRemote(root) : promptRemote(root)),
     version: 1,
     path: sidecarPath,
-    branch: getValue(parsed, "--branch", DEFAULT_BRANCH),
-    inbox: getValue(parsed, "--inbox", DEFAULT_INBOX),
+    branch: getValue(parsed, "--branch", existing?.branch ?? DEFAULT_BRANCH),
+    inbox: getValue(parsed, "--inbox", existing?.inbox ?? DEFAULT_INBOX),
     redaction: parsed.values.has("--redaction")
       ? redactionModeConfigValue(getValue(parsed, "--redaction", DEFAULT_REDACTION_MODE), "--redaction")
-      : promptRedactionMode(),
+      : existing?.redaction ?? promptRedactionMode(),
     resolve: parsed.values.has("--resolve")
       ? resolveModeConfigValue(getValue(parsed, "--resolve", DEFAULT_RESOLVE), "--resolve")
-      : DEFAULT_RESOLVE,
-    debounce: durationConfigValue(parsed.values.get("--debounce"), "--debounce"),
-    interval: durationConfigValue(parsed.values.get("--interval"), "--interval"),
-    review: reviewModeConfigValue(getValue(parsed, "--review", "off"), "--review"),
-    reviewTimeout: durationConfigValue(parsed.values.get("--review-timeout"), "--review-timeout"),
+      : existing?.resolve ?? DEFAULT_RESOLVE,
+    debounce: durationConfigValue(parsed.values.get("--debounce"), "--debounce") ?? existing?.debounce,
+    interval: durationConfigValue(parsed.values.get("--interval"), "--interval") ?? existing?.interval,
+    review: reviewModeConfigValue(getValue(parsed, "--review", existing?.review ?? "off"), "--review"),
+    reviewTimeout: durationConfigValue(parsed.values.get("--review-timeout"), "--review-timeout") ?? existing?.reviewTimeout,
   };
 }
 

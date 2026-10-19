@@ -331,157 +331,6 @@ var init_install = __esm(() => {
   INSTALL_SOURCES = new Set(["npm", "bun", "curl"]);
 });
 
-// src/git.ts
-import fs3 from "node:fs";
-import path3 from "node:path";
-import { spawnSync as spawnSync2 } from "node:child_process";
-function git(repo, args, options = {}) {
-  return gitRaw(["-C", repo, ...args], options);
-}
-function gitBytes(repo, args, options = {}) {
-  const check = options.check ?? true;
-  const result = spawnSync2("git", ["-C", repo, ...args], {
-    encoding: "buffer",
-    maxBuffer: 100 * 1024 * 1024
-  });
-  const status = result.status ?? 1;
-  const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
-  const stderr = Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.from(result.stderr ?? "");
-  if (check && status !== 0) {
-    throw new SidecarError(stderr.toString("utf8").trim() || stdout.toString("utf8").trim());
-  }
-  return { status, stdout, stderr };
-}
-function gitRaw(args, options = {}) {
-  const check = options.check ?? true;
-  const result = spawnSync2("git", args, {
-    encoding: "utf8",
-    input: options.input,
-    maxBuffer: 100 * 1024 * 1024
-  });
-  const status = result.status ?? 1;
-  const stdout = result.stdout ?? "";
-  const stderr = result.stderr ?? "";
-  if (check && status !== 0) {
-    throw new SidecarError(stderr.trim() || stdout.trim());
-  }
-  return { status, stdout, stderr };
-}
-function fetch(repo, quiet, check = true) {
-  const args = ["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"];
-  if (quiet)
-    args.splice(1, 0, "--quiet");
-  git(repo, args, { check });
-}
-function hasAnyCommit(repo) {
-  return git(repo, ["rev-parse", "--verify", "HEAD"], { check: false }).status === 0;
-}
-function branchExists(repo, branch) {
-  return git(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { check: false }).status === 0;
-}
-function remoteRefExists(repo, branch) {
-  return git(repo, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`], {
-    check: false
-  }).status === 0;
-}
-function isAncestor(repo, maybeAncestor, descendant) {
-  return git(repo, ["merge-base", "--is-ancestor", maybeAncestor, descendant], { check: false }).status === 0;
-}
-function treeOf(repo, ref) {
-  return git(repo, ["rev-parse", `${ref}^{tree}`]).stdout.trim();
-}
-function emptyTree(repo) {
-  return git(repo, ["mktree"], { input: "" }).stdout.trim();
-}
-function gitToplevel(cwd) {
-  const root = gitToplevelOptional(cwd);
-  if (!root)
-    throw new SidecarError("not inside a Git repository");
-  return root;
-}
-function gitToplevelOptional(cwd) {
-  const result = gitRaw(["-C", cwd, "rev-parse", "--show-toplevel"], { check: false });
-  if (result.status !== 0)
-    return;
-  return result.stdout.trim();
-}
-function gitCommonDir(root) {
-  const commonDir = gitCommonDirOptional(root);
-  if (!commonDir)
-    throw new SidecarError("not inside a Git repository");
-  return commonDir;
-}
-function gitExcludePath(root) {
-  const commonDir = gitCommonDirOptional(root);
-  return commonDir ? path3.join(commonDir, "info", "exclude") : undefined;
-}
-function isGitIgnored(root, relativePath) {
-  return git(root, ["check-ignore", "-q", "--", relativePath], { check: false }).status === 0;
-}
-function isGitTracked(root, relativePath) {
-  return git(root, ["ls-files", "--error-unmatch", "--", relativePath], { check: false }).status === 0;
-}
-function gitCommonDirOptional(root) {
-  const result = gitRaw(["-C", root, "rev-parse", "--git-common-dir"], { check: false });
-  if (result.status !== 0)
-    return;
-  return path3.resolve(root, result.stdout.trim());
-}
-function gitDir(repo) {
-  const result = git(repo, ["rev-parse", "--git-dir"]).stdout.trim();
-  return path3.isAbsolute(result) ? result : path3.resolve(repo, result);
-}
-function hasGitMetadata(repo) {
-  return fs3.existsSync(path3.join(repo, ".git"));
-}
-function isDirty(repo) {
-  return Boolean(git(repo, ["status", "--porcelain"]).stdout.trim());
-}
-function ensureClean(repo) {
-  if (isDirty(repo))
-    throw new SidecarError("sidecar checkout has uncommitted changes");
-}
-function sidecarIdentity() {
-  return { name: currentUser(), email: `${slug(currentUser())}@${slug(currentHost())}.local` };
-}
-function ensureCommitIdentity(repo) {
-  const { name, email } = sidecarIdentity();
-  if (git(repo, ["config", "user.name"], { check: false }).status !== 0) {
-    git(repo, ["config", "user.name", name]);
-  }
-  if (git(repo, ["config", "user.email"], { check: false }).status !== 0) {
-    git(repo, ["config", "user.email", email]);
-  }
-}
-function familyPrimaryRoot(root) {
-  const primary = jjDefaultWorkspace(root) ?? gitMainWorktree(root);
-  if (!primary)
-    return;
-  return realpathOr(primary) === realpathOr(root) ? undefined : primary;
-}
-function jjDefaultWorkspace(root) {
-  const pointer = path3.join(root, ".jj", "repo");
-  try {
-    if (!fs3.statSync(pointer).isFile())
-      return;
-    const repo = path3.resolve(path3.dirname(pointer), fs3.readFileSync(pointer, "utf8").trim());
-    const workspace = path3.dirname(path3.dirname(repo));
-    return fs3.existsSync(path3.join(workspace, ".jj")) ? workspace : undefined;
-  } catch {
-    return;
-  }
-}
-function gitMainWorktree(root) {
-  const result = git(root, ["worktree", "list", "--porcelain"], { check: false });
-  if (result.status !== 0)
-    return;
-  const entry = result.stdout.split(/\r?\n/).find((line) => line.startsWith("worktree "));
-  return entry?.slice("worktree ".length).trim() || undefined;
-}
-var init_git = __esm(() => {
-  init_util();
-});
-
 // ../../node_modules/.bun/smol-toml@1.7.0/node_modules/smol-toml/dist/date.js
 var DATE_TIME_RE, TomlDate;
 var init_date = __esm(() => {
@@ -1443,6 +1292,157 @@ var init_dist = __esm(() => {
    * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
    * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
    */
+});
+
+// src/git.ts
+import fs3 from "node:fs";
+import path3 from "node:path";
+import { spawnSync as spawnSync2 } from "node:child_process";
+function git(repo, args, options = {}) {
+  return gitRaw(["-C", repo, ...args], options);
+}
+function gitBytes(repo, args, options = {}) {
+  const check = options.check ?? true;
+  const result = spawnSync2("git", ["-C", repo, ...args], {
+    encoding: "buffer",
+    maxBuffer: 100 * 1024 * 1024
+  });
+  const status = result.status ?? 1;
+  const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
+  const stderr = Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.from(result.stderr ?? "");
+  if (check && status !== 0) {
+    throw new SidecarError(stderr.toString("utf8").trim() || stdout.toString("utf8").trim());
+  }
+  return { status, stdout, stderr };
+}
+function gitRaw(args, options = {}) {
+  const check = options.check ?? true;
+  const result = spawnSync2("git", args, {
+    encoding: "utf8",
+    input: options.input,
+    maxBuffer: 100 * 1024 * 1024
+  });
+  const status = result.status ?? 1;
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  if (check && status !== 0) {
+    throw new SidecarError(stderr.trim() || stdout.trim());
+  }
+  return { status, stdout, stderr };
+}
+function fetch(repo, quiet, check = true) {
+  const args = ["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"];
+  if (quiet)
+    args.splice(1, 0, "--quiet");
+  git(repo, args, { check });
+}
+function hasAnyCommit(repo) {
+  return git(repo, ["rev-parse", "--verify", "HEAD"], { check: false }).status === 0;
+}
+function branchExists(repo, branch) {
+  return git(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { check: false }).status === 0;
+}
+function remoteRefExists(repo, branch) {
+  return git(repo, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`], {
+    check: false
+  }).status === 0;
+}
+function isAncestor(repo, maybeAncestor, descendant) {
+  return git(repo, ["merge-base", "--is-ancestor", maybeAncestor, descendant], { check: false }).status === 0;
+}
+function treeOf(repo, ref) {
+  return git(repo, ["rev-parse", `${ref}^{tree}`]).stdout.trim();
+}
+function emptyTree(repo) {
+  return git(repo, ["mktree"], { input: "" }).stdout.trim();
+}
+function gitToplevel(cwd) {
+  const root = gitToplevelOptional(cwd);
+  if (!root)
+    throw new SidecarError("not inside a Git repository");
+  return root;
+}
+function gitToplevelOptional(cwd) {
+  const result = gitRaw(["-C", cwd, "rev-parse", "--show-toplevel"], { check: false });
+  if (result.status !== 0)
+    return;
+  return result.stdout.trim();
+}
+function gitCommonDir(root) {
+  const commonDir = gitCommonDirOptional(root);
+  if (!commonDir)
+    throw new SidecarError("not inside a Git repository");
+  return commonDir;
+}
+function gitExcludePath(root) {
+  const commonDir = gitCommonDirOptional(root);
+  return commonDir ? path3.join(commonDir, "info", "exclude") : undefined;
+}
+function isGitIgnored(root, relativePath) {
+  return git(root, ["check-ignore", "-q", "--", relativePath], { check: false }).status === 0;
+}
+function isGitTracked(root, relativePath) {
+  return git(root, ["ls-files", "--error-unmatch", "--", relativePath], { check: false }).status === 0;
+}
+function gitCommonDirOptional(root) {
+  const result = gitRaw(["-C", root, "rev-parse", "--git-common-dir"], { check: false });
+  if (result.status !== 0)
+    return;
+  return path3.resolve(root, result.stdout.trim());
+}
+function gitDir(repo) {
+  const result = git(repo, ["rev-parse", "--git-dir"]).stdout.trim();
+  return path3.isAbsolute(result) ? result : path3.resolve(repo, result);
+}
+function hasGitMetadata(repo) {
+  return fs3.existsSync(path3.join(repo, ".git"));
+}
+function isDirty(repo) {
+  return Boolean(git(repo, ["status", "--porcelain"]).stdout.trim());
+}
+function ensureClean(repo) {
+  if (isDirty(repo))
+    throw new SidecarError("sidecar checkout has uncommitted changes");
+}
+function sidecarIdentity() {
+  return { name: currentUser(), email: `${slug(currentUser())}@${slug(currentHost())}.local` };
+}
+function ensureCommitIdentity(repo) {
+  const { name, email } = sidecarIdentity();
+  if (git(repo, ["config", "user.name"], { check: false }).status !== 0) {
+    git(repo, ["config", "user.name", name]);
+  }
+  if (git(repo, ["config", "user.email"], { check: false }).status !== 0) {
+    git(repo, ["config", "user.email", email]);
+  }
+}
+function familyPrimaryRoot(root) {
+  const primary = jjDefaultWorkspace(root) ?? gitMainWorktree(root);
+  if (!primary)
+    return;
+  return realpathOr(primary) === realpathOr(root) ? undefined : primary;
+}
+function jjDefaultWorkspace(root) {
+  const pointer = path3.join(root, ".jj", "repo");
+  try {
+    if (!fs3.statSync(pointer).isFile())
+      return;
+    const repo = path3.resolve(path3.dirname(pointer), fs3.readFileSync(pointer, "utf8").trim());
+    const workspace = path3.dirname(path3.dirname(repo));
+    return fs3.existsSync(path3.join(workspace, ".jj")) ? workspace : undefined;
+  } catch {
+    return;
+  }
+}
+function gitMainWorktree(root) {
+  const result = git(root, ["worktree", "list", "--porcelain"], { check: false });
+  if (result.status !== 0)
+    return;
+  const entry = result.stdout.split(/\r?\n/).find((line) => line.startsWith("worktree "));
+  return entry?.slice("worktree ".length).trim() || undefined;
+}
+var init_git = __esm(() => {
+  init_util();
 });
 
 // src/redaction.ts
@@ -3562,6 +3562,16 @@ function sameRemoteKey(remote) {
 function reviewRequired(config) {
   return config.review === "required";
 }
+function privateFailures() {
+  return failuresArePrivate;
+}
+function keepFailuresPrivate() {
+  failuresArePrivate = true;
+}
+function notePeerPolicy(config) {
+  if (reviewRequired(config))
+    keepFailuresPrivate();
+}
 function reviewTimeoutSeconds(config) {
   return config.reviewTimeout ?? DEFAULT_REVIEW_TIMEOUT_SECONDS;
 }
@@ -3583,7 +3593,11 @@ function findConfigRootOptional(start) {
   }
 }
 function writeConfig(configPath, config) {
-  const text = [
+  notePeerPolicy(config);
+  fs5.writeFileSync(configPath, configText(config), "utf8");
+}
+function configText(config) {
+  return [
     `version = ${config.version}`,
     `remote = ${JSON.stringify(config.remote)}`,
     `path = ${JSON.stringify(config.path)}`,
@@ -3598,7 +3612,6 @@ function writeConfig(configPath, config) {
     ""
   ].join(`
 `);
-  fs5.writeFileSync(configPath, text, "utf8");
 }
 function readConfig(configPath, options = {}) {
   let values;
@@ -3609,10 +3622,14 @@ function readConfig(configPath, options = {}) {
     }
     values = parsed;
   } catch (error) {
+    if (error.code !== "ENOENT")
+      keepFailuresPrivate();
     if (error instanceof SidecarError)
       throw error;
     throw new SidecarError(`${configPath} is not valid TOML: ${error instanceof Error ? error.message : String(error)}`);
   }
+  if (values.review !== undefined && values.review !== "off")
+    keepFailuresPrivate();
   const unknown = Object.keys(values).filter((key) => !CONFIG_KEYS.has(key));
   if (unknown.length) {
     throw new SidecarError(`${configPath}: unknown key${unknown.length > 1 ? "s" : ""} ${unknown.map((key) => JSON.stringify(key)).join(", ")}; this sidecar may be older than the config — update it with \`sidecar update\``);
@@ -3795,7 +3812,7 @@ function inboxBranchPrefix(template) {
   const slashIndex = staticPrefix.lastIndexOf("/");
   return slashIndex === -1 ? staticPrefix : staticPrefix.slice(0, slashIndex + 1);
 }
-var DEFAULT_PATH = "sidecar", DEFAULT_BRANCH = "main", DEFAULT_INBOX = "sidecar-inbox/{user}/{random}", branchValidity, DEFAULT_PEER = "default", PEER_ENV = "SIDECAR_PEER", SOFT_SYNC_ENV = "SIDECAR_SYNC_SOFT", LOCAL_SYNC_ENV = "SIDECAR_SYNC_LOCAL", PEER_NAME, RESERVED_PEER_SUFFIXES, RESOLVE_MODES, DEFAULT_RESOLVE = "fork", REVIEW_MODES, DEFAULT_REVIEW_TIMEOUT_SECONDS, CONFIG_VERSION = 1, CONFIG_KEYS, PUBLIC_REFS = "refs/sidecar-public/";
+var DEFAULT_PATH = "sidecar", DEFAULT_BRANCH = "main", DEFAULT_INBOX = "sidecar-inbox/{user}/{random}", branchValidity, DEFAULT_PEER = "default", PEER_ENV = "SIDECAR_PEER", SOFT_SYNC_ENV = "SIDECAR_SYNC_SOFT", LOCAL_SYNC_ENV = "SIDECAR_SYNC_LOCAL", PEER_NAME, RESERVED_PEER_SUFFIXES, RESOLVE_MODES, DEFAULT_RESOLVE = "fork", REVIEW_MODES, DEFAULT_REVIEW_TIMEOUT_SECONDS, CONFIG_VERSION = 1, CONFIG_KEYS, failuresArePrivate = false, PUBLIC_REFS = "refs/sidecar-public/";
 var init_config = __esm(() => {
   init_dist();
   init_util();
@@ -4528,6 +4545,7 @@ function readJson(filePath) {
   }
 }
 function readReview(id) {
+  keepFailuresPrivate();
   if (!ID_PATTERN.test(id))
     return;
   const dir = reviewDir(id);
@@ -4535,20 +4553,11 @@ function readReview(id) {
   if (!record || record.id !== id)
     return;
   const verdict = readJson(path8.join(dir, "verdict.json"));
-  const attempt = currentAttempt(dir);
-  const run = attempt ? readJson(runPath(dir, attempt)) : undefined;
+  const run = readJson(runPath(dir));
   return { record, verdict, run, state: reviewState(record, verdict, run), dir };
 }
-function currentAttempt(dir) {
-  try {
-    const attempt = fs8.readFileSync(path8.join(dir, "attempt"), "utf8").trim();
-    return ID_PATTERN.test(attempt) ? attempt : undefined;
-  } catch {
-    return;
-  }
-}
-function runPath(dir, attempt) {
-  return path8.join(dir, `run-${attempt}.json`);
+function runPath(dir) {
+  return path8.join(dir, "run.json");
 }
 function reviewFamily(sidecarPath) {
   return realpathOr(gitCommonDir(sidecarPath));
@@ -4595,6 +4604,8 @@ function reviewState(record, verdict, run) {
     return "failed";
   if (run && !run.finishedAt && !pidAlive(run.pid))
     return "failed";
+  if (!run && record.launchedAt && (Date.now() - Date.parse(record.launchedAt)) / 1000 > LAUNCH_GRACE_SECONDS)
+    return "failed";
   return "pending";
 }
 function pidAlive(pid) {
@@ -4612,14 +4623,16 @@ function reviewAttention(review, now = Date.now()) {
     return "rejected";
   if (review.state === "failed") {
     const run = review.run;
-    if (run?.finishedAt) {
+    if (!run)
+      return "reviewer never started";
+    if (run.finishedAt) {
       return run.signal ? `reviewer stopped by ${run.signal} without a verdict` : `reviewer exited ${run.exitCode} without a verdict`;
     }
     return "reviewer stopped without a verdict";
   }
   if (review.state !== "pending")
     return;
-  if (!review.run && !readSettings().reviewer)
+  if (!review.record.launchedAt && !readSettings().reviewer)
     return "no reviewer is configured on this machine";
   const age = (now - Date.parse(review.record.createdAt)) / 1000;
   if (age > review.record.timeoutSeconds)
@@ -4656,20 +4669,19 @@ function createReview(options) {
   const dir = reviewDir(id);
   fs8.mkdirSync(reviewsDir(), { recursive: true, mode: 448 });
   fs8.mkdirSync(dir, { mode: 448 });
-  const from = base ?? emptyTree(sidecarPath);
-  const fields = git(sidecarPath, ["diff-tree", ...PACKET_DIFF_OPTIONS, "--name-status", "-z", from, head]).stdout.split("\x00").filter(Boolean);
+  const fields = git(sidecarPath, ["diff-tree", ...PACKET_DIFF_OPTIONS, "--name-status", "-z", base, head]).stdout.split("\x00").filter(Boolean);
   const files = [];
   for (let index = 0;index + 1 < fields.length; index += 2)
     files.push({ status: fields[index], path: fields[index + 1] });
-  writeOpaqueArtifacts(sidecarPath, dir, from, head, files);
-  const diff = git(sidecarPath, ["diff-tree", ...PACKET_DIFF_OPTIONS, "-p", "--no-color", "--no-ext-diff", "--no-textconv", from, head]).stdout;
+  writeOpaqueArtifacts(sidecarPath, dir, base, head, files);
+  const diff = git(sidecarPath, ["diff-tree", ...PACKET_DIFF_OPTIONS, "-p", "--no-color", "--no-ext-diff", "--no-textconv", base, head]).stdout;
   const record = {
     schema: REVIEW_SCHEMA,
     id,
     family: reviewFamily(sidecarPath),
     root,
     peer: config.peer,
-    ...base ? { base } : {},
+    base,
     head,
     tree: treeOf(sidecarPath, head),
     files,
@@ -4807,28 +4819,25 @@ function configuredReviewer() {
   return command;
 }
 function launchReviewer(review) {
-  const attempt = newId();
-  writePrivateFile(path8.join(review.dir, "attempt"), `${attempt}
-`);
-  review.run = undefined;
-  const child = spawn2(process.execPath, [sidecarCliPath(), "review", "run", review.record.id, attempt], {
+  updateRecord(review, { launchedAt: nowIso() });
+  const child = spawn2(process.execPath, [sidecarCliPath(), "review", "run", review.record.id], {
     cwd: review.dir,
     detached: true,
     stdio: "ignore",
     env: { ...process.env, [SKIP_LOCAL_EXEC_ENV]: "1" }
   });
   child.unref();
-  logSidecarEvent("review-launch", { id: review.record.id, attempt });
+  logSidecarEvent("review-launch", { id: review.record.id });
 }
-function runReviewer(idOrPrefix, attempt) {
+function runReviewer(idOrPrefix) {
   const review = findReview(idOrPrefix);
   const { id } = review.record;
   assertOpen(review);
-  if (currentAttempt(review.dir) !== attempt)
-    return 0;
+  if (review.run)
+    throw new SidecarError(`review ${id}'s reviewer already ran; \`sidecar review retry ${id}\` opens a new review of the same change`);
   const command = configuredReviewer();
-  const file = runPath(review.dir, attempt);
-  const run = { attempt, pid: process.pid, command, startedAt: nowIso() };
+  const file = runPath(review.dir);
+  const run = { pid: process.pid, command, startedAt: nowIso() };
   writePrivateJson(file, run);
   const log = fs8.openSync(path8.join(review.dir, "reviewer.log"), "a", 384);
   let result;
@@ -4843,7 +4852,7 @@ function runReviewer(idOrPrefix, attempt) {
   }
   const finished = { ...run, finishedAt: nowIso(), exitCode: result.status, signal: result.signal };
   writePrivateJson(file, finished);
-  logSidecarEvent("review-run", { id, attempt, exitCode: result.status, signal: result.signal });
+  logSidecarEvent("review-run", { id, exitCode: result.status, signal: result.signal });
   return 0;
 }
 function reviewerEnv(review) {
@@ -4873,17 +4882,7 @@ function decideReview(review, verdict, reason) {
   review.state = verdict;
   logSidecarEvent("review-decision", { id: review.record.id, verdict });
 }
-function resetReview(review) {
-  assertOpen(review);
-  if (review.record.publishing)
-    throw new SidecarError(`review ${review.record.id} is already being published`);
-  fs8.rmSync(path8.join(review.dir, "verdict.json"), { force: true });
-  fs8.rmSync(path8.join(review.dir, "attempt"), { force: true });
-  review.verdict = undefined;
-  review.run = undefined;
-  review.state = "pending";
-}
-var REVIEW_SCHEMA = 1, KEEP_CLOSED_REVIEWS = 10, ID_PATTERN, PACKET_DIFF_OPTIONS;
+var REVIEW_SCHEMA = 1, KEEP_CLOSED_REVIEWS = 10, ID_PATTERN, LAUNCH_GRACE_SECONDS = 60, PACKET_DIFF_OPTIONS;
 var init_review = __esm(() => {
   init_util();
   init_git();
@@ -4907,6 +4906,7 @@ function syncProject(root, config, options) {
   if (!options.remote && !hasAnyCommit(sidecarPath)) {
     throw new SidecarError(`local sync requires an initialized sidecar checkout at ${sidecarPath}; run \`sidecar sync\` first`);
   }
+  bindReviewPolicy(sidecarPath, config);
   const inbox = expandInbox(config, sidecarPath);
   ensureCommitIdentity(sidecarPath);
   ensureRedactionFilter(sidecarPath, config.redaction, config);
@@ -5037,7 +5037,7 @@ function publishReviewed(root, sidecarPath, config, inbox, siblings, stage) {
       publishApprovedReview(sidecarPath, config, inbox, open);
   });
   stage("merge");
-  mergePublishedInboxes(sidecarPath, config, { forkFiles: true });
+  withPublicGit(sidecarPath, () => mergeFetchedInboxes(sidecarPath, config, { forkFiles: true }));
   stage("merge-local");
   mergeInboxBranches(sidecarPath, config, { forkFiles: true, push: false, remote: false });
   stage("settle-remote");
@@ -5052,16 +5052,18 @@ function gateUnpublished(root, sidecarPath, config) {
   const head = git(sidecarPath, ["rev-parse", `refs/heads/${config.branch}`]).stdout.trim();
   const headTree = treeOf(sidecarPath, head);
   const publicMain = publicTip(sidecarPath, config.branch);
-  const base = publicMain ? git(sidecarPath, ["merge-base", head, publicMain], { check: false }).stdout.trim() || undefined : undefined;
+  const base = publicMain && git(sidecarPath, ["merge-base", head, publicMain], { check: false }).stdout.trim();
+  if (!base)
+    throw new SidecarError(`local ${config.branch} shares no history with the remote's; nothing is reviewed or published until it does`);
   const open = openReview(sidecarPath);
   const hasReviewer = Boolean(readSettings().reviewer);
-  if (base && treeOf(sidecarPath, base) === headTree) {
+  if (treeOf(sidecarPath, base) === headTree) {
     if (open && open.state !== "approved")
       markSuperseded(open);
     return;
   }
   if (open?.state === "pending" || open?.state === "approved") {
-    return { review: open, launch: open.state === "pending" && !open.run && hasReviewer };
+    return { review: open, launch: open.state === "pending" && !open.record.launchedAt && hasReviewer };
   }
   if (open) {
     if (open.record.tree === headTree)
@@ -5074,16 +5076,21 @@ function gateUnpublished(root, sidecarPath, config) {
 }
 function publishApprovedReview(sidecarPath, config, inbox, review) {
   const { record } = review;
-  if (!record.publishing && record.base && !isPublic(sidecarPath, record.base)) {
-    markSuperseded(review);
-    console.log(`review ${paint("brand", record.id)} was measured from a commit the remote does not have; reviewing again`);
-    return;
-  }
-  assertPublishDestination(sidecarPath);
   const target = record.publishing ?? { inbox, commit: cutPublishCommit(sidecarPath, config, inbox, record) };
-  if (!record.publishing)
-    markPublishing(review, target.inbox, target.commit);
-  if (!isAncestor(sidecarPath, target.commit, publicRef(target.inbox))) {
+  const protectRef = publishingRef(record.id);
+  if (!isPublic(sidecarPath, target.commit)) {
+    const parents = git(sidecarPath, ["rev-list", "--parents", "-n", "1", target.commit]).stdout.trim().split(" ").slice(1);
+    if (!parents.every((parent) => isPublic(sidecarPath, parent))) {
+      markSuperseded(review);
+      git(sidecarPath, ["update-ref", "-d", protectRef], { check: false });
+      console.log(`review ${paint("brand", record.id)} was measured from a commit the remote does not have; reviewing again`);
+      return;
+    }
+    assertPublishDestination(sidecarPath);
+    if (!record.publishing) {
+      git(sidecarPath, ["update-ref", protectRef, target.commit]);
+      markPublishing(review, target.inbox, target.commit);
+    }
     const push = git(sidecarPath, ["push", "--no-follow-tags", "origin", `${target.commit}:refs/heads/${target.inbox}`], { check: false });
     if (push.status !== 0) {
       throw new SidecarError(push.stderr.trim() || `could not publish review ${record.id} to ${target.inbox}`);
@@ -5093,13 +5100,27 @@ function publishApprovedReview(sidecarPath, config, inbox, review) {
   }
   linkPublished(sidecarPath, config, review, target.commit);
   markPublished(review, target.commit);
+  git(sidecarPath, ["update-ref", "-d", protectRef], { check: false });
+}
+function publishingRef(id) {
+  return `refs/sidecar-publishing/${id}`;
+}
+function retryReview(review) {
+  const { record } = review;
+  if (!isOpen(review))
+    throw new SidecarError(`review ${record.id} is already ${review.state}`);
+  if (record.publishing)
+    throw new SidecarError(`review ${record.id} is already being published`);
+  const config = loadPeer(record.root, record.peer).config;
+  const sidecarPath = requireSidecarCheckout(record.root, config);
+  markSuperseded(review);
+  const fresh = withPublicGit(sidecarPath, () => createReview({ root: record.root, config, sidecarPath, base: record.base, head: record.head }));
+  launchReviewer(fresh);
+  return fresh;
 }
 function cutPublishCommit(sidecarPath, config, inbox, record) {
   const previous = publicTip(sidecarPath, inbox);
-  const parents = [
-    ...record.base ? [record.base] : [],
-    ...previous && !(record.base && isAncestor(sidecarPath, previous, record.base)) ? [previous] : []
-  ];
+  const parents = [record.base, ...previous && !isAncestor(sidecarPath, previous, record.base) ? [previous] : []];
   const body = [
     "sidecar publish",
     "",
@@ -5138,52 +5159,55 @@ function linkPublished(sidecarPath, config, review, published) {
   }
   withScratchWorktree(sidecarPath, config, "HEAD", (worktree) => {
     git(worktree, ["switch", config.branch]);
-    git(worktree, ["merge", "--no-ff", "--allow-unrelated-histories", "-s", "ours", "-m", `sidecar: link published review ${review.record.id}`, published]);
+    git(worktree, ["merge", "--no-ff", "-s", "ours", "-m", `sidecar: link published review ${review.record.id}`, published]);
   });
 }
 function mergePublishedInboxes(sidecarPath, config, options) {
   return withPublicGit(sidecarPath, () => {
     fetchPublic(sidecarPath);
-    if (!publicTip(sidecarPath, config.branch))
-      return 0;
-    const publicMain = publicRef(config.branch);
-    if (publishedInboxBranches(sidecarPath, config).every((ref) => isAncestor(sidecarPath, ref, publicMain))) {
-      console.log("no published inbox branches to merge");
-      return 0;
-    }
-    assertPublishDestination(sidecarPath);
-    return withScratchWorktree(sidecarPath, config, publicMain, (worktree) => {
-      assertRedactionFilterIntact(worktree);
-      const maxAttempts = 3;
-      for (let attempt = 1;; attempt += 1) {
-        if (attempt > 1) {
-          fetchPublic(sidecarPath);
-          git(worktree, ["reset", "--hard", publicMain]);
-        }
-        const pending = publishedInboxBranches(worktree, config).filter((ref) => !isAncestor(worktree, ref, "HEAD"));
-        if (!pending.length) {
-          console.log("no published inbox branches to merge");
-          return 0;
-        }
-        const merged = [];
-        for (const ref of pending) {
-          console.log(`merging ${paint("brand", remoteBranchName(ref))}`);
-          if (mergeInboxBranch(worktree, config, ref, options))
-            merged.push(ref);
-        }
-        const push = git(worktree, ["push", "--no-follow-tags", "origin", `HEAD:refs/heads/${config.branch}`], { check: false });
-        if (push.status !== 0) {
-          if (attempt >= maxAttempts)
-            throw new SidecarError(push.stderr.trim() || `could not push ${config.branch}`);
-          console.log(`push of ${config.branch} was rejected; refetching and retrying`);
-          continue;
-        }
+    return mergeFetchedInboxes(sidecarPath, config, options);
+  });
+}
+function mergeFetchedInboxes(sidecarPath, config, options) {
+  if (!publicTip(sidecarPath, config.branch))
+    return 0;
+  const publicMain = publicRef(config.branch);
+  if (publishedInboxBranches(sidecarPath, config).every((ref) => isAncestor(sidecarPath, ref, publicMain))) {
+    console.log("no published inbox branches to merge");
+    return 0;
+  }
+  assertPublishDestination(sidecarPath);
+  return withScratchWorktree(sidecarPath, config, publicMain, (worktree) => {
+    assertRedactionFilterIntact(worktree);
+    const maxAttempts = 3;
+    for (let attempt = 1;; attempt += 1) {
+      if (attempt > 1) {
         fetchPublic(sidecarPath);
-        console.log(`pushed ${config.branch}`);
-        console.log(`merged ${merged.length} inbox branch(es)`);
-        return merged.length;
+        git(worktree, ["reset", "--hard", publicMain]);
       }
-    });
+      const pending = publishedInboxBranches(worktree, config).filter((ref) => !isAncestor(worktree, ref, "HEAD"));
+      if (!pending.length) {
+        console.log("no published inbox branches to merge");
+        return 0;
+      }
+      const merged = [];
+      for (const ref of pending) {
+        console.log(`merging ${paint("brand", remoteBranchName(ref))}`);
+        if (mergeInboxBranch(worktree, config, ref, options))
+          merged.push(ref);
+      }
+      const push = git(worktree, ["push", "--no-follow-tags", "origin", `HEAD:refs/heads/${config.branch}`], { check: false });
+      if (push.status !== 0) {
+        if (attempt >= maxAttempts)
+          throw new SidecarError(push.stderr.trim() || `could not push ${config.branch}`);
+        console.log(`push of ${config.branch} was rejected; refetching and retrying`);
+        continue;
+      }
+      fetchPublic(sidecarPath);
+      console.log(`pushed ${config.branch}`);
+      console.log(`merged ${merged.length} inbox branch(es)`);
+      return merged.length;
+    }
   });
 }
 function publishedInboxBranches(repo, config) {
@@ -5202,7 +5226,7 @@ function settleCheckouts(sidecarPath, config, inbox, siblings) {
     } catch (error) {
       logSidecarEvent("settle-skip", {
         sidecarPath: sibling,
-        message: error instanceof Error ? error.message : String(error)
+        ...reviewRequired(config) ? {} : { message: error instanceof Error ? error.message : String(error) }
       });
     }
   }
@@ -5242,13 +5266,19 @@ function reportSyncHealth(root, config, outcome) {
     logSidecarEvent("failure", {
       command: "health",
       root,
-      message: `could not publish health: ${error instanceof Error ? error.message : String(error)}`
+      message: reviewRequired(config) ? "could not publish health" : `could not publish health: ${error instanceof Error ? error.message : String(error)}`
     });
   }
 }
 function publishHealth(root, config, sidecarPath, outcome) {
   const branch = healthBranchFor(sidecarPath);
-  const previous = readHealthRecordAt(sidecarPath, `origin/${branch}`);
+  const gated = reviewRequired(config);
+  if (gated && outcome.status === "failed") {
+    try {
+      fetchPublic(sidecarPath);
+    } catch {}
+  }
+  const previous = readHealthRecordAt(sidecarPath, gated ? publicRef(branch) : `origin/${branch}`);
   const identity = {
     machine: currentMachine(),
     root,
@@ -5259,7 +5289,7 @@ function publishHealth(root, config, sidecarPath, outcome) {
   const record = nextHealthRecord(previous, identity, outcome, nowIso());
   if (!shouldPublishHealth(previous, record))
     return;
-  if (reviewRequired(config))
+  if (gated)
     assertPublishDestination(sidecarPath);
   publishHealthRecord(sidecarPath, branch, record);
   logSidecarEvent("health", {
@@ -5450,7 +5480,7 @@ function familySidecarCheckout(root, config) {
   } catch {
     return;
   }
-  if (primaryConfig.remote !== config.remote)
+  if (!sharesFamilyCheckout(primaryConfig, config))
     return;
   const primaryPath = resolveSidecarPath(primary, primaryConfig);
   if (path9.resolve(primaryPath) === path9.resolve(primary))
@@ -5482,10 +5512,23 @@ function checkoutIsUnlinkedFromFamily(root, config, sidecarPath) {
   if (!primary)
     return false;
   try {
-    const primaryConfig = readConfig(peerConfigPath(primary, config.peer));
-    return primaryConfig.remote === config.remote;
+    return sharesFamilyCheckout(readConfig(peerConfigPath(primary, config.peer)), config);
   } catch {
     return false;
+  }
+}
+function sharesFamilyCheckout(primaryConfig, config) {
+  return primaryConfig.remote === config.remote && reviewRequired(primaryConfig) === reviewRequired(config);
+}
+function bindReviewPolicy(sidecarPath, config) {
+  const bound = git(sidecarPath, ["config", "--local", "--get", REVIEW_POLICY_KEY], { check: false }).stdout.trim();
+  if (reviewRequired(config)) {
+    if (bound !== "required")
+      git(sidecarPath, ["config", "--local", REVIEW_POLICY_KEY, "required"]);
+    return;
+  }
+  if (bound === "required") {
+    throw new SidecarError(`${sidecarPath} holds work from a peer that requires review, and this peer would publish it unreviewed; set review = "required" in this repo's ${peerFileName(config.peer)} too — or, to publish that work without review, \`git -C ${sidecarPath} config --unset ${REVIEW_POLICY_KEY}\``);
   }
 }
 function cloneOrUpdate(root, config, bootstrapMain, options) {
@@ -5525,6 +5568,7 @@ function cloneOrUpdate(root, config, bootstrapMain, options) {
   }
   ensureCommitIdentity(sidecarPath);
   ensureRedactionFilter(sidecarPath, config.redaction, config);
+  bindReviewPolicy(sidecarPath, config);
   if (bootstrapMain)
     bootstrapMainBranch(sidecarPath, config);
   const inbox = expandInbox(config, sidecarPath);
@@ -5603,6 +5647,12 @@ function ensureMainBranch(repo, config) {
     return;
   }
   if (reviewRequired(config)) {
+    if (git(repo, ["merge-base", "HEAD", remoteBranch], { check: false }).status !== 0) {
+      const link = git(repo, ["commit-tree", treeOf(repo, "HEAD"), "-p", "HEAD", "-p", remoteBranch, "-m", `sidecar: link the remote's new ${config.branch}`]).stdout.trim();
+      git(repo, ["merge", "--ff-only", link]);
+      console.log(`${remoteBranch} was started over; local ${config.branch} is joined to it and reviewed from there`);
+      return;
+    }
     mergeInboxBranch(repo, config, remoteBranch, { forkFiles: true });
     return;
   }
@@ -6151,7 +6201,7 @@ function pendingInboxBranches(repo, config) {
   });
   return [...local, ...remote].sort();
 }
-var WRITTEN_TRAILER = "written:", WRITTEN_TRAILER_LIMIT = 500, REDACTION_FILTER_NAME = "sidecar-redact", REDACTION_FILTER_REVISION = "2", REDACTION_POLICY_FILE = "sidecar-redaction-policy";
+var REVIEW_POLICY_KEY = "sidecar.review", WRITTEN_TRAILER = "written:", WRITTEN_TRAILER_LIMIT = 500, REDACTION_FILTER_NAME = "sidecar-redact", REDACTION_FILTER_REVISION = "2", REDACTION_POLICY_FILE = "sidecar-redaction-policy";
 var init_sync = __esm(() => {
   init_color();
   init_util();
@@ -6409,12 +6459,14 @@ function cmdInit(args) {
 function configurePeer(root, name, remote, parsed) {
   const configPath = peerConfigPath(root, name);
   let reuse = !remote && fs11.existsSync(configPath);
+  let built;
   if (remote && fs11.existsSync(configPath)) {
     const existing = readConfig(configPath);
-    const unchanged = existing.remote === remote && existing.path === getValue(parsed, "--path", existing.path) && existing.branch === getValue(parsed, "--branch", existing.branch) && existing.inbox === getValue(parsed, "--inbox", existing.inbox) && existing.redaction === getValue(parsed, "--redaction", existing.redaction) && existing.resolve === getValue(parsed, "--resolve", existing.resolve) && existing.debounce === durationConfigValue(parsed.values.get("--debounce") ?? existing.debounce, "--debounce") && existing.interval === durationConfigValue(parsed.values.get("--interval") ?? existing.interval, "--interval") && existing.review === getValue(parsed, "--review", existing.review ?? "off") && existing.reviewTimeout === durationConfigValue(parsed.values.get("--review-timeout") ?? existing.reviewTimeout, "--review-timeout");
-    reuse = unchanged || !promptOverwriteConfig(configPath, existing.remote, remote);
+    built = buildInitConfig(root, name, remote, parsed, existing);
+    reuse = configText(built) === configText(existing) || !promptOverwriteConfig(configPath, existing.remote, remote);
   }
-  const config = reuse ? readConfig(configPath) : buildInitConfig(root, name, remote, parsed);
+  const config = reuse ? readConfig(configPath) : built ?? buildInitConfig(root, name, remote, parsed);
+  notePeerPolicy(config);
   if (!reuse) {
     config.rulesPath = peerRulesPath(root, name);
     config.rules = readRules(config.rulesPath);
@@ -6475,9 +6527,9 @@ function initRoot(remote, parsed) {
   console.log(`initialized ${paint("repo", cwd)} as a Git repository`);
   return cwd;
 }
-function buildInitConfig(root, name, remote, parsed) {
+function buildInitConfig(root, name, remote, parsed, existing) {
   const defaultPath = name === DEFAULT_PEER ? DEFAULT_PATH : name;
-  const rawPath = parsed.values.has("--path") ? getValue(parsed, "--path", defaultPath) : promptSidecarPath(root, name, defaultPath);
+  const rawPath = parsed.values.has("--path") ? getValue(parsed, "--path", defaultPath) : existing?.path ?? promptSidecarPath(root, name, defaultPath);
   const sidecarPath = pathIsRepoRoot(root, rawPath) ? "." : rawPath;
   const standalone = isStandalonePath(sidecarPath);
   if (standalone && name !== DEFAULT_PEER) {
@@ -6488,14 +6540,14 @@ function buildInitConfig(root, name, remote, parsed) {
     remote: remote ?? (standalone ? standaloneRemote(root) : promptRemote(root)),
     version: 1,
     path: sidecarPath,
-    branch: getValue(parsed, "--branch", DEFAULT_BRANCH),
-    inbox: getValue(parsed, "--inbox", DEFAULT_INBOX),
-    redaction: parsed.values.has("--redaction") ? redactionModeConfigValue(getValue(parsed, "--redaction", DEFAULT_REDACTION_MODE), "--redaction") : promptRedactionMode(),
-    resolve: parsed.values.has("--resolve") ? resolveModeConfigValue(getValue(parsed, "--resolve", DEFAULT_RESOLVE), "--resolve") : DEFAULT_RESOLVE,
-    debounce: durationConfigValue(parsed.values.get("--debounce"), "--debounce"),
-    interval: durationConfigValue(parsed.values.get("--interval"), "--interval"),
-    review: reviewModeConfigValue(getValue(parsed, "--review", "off"), "--review"),
-    reviewTimeout: durationConfigValue(parsed.values.get("--review-timeout"), "--review-timeout")
+    branch: getValue(parsed, "--branch", existing?.branch ?? DEFAULT_BRANCH),
+    inbox: getValue(parsed, "--inbox", existing?.inbox ?? DEFAULT_INBOX),
+    redaction: parsed.values.has("--redaction") ? redactionModeConfigValue(getValue(parsed, "--redaction", DEFAULT_REDACTION_MODE), "--redaction") : existing?.redaction ?? promptRedactionMode(),
+    resolve: parsed.values.has("--resolve") ? resolveModeConfigValue(getValue(parsed, "--resolve", DEFAULT_RESOLVE), "--resolve") : existing?.resolve ?? DEFAULT_RESOLVE,
+    debounce: durationConfigValue(parsed.values.get("--debounce"), "--debounce") ?? existing?.debounce,
+    interval: durationConfigValue(parsed.values.get("--interval"), "--interval") ?? existing?.interval,
+    review: reviewModeConfigValue(getValue(parsed, "--review", existing?.review ?? "off"), "--review"),
+    reviewTimeout: durationConfigValue(parsed.values.get("--review-timeout"), "--review-timeout") ?? existing?.reviewTimeout
   };
 }
 function printCheckoutVisibility(root, config) {
@@ -7119,15 +7171,17 @@ function refreshPeer({ root, config, name }, parsed) {
   let inbox;
   if (readable) {
     inbox = expandInbox(config, sidecarPath);
-    fetch(sidecarPath, true, false);
     if (reviewRequired(config)) {
       try {
         refreshPublicRefs(sidecarPath);
       } catch {}
+    } else {
+      fetch(sidecarPath, true, false);
     }
     const held = heldWork(sidecarPath, config, inbox);
     if (held.length && !force) {
-      throw new SidecarError(`this checkout still holds ${held.join(" and ")}; run \`sidecar sync\` to push them, then refresh — or \`sidecar refresh --force\` to discard them`);
+      const publish = reviewRequired(config) ? "approve its review (`sidecar review`) and sync to publish them" : "run `sidecar sync` to push them";
+      throw new SidecarError(`this checkout still holds ${held.join(" and ")}; ${publish}, then refresh — or \`sidecar refresh --force\` to discard them`);
     }
   }
   if (standalone) {
@@ -8182,6 +8236,13 @@ import fs14 from "node:fs";
 import path12 from "node:path";
 import { spawn as spawn3 } from "node:child_process";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
+function outputIsPrivate(key) {
+  try {
+    return reviewRequired(readConfig(key, { loadRules: false }));
+  } catch {
+    return true;
+  }
+}
 function peerRoot(key) {
   return path12.dirname(key);
 }
@@ -8381,7 +8442,7 @@ async function syncInstance(state, key, trigger, options = {}) {
         command: "daemon",
         ...peerFields(key),
         trigger,
-        message: result.timedOut ? "sync timed out" : result.output.trim().slice(-500) || `sync exited ${result.status}`
+        message: result.timedOut ? "sync timed out" : !outputIsPrivate(key) && result.output.trim().slice(-500) || `sync exited ${result.status}`
       });
     }
   } finally {
@@ -8493,7 +8554,7 @@ async function refreshWatchers(state) {
           logSidecarEvent("failure", {
             command: "daemon",
             ...peerFields(key),
-            message: `watcher error: ${error instanceof Error ? error.message : String(error)}`
+            message: outputIsPrivate(key) ? "watcher error" : `watcher error: ${error instanceof Error ? error.message : String(error)}`
           });
         });
         state.watchers.set(key, watcher);
@@ -8501,7 +8562,7 @@ async function refreshWatchers(state) {
         logSidecarEvent("failure", {
           command: "daemon",
           ...peerFields(key),
-          message: `could not watch ${sidecarPath}: ${error instanceof Error ? error.message : String(error)}`
+          message: outputIsPrivate(key) ? `could not watch ${sidecarPath}` : `could not watch ${sidecarPath}: ${error instanceof Error ? error.message : String(error)}`
         });
       }
     }
@@ -9000,20 +9061,23 @@ function cmdSnapshot(args) {
   if (parsed.positional.length)
     throw new SidecarError("usage: sidecar snapshot [--push] [-m message] [--peer name]");
   const peers = loadPeers(selectedPeer(parsed));
+  const push = parsed.flags.has("--push");
+  const gated = push ? peers.filter((peer) => reviewRequired(peer.config)) : [];
+  if (gated.length) {
+    throw new SidecarError(`${peers.length === 1 ? "this peer requires" : `${gated.map((peer) => peer.name).join(", ")} require`} review before anything is published; snapshot without --push, and \`sidecar sync\` opens or advances the review`);
+  }
   for (const peer of peers) {
     announcePeer(peer, peers);
     const { root, config } = peer;
     const sidecarPath = requireSidecarCheckout(root, config);
     withSyncLock(root, peer.name, "throw", () => {
+      bindReviewPolicy(sidecarPath, config);
       const inbox = expandInbox(config, sidecarPath);
       ensureCommitIdentity(sidecarPath);
       ensureRedactionFilter(sidecarPath, config.redaction, config);
       ensureInboxBranch(sidecarPath, config, inbox);
       const committed = snapshot(sidecarPath, root, inbox, getValue(parsed, "--message", getValue(parsed, "-m", "")) || undefined, config.redaction, config);
-      if (committed && parsed.flags.has("--push")) {
-        if (reviewRequired(config)) {
-          throw new SidecarError("this peer requires review before anything is published; `sidecar sync` opens or advances the review");
-        }
+      if (committed && push) {
         syncBranchBeforePush(sidecarPath, inbox, config);
         pushBranch(sidecarPath, inbox);
       }
@@ -9076,15 +9140,12 @@ function syncPeer(peer, options) {
       registerCurrentInstance(root, config, remote ? { event: "sync", lastSyncAt: nowIso() } : { event: "sync-local" });
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
     if (remote)
       reportSyncHealth(root, config, {
         status: "failed",
         stage,
-        message: reviewRequired(config) ? "details are kept on this machine; see `sidecar tail` there" : message
+        message: reviewRequired(config) ? "details are shown only by a sync run by hand on that machine" : error instanceof Error ? error.message : String(error)
       });
-    if (reviewRequired(config))
-      logSidecarEvent("failure", { command: "sync", root, stage, message });
     throw error;
   }
   if (synced) {
@@ -9119,6 +9180,7 @@ function cmdMerge(args) {
     const { root, config } = peer;
     const sidecarPath = requireSidecarCheckout(root, config);
     withSyncLock(root, peer.name, "throw", () => {
+      bindReviewPolicy(sidecarPath, config);
       ensureRedactionFilter(sidecarPath, config.redaction, config);
       const forkFiles = parsed.flags.has("--fork-files");
       const push = !parsed.flags.has("--no-push");
@@ -9370,37 +9432,36 @@ function retryCommand(args) {
     throw new SidecarError(USAGE);
   configuredReviewer();
   const selected = selectReview(parsed.positional[0], selectedPeer(parsed));
-  withLockedReview(selected, (review) => {
-    resetReview(review);
-    launchReviewer(review);
-  });
-  console.log(`relaunched the reviewer for review ${paint("brand", selected.record.id)}`);
+  const fresh = withLockedReview(selected, retryReview);
+  console.log(`retired review ${paint("brand", selected.record.id)}; review ${paint("brand", fresh.record.id)} covers the same change, and its reviewer is running`);
   return 0;
 }
 function withLockedReview(selected, fn) {
   const { id, root, peer } = selected.record;
+  let result;
   withSyncLock(root, peer, "wait", () => {
     const review = readReview(id);
     if (!review)
       throw new SidecarError(`review ${id} is gone`);
-    fn(review);
+    result = fn(review);
   });
+  return result;
 }
 function reviewerCommand(args) {
-  const parsed = parseOptions(args, { boolean: new Set(["--unset"]), value: new Set });
   const settings = readSettings();
-  if (parsed.flags.has("--unset")) {
-    if (parsed.positional.length)
-      throw new SidecarError("usage: sidecar review reviewer [<command>|--unset]");
+  if (!args.length) {
+    console.log(settings.reviewer ?? paint("quiet", "no reviewer configured"));
+    return 0;
+  }
+  if (args.length === 1 && args[0] === "--unset") {
     writeSettings({ ...settings, reviewer: undefined });
     console.log("reviewer unset; reviews now wait for `sidecar review approve`");
     return 0;
   }
-  if (!parsed.positional.length) {
-    console.log(settings.reviewer ?? paint("quiet", "no reviewer configured"));
-    return 0;
+  if (args.length !== 1) {
+    throw new SidecarError('usage: sidecar review reviewer ["<command>"|--unset]; quote the command as one argument');
   }
-  const command = parsed.positional.join(" ").trim();
+  const command = args[0].trim();
   if (!command)
     throw new SidecarError("the reviewer command is empty");
   writeSettings({ ...settings, reviewer: command });
@@ -9408,9 +9469,9 @@ function reviewerCommand(args) {
   return 0;
 }
 function runCommand(args) {
-  if (args.length !== 2)
-    throw new SidecarError("usage: sidecar review run <id> <attempt>");
-  return runReviewer(args[0], args[1]);
+  if (args.length !== 1)
+    throw new SidecarError("usage: sidecar review run <id>");
+  return runReviewer(args[0]);
 }
 function selectReview(id, peer) {
   if (id)
@@ -9430,6 +9491,7 @@ var init_cmd_review = __esm(() => {
   init_config();
   init_state();
   init_review();
+  init_sync();
   init_cmd_sync();
   init_ui();
   LABEL_WIDTH = "reviewer:".length;
@@ -9616,7 +9678,7 @@ async function main(argv = process.argv.slice(2)) {
     if (command !== "redact" && command !== "deinit" && shouldUseGlobalRegistry()) {
       logSidecarEvent("failure", {
         command,
-        message: error instanceof Error ? error.message : String(error)
+        ...privateFailures() ? {} : { message: error instanceof Error ? error.message : String(error) }
       });
     }
     if (error instanceof SidecarError) {
@@ -9634,6 +9696,7 @@ var init_cli = __esm(() => {
   init_color();
   init_util();
   init_install();
+  init_config();
   init_state();
   init_commands();
   init_util();

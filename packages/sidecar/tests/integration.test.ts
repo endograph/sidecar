@@ -2546,12 +2546,46 @@ describe("review-gated publishing", () => {
     expect(remoteFile(remote, "later.md")).toBe("decide later\n");
   });
 
-  test("a gated peer refuses to push a snapshot directly", () => {
+  test("a gated peer refuses to push a snapshot directly, before snapshotting anything", () => {
     const { main, sidecar } = initSidecarProject(["--review", "required"]);
-    fs.writeFileSync(path.join(sidecar, "notes.md"), "hello\n", "utf8");
-    const result = runSidecarRaw(["snapshot", "--push"], main);
+    const before = git(sidecar, ["rev-parse", "HEAD"]).stdout.trim();
+    for (const content of [undefined, "hello\n"]) {
+      if (content) fs.writeFileSync(path.join(sidecar, "notes.md"), content, "utf8");
+      const result = runSidecarRaw(["snapshot", "--push"], main);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("requires review");
+      expect(git(sidecar, ["rev-parse", "HEAD"]).stdout.trim()).toBe(before);
+    }
+  });
+
+  test("a working copy whose review policy drifts from its family's refuses to sync the shared store", () => {
+    const { main, worktree, remote, state } = initWorktreeFamily(["--review", "required"]);
+    const env = { SIDECAR_STATE_DIR: state };
+    runSidecar(["clone"], worktree, env);
+    fs.writeFileSync(path.join(main, "sidecar", "plan.md"), "unreviewed plan\n", "utf8");
+    runSidecar(["sync"], main, env);
+
+    const config = path.join(worktree, ".sidecar");
+    fs.writeFileSync(config, fs.readFileSync(config, "utf8").replace('review = "required"\n', ""), "utf8");
+    const result = runSidecarRaw(["sync"], worktree, env);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("requires review");
+    expect(remoteObjectsContain(remote, "unreviewed plan")).toBe(false);
+  });
+
+  test("retrying a review retires it, so its old reviewer can no longer decide", () => {
+    const { main, sidecar } = initSidecarProject(["--review", "required"]);
+    const env = reviewerEnv(main);
+    fs.writeFileSync(path.join(sidecar, "notes.md"), "hello\n", "utf8");
+    const first = openedReview(runSidecar(["sync"], main, env.vars));
+    runSidecar(["review", "reviewer", `touch ${JSON.stringify(env.defer)}`], main, env.vars);
+
+    const retried = /review ([0-9a-f]+) covers the same change/.exec(runSidecar(["review", "retry", first], main, env.vars))?.[1];
+    expect(retried).toBeDefined();
+    expect(retried).not.toBe(first);
+    const late = runSidecarRaw(["review", "approve", first, "--no-sync"], main, env.vars);
+    expect(late.status).not.toBe(0);
+    expect(late.stderr).toContain("already superseded");
   });
 });
 

@@ -5,7 +5,6 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 vi.mock("../src/git.js", async (original) => ({
   ...await original<typeof import("../src/git.js")>(),
-  emptyTree: vi.fn(),
   git: vi.fn(),
   gitBytes: vi.fn(),
   gitCommonDir: vi.fn(),
@@ -16,7 +15,7 @@ vi.mock("../src/state.js", async (original) => ({
   logSidecarEvent: vi.fn(),
 }));
 
-import { emptyTree, git, gitBytes, gitCommonDir, treeOf } from "../src/git.js";
+import { git, gitBytes, gitCommonDir, treeOf } from "../src/git.js";
 import { logSidecarEvent, readSettings, writeSettings } from "../src/state.js";
 import type { SidecarConfig } from "../src/config.js";
 import {
@@ -30,7 +29,6 @@ import {
   markSuperseded,
   openReview,
   readReview,
-  resetReview,
   reviewAttention,
 } from "../src/review.js";
 
@@ -50,7 +48,6 @@ beforeEach(() => {
   fs.mkdirSync(path.join(root, "sidecar", ".git"), { recursive: true });
   vi.stubEnv("SIDECAR_STATE_DIR", path.join(directory, "state"));
   vi.mocked(gitCommonDir).mockImplementation((checkout) => path.join(checkout, ".git"));
-  vi.mocked(emptyTree).mockReturnValue("empty-tree");
   vi.mocked(treeOf).mockReturnValue("tree-oid");
   vi.mocked(gitBytes).mockReturnValue({ status: 0, stdout: Buffer.from("plain text\n"), stderr: Buffer.alloc(0) });
   vi.mocked(git).mockImplementation((_repo, args) => {
@@ -72,9 +69,13 @@ function open(checkout = path.join(root, "sidecar")): Review {
   return createReview({ root, config, sidecarPath: checkout, base: "base-oid", head: "head-oid" });
 }
 
-function writeRun(review: Review, run: Record<string, unknown>, attempt = "a1"): void {
-  fs.writeFileSync(path.join(review.dir, "attempt"), `${attempt}\n`, "utf8");
-  fs.writeFileSync(path.join(review.dir, `run-${attempt}.json`), JSON.stringify({ attempt, ...run }), "utf8");
+function writeRun(review: Review, run: Record<string, unknown>): void {
+  fs.writeFileSync(path.join(review.dir, "run.json"), JSON.stringify(run), "utf8");
+}
+
+function markLaunched(review: Review, secondsAgo: number): void {
+  const record = { ...review.record, launchedAt: new Date(Date.now() - secondsAgo * 1000).toISOString() };
+  fs.writeFileSync(path.join(review.dir, "review.json"), JSON.stringify(record), "utf8");
 }
 
 describe("opening a review", () => {
@@ -132,11 +133,6 @@ describe("opening a review", () => {
     expect(review.record.files.find((file) => file.path === "notes.md")!.artifact).toBeUndefined();
   });
 
-  test("diffs against the empty tree when the head shares no history with the remote", () => {
-    createReview({ root, config, sidecarPath: path.join(root, "sidecar"), head: "head-oid" });
-    expect(git).toHaveBeenCalledWith(path.join(root, "sidecar"), expect.arrayContaining(["diff-tree", "-p", "empty-tree", "head-oid"]));
-  });
-
   test("says so when the repository has no guidelines", () => {
     const review = open();
     expect(fs.existsSync(path.join(review.dir, "guidelines.md"))).toBe(false);
@@ -146,7 +142,7 @@ describe("opening a review", () => {
   test("reads a named peer's guidelines from its own file", () => {
     fs.writeFileSync(path.join(root, ".sidecar-review.notes"), "Notes only.\n", "utf8");
     fs.writeFileSync(path.join(root, ".sidecar-review"), "Default only.\n", "utf8");
-    const review = createReview({ root, config: { ...config, peer: "notes" }, sidecarPath: path.join(root, "sidecar"), head: "head-oid" });
+    const review = createReview({ root, config: { ...config, peer: "notes" }, sidecarPath: path.join(root, "sidecar"), base: "base-oid", head: "head-oid" });
     expect(fs.readFileSync(path.join(review.dir, "guidelines.md"), "utf8")).toBe("Notes only.\n");
   });
 });
@@ -208,33 +204,24 @@ describe("review state", () => {
     expect(reviewAttention(review, opened + 3601_000)).toBe("undecided for over 1h");
   });
 
-  test("only the current attempt's runner counts", () => {
+  test("a launched reviewer that never records a run has failed once its grace period passes", () => {
+    writeSettings({ ...readSettings(), reviewer: "reviewer" });
     const review = open();
-    writeRun(review, { pid: process.pid, command: "reviewer", startedAt: "t", finishedAt: "t", exitCode: 0 }, "new");
-    // The retired attempt's runner finishes late and badly; it is not the record read.
-    fs.writeFileSync(path.join(review.dir, "run-old.json"), JSON.stringify({ attempt: "old", pid: 1, startedAt: "t", finishedAt: "t", exitCode: 7 }));
+    markLaunched(review, 10);
     expect(readReview(review.record.id)!.state).toBe("pending");
+    markLaunched(review, 120);
+    const reread = readReview(review.record.id)!;
+    expect(reread.state).toBe("failed");
+    expect(reviewAttention(reread)).toBe("reviewer never started");
   });
 
-  test("once publication has begun, a review can no longer be rejected or reset", () => {
+  test("once publication has begun, a review can no longer be rejected", () => {
     const review = open();
     decideReview(review, "approved");
     markPublishing(review, "sidecar-inbox/test/abc", "commit-oid");
     const reread = readReview(review.record.id)!;
     expect(reread.record.publishing).toEqual({ inbox: "sidecar-inbox/test/abc", commit: "commit-oid" });
     expect(() => decideReview(reread, "rejected")).toThrow(/already being published/);
-    expect(() => resetReview(reread)).toThrow(/already being published/);
-  });
-
-  test("reset clears the verdict and run so the reviewer can take it again", () => {
-    const review = open();
-    writeRun(review, { pid: 999_999, command: "reviewer", startedAt: "t", finishedAt: "t", exitCode: 1 });
-    decideReview(review, "rejected", "no");
-    resetReview(review);
-    const reread = readReview(review.record.id)!;
-    expect(reread.state).toBe("pending");
-    expect(reread.verdict).toBeUndefined();
-    expect(reread.run).toBeUndefined();
   });
 });
 

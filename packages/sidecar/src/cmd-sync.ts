@@ -20,8 +20,9 @@ import {
   reviewRequired,
   selectedPeer,
 } from "./config.js";
-import { logSidecarEvent, registerCurrentInstance, withSyncLock } from "./state.js";
+import { registerCurrentInstance, withSyncLock } from "./state.js";
 import {
+  bindReviewPolicy,
   checkoutIsUnlinkedFromFamily,
   checkoutRedactionPolicy,
   ensureInboxBranch,
@@ -49,6 +50,15 @@ export function cmdSnapshot(args: string[]): number {
   if (parsed.positional.length) throw new SidecarError("usage: sidecar snapshot [--push] [-m message] [--peer name]");
 
   const peers = loadPeers(selectedPeer(parsed));
+  const push = parsed.flags.has("--push");
+  // A gated peer's snapshots are local history; only a review publishes.
+  // Refused before any peer is touched, so the command does all or nothing.
+  const gated = push ? peers.filter((peer) => reviewRequired(peer.config)) : [];
+  if (gated.length) {
+    throw new SidecarError(
+      `${peers.length === 1 ? "this peer requires" : `${gated.map((peer) => peer.name).join(", ")} require`} review before anything is published; snapshot without --push, and \`sidecar sync\` opens or advances the review`,
+    );
+  }
   for (const peer of peers) {
     announcePeer(peer, peers);
     const { root, config } = peer;
@@ -56,6 +66,7 @@ export function cmdSnapshot(args: string[]): number {
     // Snapshotting while a daemon sync is mid-merge would commit on whatever
     // branch the merge has checked out, so take the same lock syncs use.
     withSyncLock(root, peer.name, "throw", () => {
+      bindReviewPolicy(sidecarPath, config);
       const inbox = expandInbox(config, sidecarPath);
       ensureCommitIdentity(sidecarPath);
       ensureRedactionFilter(sidecarPath, config.redaction, config);
@@ -68,11 +79,7 @@ export function cmdSnapshot(args: string[]): number {
         config.redaction,
         config,
       );
-      if (committed && parsed.flags.has("--push")) {
-        // A gated peer's snapshots are local history; only a review publishes.
-        if (reviewRequired(config)) {
-          throw new SidecarError("this peer requires review before anything is published; `sidecar sync` opens or advances the review");
-        }
+      if (committed && push) {
         syncBranchBeforePush(sidecarPath, inbox, config);
         pushBranch(sidecarPath, inbox);
       }
@@ -156,16 +163,16 @@ export function syncPeer(peer: Peer, options: PeerSyncOptions): void {
         : { event: "sync-local" });
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
     if (remote) reportSyncHealth(root, config, {
       status: "failed",
       stage,
-      // Git's diagnostics quote paths, and on a gated peer a path is content
-      // nobody has reviewed yet. The heartbeat says where it failed; the
-      // details stay in this machine's log.
-      message: reviewRequired(config) ? "details are kept on this machine; see `sidecar tail` there" : message,
+      // Git's diagnostics quote paths, and on a gated peer a path can be
+      // content nobody has reviewed yet. The heartbeat says where it failed;
+      // the details reach only this terminal (see privateFailures).
+      message: reviewRequired(config)
+        ? "details are shown only by a sync run by hand on that machine"
+        : error instanceof Error ? error.message : String(error),
     });
-    if (reviewRequired(config)) logSidecarEvent("failure", { command: "sync", root, stage, message });
     throw error;
   }
   // A soft sync that lost the lock never attempted anything, so it has nothing
@@ -209,6 +216,7 @@ export function cmdMerge(args: string[]): number {
     withSyncLock(root, peer.name, "throw", () => {
       // Filter wiring mutates the shared Git config too, so keep it under
       // the same lock as the merge and its temporary worktree cleanup.
+      bindReviewPolicy(sidecarPath, config);
       ensureRedactionFilter(sidecarPath, config.redaction, config);
       const forkFiles = parsed.flags.has("--fork-files");
       const push = !parsed.flags.has("--no-push");
