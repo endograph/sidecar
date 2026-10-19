@@ -79,7 +79,11 @@ sidecar review approve <id>
 sidecar review reject <id> --reason "plans/q3.md: unreleased pricing"
 ```
 
-Approving publishes at once (`--no-sync` leaves it to the next sync).
+Approving publishes at once (`--no-sync` leaves it to the next sync). Once
+the reviewed commit is on the remote, `approve` exits 0 even if the rest of
+its sync stops early — say, because you kept editing — since any later sync
+finishes that. If it stops before publishing, it exits nonzero and the
+review stays approved for the next sync.
 Rejecting holds publishing until the flagged content changes. The next sync
 then opens a fresh review of the new state. Approving a rejected review
 overrides the rejection. The id can be omitted when the repo has exactly one
@@ -174,6 +178,17 @@ off gets its own clone, and one whose config changes after linking refuses to
 sync through the shared clone rather than publish what its siblings hold. One
 review is open at a time. Edits made while it's open wait for the next one,
 which covers everything after what was approved.
+
+Reviews also open no more often than the peer's `debounce` (60 seconds by
+default; see [Cadence](sync.md#cadence)), counted from when the previous one
+opened or its reviewer launched. Without that floor, an approval — whose sync
+looks for the next review straight after publishing — would launch the next
+reviewer at once, and steady editing would keep reviewers running back to
+back. With it, a reviewer runs at most once per remote round trip, and each
+review covers everything that accumulated in between. Work the floor holds
+back is recorded in the state dir as due, and the daemon comes back for it
+when the floor passes even if nothing else happens. `sidecar sync` run by
+hand ignores the floor and opens the review now.
 
 When the remote has no `main` yet, it starts as an empty commit, never as the
 checkout's history or anything staged in it, and the first review covers

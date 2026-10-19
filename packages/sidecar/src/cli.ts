@@ -4,7 +4,7 @@
 // CLAUDE.md for the map. When adding an export to any module, nothing extra
 // is needed here; `export *` forwards it.
 import { colorLevel, paint } from "./color.js";
-import { SidecarError } from "./util.js";
+import { DIRTY_CHECKOUT_EXIT, SidecarError } from "./util.js";
 import { shouldUseGlobalRegistry } from "./install.js";
 import { privateFailures } from "./config.js";
 import { logSidecarEvent } from "./state.js";
@@ -41,13 +41,18 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     if (command !== "redact" && command !== "deinit" && shouldUseGlobalRegistry()) {
       logSidecarEvent("failure", {
         command,
+        // Reason and stage are closed sets of names, so they are logged even
+        // where the message is private: enough to tell a checkout that changed
+        // mid-sync from a remote that refused a push without rerunning by hand.
+        ...(error instanceof SidecarError && error.reason ? { reason: error.reason } : {}),
+        ...(error instanceof SidecarError && error.stage ? { stage: error.stage } : {}),
         // The terminal still gets the message below.
         ...(privateFailures() ? {} : { message: error instanceof Error ? error.message : String(error) }),
       });
     }
     if (error instanceof SidecarError) {
       console.error(`${paint("bad", "sidecar:", colorLevel(process.stderr))} ${error.message}`);
-      return 1;
+      return error.reason === "dirty-checkout" ? DIRTY_CHECKOUT_EXIT : 1;
     }
     if (error instanceof Error && error.name === "AbortError") {
       console.error("sidecar: stopped");

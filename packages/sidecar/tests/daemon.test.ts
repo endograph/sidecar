@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { compileGitignoreMatcher, refreshWatchers, scheduleFor, selectWatchTargets, watchIgnoreMatcher } from "../src/daemon.js";
+import { compileGitignoreMatcher, refreshWatchers, reviewDueAt, scheduleFor, selectWatchTargets, watchIgnoreMatcher } from "../src/daemon.js";
 import type { SidecarInstance } from "../src/cli.js";
 import * as cli from "../src/cli.js";
 
@@ -254,5 +254,30 @@ describe("scheduleFor", () => {
     expect(scheduleFor(path.join(root, ".sidecar"), defaults)).toEqual({ debounceSeconds: 60, intervalSeconds: 600 });
     fs.writeFileSync(path.join(root, ".sidecar"), "remote = [\n", "utf8");
     expect(scheduleFor(path.join(root, ".sidecar"), defaults)).toEqual({ debounceSeconds: 60, intervalSeconds: 600 });
+  });
+});
+
+describe("reviewDueAt", () => {
+  const now = 1_000_000;
+
+  test("books a due time still ahead as is, whoever asks", () => {
+    for (const when of ["start", "change", "after-sync"] as const) {
+      expect(reviewDueAt(now + 30_000, when, now, 60_000)).toBe(now + 30_000);
+    }
+  });
+
+  test("leaves a peer without a due review alone", () => {
+    expect(reviewDueAt(undefined, "start", now, 60_000)).toBeUndefined();
+  });
+
+  test("an overdue review goes now at start, and never on another peer's change", () => {
+    expect(reviewDueAt(now - 1, "start", now, 60_000)).toBe(now);
+    // Booking it here would override a retry already booked for this peer.
+    expect(reviewDueAt(now - 1, "change", now, 60_000)).toBeUndefined();
+  });
+
+  test("an overdue review a sync left behind waits a debounce, and never less than the settle window", () => {
+    expect(reviewDueAt(now - 1, "after-sync", now, 60_000)).toBe(now + 60_000);
+    expect(reviewDueAt(now - 1, "after-sync", now, 0)).toBe(now + 5000);
   });
 });

@@ -43,6 +43,12 @@ export const SOFT_SYNC_ENV = "SIDECAR_SYNC_SOFT";
 // more often than it talks to the remote, and a pinned older CLI has to be able
 // to ignore the request instead of rejecting an option it never heard of.
 export const LOCAL_SYNC_ENV = "SIDECAR_SYNC_LOCAL";
+/**
+ * The least time between remote round trips once edits land, for a peer
+ * whose config sets no `debounce` of its own and a daemon started without
+ * `--debounce`. A review-gated peer opens reviews no more often than this.
+ */
+export const DEFAULT_DEBOUNCE_SECONDS = 60;
 const PEER_NAME = /^[a-z0-9][a-z0-9-]*$/;
 // Suffixes an editor or a cautious hand puts on a copy of `.sidecar`. A swap
 // file or a backup must never be read as a peer, so these names are refused at

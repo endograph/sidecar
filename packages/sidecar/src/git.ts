@@ -154,7 +154,7 @@ export function isDirty(repo: string): boolean {
 }
 
 export function ensureClean(repo: string): void {
-  if (isDirty(repo)) throw new SidecarError("sidecar checkout has uncommitted changes");
+  if (isDirty(repo)) throw new SidecarError("sidecar checkout has uncommitted changes", { reason: "dirty-checkout" });
 }
 
 /** The identity sidecar commits as when nothing else is configured. */

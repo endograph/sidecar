@@ -5,10 +5,32 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+/**
+ * Why a command failed, as a closed set of names safe to log for any peer —
+ * unlike the message, which can quote paths nobody has reviewed.
+ *
+ * `dirty-checkout`: a step that rewrites the sidecar checkout found edits no
+ * sync has captured yet. Nothing is wrong; the next sync snapshots them and
+ * runs the step again.
+ */
+export type FailureReason = "dirty-checkout";
+
+/**
+ * The exit status of a command that failed with `dirty-checkout` and nothing
+ * worse (EX_TEMPFAIL). The daemon reads it as "ask again", not as a failing
+ * remote to back off from; an older daemon sees an ordinary failure.
+ */
+export const DIRTY_CHECKOUT_EXIT = 75;
+
 export class SidecarError extends Error {
-  constructor(message: string) {
+  readonly reason?: FailureReason;
+  /** The sync stage in flight when this was thrown, where one was. Safe to log. */
+  stage?: string;
+
+  constructor(message: string, options: { reason?: FailureReason } = {}) {
     super(message);
     this.name = "SidecarError";
+    this.reason = options.reason;
   }
 }
 

@@ -9,7 +9,7 @@ import { type Role, paint } from "./color.js";
 import { SidecarError, parseOptions } from "./util.js";
 import { hasGitMetadata } from "./git.js";
 import { type Peer, loadPeer, loadPeers, resolveSidecarPath, reviewRequired, selectedPeer } from "./config.js";
-import { readSettings, withSyncLock, writeSettings } from "./state.js";
+import { logSidecarEvent, readSettings, withSyncLock, writeSettings } from "./state.js";
 import {
   type Review,
   configuredReviewer,
@@ -160,9 +160,28 @@ function decideCommand(verdict: "approve" | "reject", args: string[]): number {
   }
   // Publishing now rather than at the daemon's next round trip, which can be
   // ten minutes away. The sync that opened this review may still hold the
-  // lock — a fast reviewer approves from inside it — so wait for it.
+  // lock — a fast reviewer approves from inside it — so wait for it. It holds
+  // the next review to the floor like the daemon's do: a reviewer approving
+  // must not, by approving, launch the next reviewer straight away.
   const peer = loadPeer(selected.record.root, selected.record.peer);
-  syncPeer(peer, { lock: "wait", remote: true, snapshot: true });
+  try {
+    syncPeer(peer, { lock: "wait", remote: true, snapshot: true, reviewFloor: true });
+  } catch (error) {
+    // The approval's job ends once the reviewed commit is on the remote: what
+    // the sync does after that — the canonical merge, settling, the next
+    // review — is ordinary sync work any later sync redoes. A reviewer
+    // reporting failure for it reads as a reviewer that broke.
+    if (readReview(id)?.state !== "published") {
+      console.error(`sidecar: review ${id} is approved, but this sync could not confirm it published; the next sync finishes publishing it`);
+      throw error;
+    }
+    logSidecarEvent("review-followup-failure", {
+      id,
+      ...(error instanceof SidecarError && error.reason ? { reason: error.reason } : {}),
+      ...(error instanceof SidecarError && error.stage ? { stage: error.stage } : {}),
+    });
+    console.error(`sidecar: published review ${id}; the sync after it stopped early and the next sync finishes it: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return 0;
 }
 

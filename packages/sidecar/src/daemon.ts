@@ -6,6 +6,7 @@ import ignore from "ignore";
 
 import {
   DEFAULT_PEER,
+  DIRTY_CHECKOUT_EXIT,
   PACKAGE_NAME,
   LOCAL_SYNC_ENV,
   PEER_ENV,
@@ -26,7 +27,9 @@ import {
   projectDependsOnSidecar,
   readConfig,
   readInstances,
+  readReviewDue,
   readSettings,
+  reviewDueDir,
   reviewRequired,
   sidecarStateDir,
   startDetachedDaemon,
@@ -123,7 +126,8 @@ type DaemonState = {
   syncing: Set<string>;
   syncingFamilies: Set<string>;
   lastRemoteSyncAt: Map<string, number>;
-  remoteTimers: Map<string, NodeJS.Timeout>;
+  /** One booked remote round trip per peer, and when it fires (epoch ms). */
+  remoteTimers: Map<string, { timer: NodeJS.Timeout; at: number }>;
   pendingTimers: Map<string, NodeJS.Timeout>;
   trailingPending: Set<string>;
   failures: Map<string, number>;
@@ -174,6 +178,7 @@ export async function runDaemonLoop(options: DaemonOptions): Promise<number> {
   await acquireDaemonPid();
   installShutdownHandlers();
   await watchRegistry(state);
+  await watchReviewDue(state);
   const bootVersion = packageVersion();
 
   while (true) {
@@ -322,10 +327,11 @@ async function syncInstance(
   // be retried at the settle cadence.
   if (!options.localOnly) {
     state.lastRemoteSyncAt.set(key, Date.now());
-    clearTimeout(state.remoteTimers.get(key));
+    clearTimeout(state.remoteTimers.get(key)?.timer);
     state.remoteTimers.delete(key);
   }
   let succeeded = false;
+  let dirtyCheckout = false;
   try {
     const localCli = localSidecarCliPath(root);
     const cli = localCli ?? currentCliPath();
@@ -347,19 +353,34 @@ async function syncInstance(
       },
       timeoutMs: SYNC_TIMEOUT_MS,
     });
+    dirtyCheckout = !result.timedOut && result.status === DIRTY_CHECKOUT_EXIT;
     if (result.status === 0) {
-      state.failures.delete(key);
-      state.skipUntilCycle.delete(key);
+      // Backoff is for a remote that keeps failing, and only a round trip
+      // shows it has stopped: settling this machine says nothing about it.
+      if (!options.localOnly) {
+        state.failures.delete(key);
+        state.skipUntilCycle.delete(key);
+      }
       logSidecarEvent("daemon-sync", { ...peerFields(key), trigger, local: Boolean(localCli) });
       succeeded = true;
     } else {
-      const failures = (state.failures.get(key) ?? 0) + 1;
-      state.failures.set(key, failures);
-      state.skipUntilCycle.set(key, state.cycleCount + Math.min(2 ** (failures - 1), MAX_BACKOFF_CYCLES));
+      // A checkout that changed under the sync is someone still typing, not
+      // something failing: no backoff, which would leave the interval poll
+      // further and further away from whatever the next edit strands.
+      if (!dirtyCheckout) {
+        const failures = (state.failures.get(key) ?? 0) + 1;
+        state.failures.set(key, failures);
+        state.skipUntilCycle.set(key, state.cycleCount + Math.min(2 ** (failures - 1), MAX_BACKOFF_CYCLES));
+      }
+      // A failed round trip counts from when it gave up, so the follow-up
+      // below settles locally rather than retrying a failing remote at once.
+      if (!options.localOnly) state.lastRemoteSyncAt.set(key, Date.now());
       logSidecarEvent("failure", {
         command: "daemon",
         ...peerFields(key),
         trigger,
+        // A name from a closed set, safe for a gated peer whose output is not.
+        reason: result.timedOut ? "timeout" : dirtyCheckout ? "dirty-checkout" : `exit-${result.status}`,
         message: result.timedOut
           ? "sync timed out"
           : (!outputIsPrivate(key) && result.output.trim().slice(-500)) || `sync exited ${result.status}`,
@@ -370,9 +391,34 @@ async function syncInstance(
     state.syncingFamilies.delete(family);
     if (options.localOnly) armRemoteSync(state, key);
   }
-  if (succeeded) await followUpTrailingSync(state, key);
-  else state.trailingPending.delete(key);
+  if (succeeded) {
+    if (!options.localOnly) armReviewDue(state, key, "after-sync");
+    await followUpTrailingSync(state, key);
+  } else {
+    followUpFailedSync(state, key, { dirtyCheckout, remote: !options.localOnly });
+  }
   return succeeded;
+}
+
+/**
+ * What a failed sync still owes. Whatever it failed at, edits that landed
+ * while it ran are as uncaptured as before it started, and nothing else is
+ * coming for them: the watcher already reported them, to this sync. So they
+ * get the trailing sync a success would have given them, at the settle
+ * cadence — never sooner, so a sync failing on every attempt costs one try
+ * per window rather than a loop. That sync is local unless the remote is due,
+ * and a local one books the round trip this one could not finish.
+ *
+ * A sync stopped by the checkout changing under it (DIRTY_CHECKOUT_EXIT) owes
+ * the work it was started for, edits or not, and a round trip it never made.
+ * Any other failed round trip is left to the interval poll and its backoff.
+ */
+function followUpFailedSync(state: DaemonState, key: PeerKey, failure: { dirtyCheckout: boolean; remote: boolean }): void {
+  if (failure.dirtyCheckout) {
+    state.trailingPending.add(key);
+    if (failure.remote) armRemoteSync(state, key);
+  }
+  if (state.trailingPending.has(key) && !state.pendingTimers.has(key)) openTrailingWindow(state, key, SETTLE_WINDOW_MS);
 }
 
 // Watch events that arrived during a sync are either edits the sync missed or
@@ -397,7 +443,11 @@ async function checkoutIsDirty(key: PeerKey): Promise<boolean> {
   const sidecarPath = readInstances().find((instance) => instance.configPath === key)?.sidecarPath;
   if (!sidecarPath || !fs.existsSync(sidecarPath)) return false;
   const result = await runChild("git", ["-C", sidecarPath, "status", "--porcelain"], { timeoutMs: 30_000 });
-  return result.status === 0 && Boolean(result.stdout.trim());
+  // A checkout git cannot read is not known to be clean. Syncing it costs one
+  // attempt that reports what is wrong; calling it clean would drop the edit
+  // that woke us.
+  if (result.status !== 0) return true;
+  return Boolean(result.stdout.trim());
 }
 
 function localSidecarCliPath(root: string): string | undefined {
@@ -567,18 +617,60 @@ async function beginWatchSync(state: DaemonState, key: PeerKey): Promise<void> {
  * one `--debounce` asked for however the syncs were triggered.
  */
 function armRemoteSync(state: DaemonState, key: PeerKey): void {
-  if (state.remoteTimers.has(key)) return;
   const elapsed = Date.now() - (state.lastRemoteSyncAt.get(key) ?? 0);
-  const timer = setTimeout(
-    () => {
-      state.remoteTimers.delete(key);
-      void syncInstance(state, key, "remote-due");
-    },
-    // The floor keeps an overdue sync rebooked against a busy family from
-    // retrying in a hot loop instead of at the settle cadence.
-    Math.max(SETTLE_WINDOW_MS, scheduleFor(key, state.options).debounceSeconds * 1000 - elapsed),
-  );
-  state.remoteTimers.set(key, timer);
+  // The floor keeps an overdue sync rebooked against a busy family from
+  // retrying in a hot loop instead of at the settle cadence.
+  armRemoteAt(state, key, Date.now() + Math.max(SETTLE_WINDOW_MS, scheduleFor(key, state.options).debounceSeconds * 1000 - elapsed), "remote-due");
+}
+
+/** Books a round trip for `at` (epoch ms), unless one is booked no later. */
+function armRemoteAt(state: DaemonState, key: PeerKey, at: number, trigger: string): void {
+  const booked = state.remoteTimers.get(key);
+  if (booked && booked.at <= at) return;
+  clearTimeout(booked?.timer);
+  const timer = setTimeout(() => {
+    state.remoteTimers.delete(key);
+    void syncInstance(state, key, trigger);
+  }, Math.max(0, at - Date.now()));
+  state.remoteTimers.set(key, { timer, at });
+}
+
+/**
+ * Books the round trip that opens a review-gated peer's held review, once the
+ * review floor lets it open (see gateUnpublished). The sync that held it
+ * recorded when; nothing else is certain to come back by then — the last
+ * edit may be long captured, and the approval that published the previous
+ * review is not the daemon's sync.
+ *
+ * `when` says what is asking; see reviewDueAt.
+ */
+function armReviewDue(state: DaemonState, key: PeerKey, when: ReviewDueCheck): void {
+  const at = reviewDueAt(readReviewDue(key), when, Date.now(), scheduleFor(key, state.options).debounceSeconds * 1000);
+  if (at !== undefined) armRemoteAt(state, key, at, "review-due");
+}
+
+export type ReviewDueCheck = "start" | "change" | "after-sync";
+
+/**
+ * When to come back for a review due at `due` (epoch ms), or undefined to
+ * leave it alone.
+ *
+ * A due time still ahead is booked as is. One already past is a record no
+ * sync has acted on, and how soon to retry depends on who noticed:
+ * - "start": the daemon starting up finds one left over — go now.
+ * - "after-sync": the daemon's own round trip ended without clearing it, so
+ *   that sync never reached the gate (it lost the lock to another) or ran a
+ *   CLI too old to clear it. Ask again a debounce later, never under the
+ *   settle window, so neither case costs more than the cadence the peer keeps.
+ * - "change": another peer's record changed. Nothing new is known about this
+ *   one, and booking it now would override the retry already booked for it.
+ */
+export function reviewDueAt(due: number | undefined, when: ReviewDueCheck, now: number, debounceMs: number): number | undefined {
+  if (due === undefined) return undefined;
+  if (due > now) return due;
+  if (when === "start") return now;
+  if (when === "after-sync") return now + Math.max(SETTLE_WINDOW_MS, debounceMs);
+  return undefined;
 }
 
 /**
@@ -633,6 +725,35 @@ async function watchRegistry(state: DaemonState): Promise<void> {
     logSidecarEvent("failure", {
       command: "daemon",
       message: `could not watch registry: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
+}
+
+// Review due times are written by syncs in other processes — the daemon's own
+// children and anyone's `sidecar review approve` — so they arrive as files.
+// Read them all at start, then again whenever the directory changes.
+async function watchReviewDue(state: DaemonState): Promise<void> {
+  const scan = (when: ReviewDueCheck) => {
+    for (const instance of readInstances()) armReviewDue(state, instance.configPath, when);
+  };
+  scan("start");
+  const chokidar = await loadChokidar();
+  if (!chokidar) return;
+  try {
+    fs.mkdirSync(reviewDueDir(), { recursive: true });
+    const watcher = chokidar.watch(reviewDueDir(), { ignoreInitial: true, depth: 0 }) as unknown as Watcher;
+    let timer: NodeJS.Timeout | undefined;
+    watcher.on("all", () => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        scan("change");
+      }, 500);
+    });
+  } catch (error) {
+    logSidecarEvent("failure", {
+      command: "daemon",
+      message: `could not watch review due times: ${error instanceof Error ? error.message : String(error)}`,
     });
   }
 }
