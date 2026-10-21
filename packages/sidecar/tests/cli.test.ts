@@ -716,13 +716,16 @@ describe("redaction", () => {
     ["POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}", "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-<SECRET>}"],
     ["echo ${#DB_PASSWORD:-hunter2}", "echo ${#DB_PASSWORD:-<SECRET>}"],
     ['echo ${DB_PASSWORD:-"pre$(printf "%s" "}hunter2")"}', "echo ${DB_PASSWORD:-<SECRET>}"],
-    // A command's arguments can be literals; only a bare one that would no
-    // longer parse, with nothing inside to redact, is left alone.
+    // A command's arguments can be literals. Only a plain command name, all
+    // the old pattern would have replaced, is left alone.
     ["echo ${DB_PASSWORD:-$(security find-generic-password -s db -w)}", "echo ${DB_PASSWORD:-<SECRET>}"],
     ['export GITHUB_TOKEN="$(gh auth token)"', 'export GITHUB_TOKEN="<TOKEN>"'],
     ['PASSWORD="$(printf %s hunter2)"', 'PASSWORD="<SECRET>"'],
     ["PASSWORD=$((12345678))", "PASSWORD=<SECRET>"],
-    ["export GITHUB_TOKEN=$(echo password=hunter2)", "export GITHUB_TOKEN=<TOKEN> password=<SECRET>"],
+    ["PASSWORD=$(cat<<<hunter2)", "PASSWORD=<SECRET>"],
+    ["PASSWORD=$(echo${IFS}hunter2)", "PASSWORD=<SECRET>"],
+    ["export GITHUB_TOKEN=$(echo password=hunter2)", "export GITHUB_TOKEN=$(echo password=<SECRET>"],
+    ["PASSWORD=$(echo password=<SECRET>)", "PASSWORD=$(echo password=<SECRET>"],
     // Unterminated: nothing to keep, so the rest of the line goes.
     ["echo ${DB_PASSWORD:-hunter2", "echo ${DB_PASSWORD:-<SECRET>"],
     // A `$` before a key read by `=` is an assignment (PHP, PowerShell).
@@ -747,6 +750,7 @@ describe("redaction", () => {
     redactText(`${"${TOKEN:-".repeat(5000)}$FALLBACK${"}".repeat(5000)}`);
     redactText(`TOKEN=${"$(".repeat(5000)}x${")".repeat(5000)}`);
     redactText('"$('.repeat(5000));
+    redactText(`${"TOKEN=$(echo ".repeat(5000)}x${")".repeat(5000)}`);
     expect(Date.now() - started).toBeLessThan(1000);
   });
 

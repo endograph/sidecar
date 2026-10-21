@@ -156,30 +156,27 @@ function isShellReference(value: string, depth = 0): boolean {
   return word !== undefined && (word === "" || isPlaceholder(word) || isShellReference(word, depth + 1));
 }
 
-/**
- * Whether the unquoted value starting at `start` is wholly a reference, or a
- * command substitution with nothing inside to redact: `KEY=$(gh auth token)`.
- * Redacting either would leave a line that no longer parses, and the old
- * pattern only ever caught a command's first word. Quoted, a command is
- * still redacted: `KEY="<TOKEN>"` parses, and the quotes may hold a literal.
- */
-function startsWithShellReference(text: string, start: number): boolean {
+// `$(gh auth token)`: an unquoted value that opens a command substitution
+// with a plain command name. The value pattern stops at whitespace, so the
+// name is all it would replace, leaving `<TOKEN> auth token)`: no secret
+// removed, and a line that no longer parses. Anything less plain
+// (`$(cat<<<x)`, `$(echo${IFS}x)`, `$((1234))`) is redacted.
+const SHELL_COMMAND_NAME_VALUE = /^\$\([A-Za-z0-9_./+-]+\)?$/;
+
+/** Whether the unquoted value starting at `start` only refers to something else: `$NAME`, `${NAME}`, or a command. */
+function startsWithShellReference(text: string, start: number, value: string): boolean {
+  if (SHELL_COMMAND_NAME_VALUE.test(value)) return true;
   if (text[start] !== "$") return false;
   let end: number;
-  if (text[start + 1] === "{" || text[start + 1] === "(") {
-    end = shellWordEnd(text, start + 2, text[start + 1] === "{" ? "}" : ")");
+  if (text[start + 1] === "{") {
+    end = shellWordEnd(text, start + 2, "}");
     if (end === -1) return false;
     end += 1;
   } else {
     end = start + 1 + (/^[A-Za-z0-9_]*/.exec(text.slice(start + 1))?.[0].length ?? 0);
   }
   if (end < text.length && !/[\s;&|)]/.test(text[end])) return false;
-  const value = text.slice(start, end);
-  if (!value.startsWith("$(")) return isShellReference(value);
-  // Arithmetic is a literal number, not a command.
-  if (value.startsWith("$((")) return false;
-  const command = value.slice(2, -1);
-  return redactText(command, "secrets") === command;
+  return isShellReference(text.slice(start, end));
 }
 
 const AUTHORIZATION_HEADER_REGEX = /\b(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)([^\s"',;`]+)/gi;
@@ -228,9 +225,9 @@ export function redactText(input: string, mode: RedactionMode = DEFAULT_REDACTIO
     })
     .replace(
       BARE_ASSIGNMENT_SECRET_REGEX,
-      (match, key: string, separator: string, _value: string, offset: number, text: string) => {
+      (match, key: string, separator: string, value: string, offset: number, text: string) => {
         if (!isSensitiveKey(key) || isShellReadOfKey(text, offset, separator)) return match;
-        if (startsWithShellReference(text, offset + key.length + separator.length)) return match;
+        if (startsWithShellReference(text, offset + key.length + separator.length, value)) return match;
         return `${key}${separator}${placeholderForKey(key)}`;
       },
     );

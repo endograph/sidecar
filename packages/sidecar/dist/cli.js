@@ -1548,12 +1548,14 @@ function isShellReference(value, depth = 0) {
   const word = /^:?[-=+](?<word>.*)$/s.exec(rest)?.groups?.word;
   return word !== undefined && (word === "" || isPlaceholder(word) || isShellReference(word, depth + 1));
 }
-function startsWithShellReference(text, start) {
+function startsWithShellReference(text, start, value) {
+  if (SHELL_COMMAND_NAME_VALUE.test(value))
+    return true;
   if (text[start] !== "$")
     return false;
   let end;
-  if (text[start + 1] === "{" || text[start + 1] === "(") {
-    end = shellWordEnd(text, start + 2, text[start + 1] === "{" ? "}" : ")");
+  if (text[start + 1] === "{") {
+    end = shellWordEnd(text, start + 2, "}");
     if (end === -1)
       return false;
     end += 1;
@@ -1562,13 +1564,7 @@ function startsWithShellReference(text, start) {
   }
   if (end < text.length && !/[\s;&|)]/.test(text[end]))
     return false;
-  const value = text.slice(start, end);
-  if (!value.startsWith("$("))
-    return isShellReference(value);
-  if (value.startsWith("$(("))
-    return false;
-  const command = value.slice(2, -1);
-  return redactText(command, "secrets") === command;
+  return isShellReference(text.slice(start, end));
 }
 function redactText(input, mode = DEFAULT_REDACTION_MODE) {
   if (mode === "none")
@@ -1582,10 +1578,10 @@ function redactText(input, mode = DEFAULT_REDACTION_MODE) {
     if (valueQuote === '"' && isShellReference(value))
       return match;
     return `${keyQuote}${key}${keyQuote}${separator}${valueQuote}${placeholderForKey(key)}${valueQuote}`;
-  }).replace(BARE_ASSIGNMENT_SECRET_REGEX, (match, key, separator, _value, offset, text) => {
+  }).replace(BARE_ASSIGNMENT_SECRET_REGEX, (match, key, separator, value, offset, text) => {
     if (!isSensitiveKey(key) || isShellReadOfKey(text, offset, separator))
       return match;
-    if (startsWithShellReference(text, offset + key.length + separator.length))
+    if (startsWithShellReference(text, offset + key.length + separator.length, value))
       return match;
     return `${key}${separator}${placeholderForKey(key)}`;
   });
@@ -1655,7 +1651,7 @@ function isLikelyCreditCard(value) {
   }
   return sum % 10 === 0;
 }
-var DEFAULT_REDACTION_MODE = "secrets", REDACTION_MODES, KEY_NAME_PATTERN, QUOTED_SECRET_REGEX, BARE_ASSIGNMENT_SECRET_REGEX, SHELL_NAME_PATTERN, SHELL_EXPANSION_OPEN, SHELL_DEFAULT_REGEX, SHELL_EXPANSION_KEY_PREFIX, SHELL_EXPANSION_INNER, SHELL_DIRECTORY_NAMES, SHELL_VARIABLE_REFERENCE, SHELL_NESTING_LIMIT = 16, AUTHORIZATION_HEADER_REGEX, PEM_PRIVATE_KEY_REGEX, URL_CREDENTIALS_REGEX, BARE_BEARER_TOKEN_REGEX, TOKEN_PATTERNS, EMAIL_REGEX, PHONE_REGEX, SSN_REGEX, CREDIT_CARD_CANDIDATE_REGEX, PLACEHOLDER_REGEX, COMPACT_SENSITIVE_KEYS;
+var DEFAULT_REDACTION_MODE = "secrets", REDACTION_MODES, KEY_NAME_PATTERN, QUOTED_SECRET_REGEX, BARE_ASSIGNMENT_SECRET_REGEX, SHELL_NAME_PATTERN, SHELL_EXPANSION_OPEN, SHELL_DEFAULT_REGEX, SHELL_EXPANSION_KEY_PREFIX, SHELL_EXPANSION_INNER, SHELL_DIRECTORY_NAMES, SHELL_VARIABLE_REFERENCE, SHELL_NESTING_LIMIT = 16, SHELL_COMMAND_NAME_VALUE, AUTHORIZATION_HEADER_REGEX, PEM_PRIVATE_KEY_REGEX, URL_CREDENTIALS_REGEX, BARE_BEARER_TOKEN_REGEX, TOKEN_PATTERNS, EMAIL_REGEX, PHONE_REGEX, SSN_REGEX, CREDIT_CARD_CANDIDATE_REGEX, PLACEHOLDER_REGEX, COMPACT_SENSITIVE_KEYS;
 var init_redaction = __esm(() => {
   REDACTION_MODES = ["none", "secrets", "secrets+pii"];
   KEY_NAME_PATTERN = String.raw`[A-Za-z0-9_][A-Za-z0-9_-]*`;
@@ -1668,6 +1664,7 @@ var init_redaction = __esm(() => {
   SHELL_EXPANSION_INNER = new RegExp(String.raw`^(?:\([^()\s]*\))?[#!^=~]*${SHELL_NAME_PATTERN}(?<rest>.*)$`, "s");
   SHELL_DIRECTORY_NAMES = new Set(["PWD", "OLDPWD"]);
   SHELL_VARIABLE_REFERENCE = new RegExp(String.raw`^\$(?:[A-Z_][A-Z0-9_]*)$`);
+  SHELL_COMMAND_NAME_VALUE = /^\$\([A-Za-z0-9_./+-]+\)?$/;
   AUTHORIZATION_HEADER_REGEX = /\b(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)([^\s"',;`]+)/gi;
   PEM_PRIVATE_KEY_REGEX = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g;
   URL_CREDENTIALS_REGEX = /(\/\/[^\s/:@"'`]+):([^\s/@"'`]+)@/g;
