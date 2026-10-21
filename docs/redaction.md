@@ -40,9 +40,10 @@ though the name looks sensitive and the `:` looks like `key: value`. So is an
 assignment whose whole value names another variable (`$GH_TOKEN`,
 `"${GH_TOKEN}"`), and the command name of an unquoted command, as in
 `export GITHUB_TOKEN=$(gh auth token)`. Replacing either would leave a line
-that no longer parses. A command's arguments are not checked, so keep
-literal secrets out of them. A quoted command (`"$(gh auth token)"`) is
-still redacted whole, since `"<TOKEN>"` parses.
+that no longer parses. The command's arguments still go through the other
+patterns, but a bare literal argument (`$(printf %s hunter2)`) isn't
+recognized as a secret, so keep secrets out of them. A quoted command
+(`"$(gh auth token)"`) is still redacted whole, since `"<TOKEN>"` parses.
 
 The one part of an expansion that can hold a literal secret is the word of a
 default, assign, or alternate (`:-`, `:=`, `:+`, and the forms without `:`).

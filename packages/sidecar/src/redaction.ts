@@ -160,8 +160,10 @@ function isShellReference(value: string, depth = 0): boolean {
 // with a plain command name. The value pattern stops at whitespace, so the
 // name is all it would replace, leaving `<TOKEN> auth token)`: no secret
 // removed, and a line that no longer parses. Anything less plain
-// (`$(cat<<<x)`, `$(echo${IFS}x)`, `$((1234))`) is redacted.
-const SHELL_COMMAND_NAME_VALUE = /^\$\([A-Za-z0-9_./+-]+\)?$/;
+// (`$(cat<<<x)`, `$(echo${IFS}x)`, `$((1234))`) is redacted. A name the
+// token patterns later replace must still pass as their placeholder, or the
+// next pass would redact differently.
+const SHELL_COMMAND_NAME_VALUE = /^\$\((?:[A-Za-z0-9_./+-]+|<(?:API_KEY|TOKEN|SECRET|PRIVATEKEY|EMAIL|PHONENUMBER|SSN|CREDITCARD)>)\)?$/;
 
 /** Whether the unquoted value starting at `start` only refers to something else: `$NAME`, `${NAME}`, or a command. */
 function startsWithShellReference(text: string, start: number, value: string): boolean {

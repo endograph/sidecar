@@ -723,6 +723,7 @@ describe("redaction", () => {
     ['PASSWORD="$(printf %s hunter2)"', 'PASSWORD="<SECRET>"'],
     ["PASSWORD=$((12345678))", "PASSWORD=<SECRET>"],
     ["PASSWORD=$(cat<<<hunter2)", "PASSWORD=<SECRET>"],
+    ["PASSWORD=$(sk-1234567890abcdef)", "PASSWORD=$(<API_KEY>)"],
     ["PASSWORD=$(echo${IFS}hunter2)", "PASSWORD=<SECRET>"],
     ["export GITHUB_TOKEN=$(echo password=hunter2)", "export GITHUB_TOKEN=$(echo password=<SECRET>"],
     ["PASSWORD=$(echo password=<SECRET>)", "PASSWORD=$(echo password=<SECRET>"],
