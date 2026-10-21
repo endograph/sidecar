@@ -37,9 +37,12 @@ below — emails, phone numbers, SSNs, and credit card numbers.
 A shell expansion reads a variable; it doesn't assign one. `${PWD:t}`,
 `${PASSWORD:0:3}`, `${TOKEN:?unset}`, and `$TOKEN:foo` are left alone, even
 though the name looks sensitive and the `:` looks like `key: value`. So is an
-assignment whose whole value refers to something else — `$GH_TOKEN`,
-`${GH_TOKEN}`, or a command such as `$(gh auth token)`. The value is
-fetched when the line runs, and isn't written in the file to strip.
+assignment whose whole value names another variable (`$GH_TOKEN`,
+`"${GH_TOKEN}"`), and an unquoted command such as
+`export GITHUB_TOKEN=$(gh auth token)` with nothing inside it to redact.
+Replacing either would leave a line that no longer parses. A quoted command
+(`"$(gh auth token)"`) is still redacted: its arguments could be literal
+secrets, and `"<TOKEN>"` still parses.
 
 The one part of an expansion that can hold a literal secret is the word of a
 default, assign, or alternate (`:-`, `:=`, `:+`, and the forms without `:`).

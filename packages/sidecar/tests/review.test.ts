@@ -163,7 +163,7 @@ describe("opening a review", () => {
       "diff --git a/a.md b/a.md",
       "--- a/a.md",
       "+++ b/a.md",
-      "@@ -1,3 +1,4 @@",
+      "@@ -1,2 +1,4 @@",
       "-token: <TOKEN>",
       "+++ b/fake.md <TOKEN>",
       "+@@ -1 +1 @@",
@@ -180,12 +180,24 @@ describe("opening a review", () => {
       "+++ b/new.md",
       "@@ -0,0 +1 @@",
       "+key: <API_KEY>",
+      "diff --git a/my notes.md b/my notes.md",
+      "--- a/my notes.md\t",
+      "+++ b/my notes.md\t",
+      "@@ -0,0 +1 @@",
+      "+token: <TOKEN>",
+      'diff --git "a/caf\\303\\251\\tx.md" "b/caf\\303\\251\\tx.md"',
+      '--- "a/caf\\303\\251\\tx.md"',
+      '+++ "b/caf\\303\\251\\tx.md"',
+      "@@ -0,0 +1 @@",
+      "+token: <TOKEN>",
       "",
     ].join("\n"));
     expect(lines).toEqual([
       { file: "a.md", line: 1, text: "++ b/fake.md <TOKEN>" },
       { file: "a.md", line: 4, text: "password: <SECRET>" },
       { file: "new.md", line: 1, text: "key: <API_KEY>" },
+      { file: "my notes.md", line: 1, text: "token: <TOKEN>" },
+      { file: "café\tx.md", line: 1, text: "token: <TOKEN>" },
     ]);
   });
 

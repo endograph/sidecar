@@ -1454,21 +1454,24 @@ function redactShellDefaults(text) {
   let copied = 0;
   for (const match of text.matchAll(SHELL_DEFAULT_REGEX)) {
     const [whole, open, name, operator] = match;
-    const wordStart = match.index + whole.length;
-    if (match.index < copied || SHELL_DIRECTORY_NAMES.has(name) || !isSensitiveKey(name))
+    if (match.index < copied)
       continue;
+    if (SHELL_DIRECTORY_NAMES.has(name) || !isSensitiveKey(name))
+      continue;
+    const wordStart = match.index + whole.length;
     const end = shellWordEnd(text, wordStart, "}");
     const wordEnd = end === -1 ? lineEnd(text, wordStart) : end;
     const word = text.slice(wordStart, wordEnd);
-    if (!word || isShellReference(word) || isPlaceholder(word))
-      continue;
-    output += `${text.slice(copied, match.index)}${open}${name}${operator}${placeholderForKey(name)}`;
+    output += text.slice(copied, wordStart);
+    output += !word || isPlaceholder(word) || isShellReference(word) ? word : placeholderForKey(name);
     copied = wordEnd;
   }
   return output + text.slice(copied);
 }
-function shellWordEnd(text, start, close) {
-  const closers = [close];
+function shellWordEnd(text, start, close, depth = 0) {
+  if (depth > SHELL_NESTING_LIMIT)
+    return -1;
+  let parens = 0;
   for (let index = start;index < text.length; index += 1) {
     const char = text[index];
     if (char === `
@@ -1477,33 +1480,46 @@ function shellWordEnd(text, start, close) {
     if (char === "\\") {
       index += 1;
     } else if (char === "'" || char === '"' || char === "`") {
-      const quoteEnd = closingQuote(text, index + 1, char);
-      if (quoteEnd === -1)
+      index = closingQuote(text, index + 1, char, depth + 1);
+      if (index === -1)
         return -1;
-      index = quoteEnd;
     } else if (char === "$" && (text[index + 1] === "{" || text[index + 1] === "(")) {
-      closers.push(text[index + 1] === "{" ? "}" : ")");
-      index += 1;
-    } else if (char === "(" && closers.at(-1) === ")") {
-      closers.push(")");
-    } else if (char === closers.at(-1)) {
-      closers.pop();
-      if (!closers.length)
-        return index;
+      index = shellWordEnd(text, index + 2, text[index + 1] === "{" ? "}" : ")", depth + 1);
+      if (index === -1)
+        return -1;
+    } else if (close === ")" && char === "(") {
+      parens += 1;
+    } else if (close === ")" && char === ")" && parens > 0) {
+      parens -= 1;
+    } else if (char === close) {
+      return index;
     }
   }
   return -1;
 }
-function closingQuote(text, start, quote) {
+function closingQuote(text, start, quote, depth) {
+  if (depth > SHELL_NESTING_LIMIT)
+    return -1;
   for (let index = start;index < text.length; index += 1) {
     const char = text[index];
     if (char === `
 ` || char === "\r")
       return -1;
-    if (char === "\\" && quote !== "'")
-      index += 1;
-    else if (char === quote)
+    if (char === quote)
       return index;
+    if (quote === "'")
+      continue;
+    if (char === "\\") {
+      index += 1;
+    } else if (quote === '"' && char === "$" && (text[index + 1] === "{" || text[index + 1] === "(")) {
+      index = shellWordEnd(text, index + 2, text[index + 1] === "{" ? "}" : ")", depth + 1);
+      if (index === -1)
+        return -1;
+    } else if (quote === '"' && char === "`") {
+      index = closingQuote(text, index + 1, "`", depth + 1);
+      if (index === -1)
+        return -1;
+    }
   }
   return -1;
 }
@@ -1516,25 +1532,21 @@ function isShellReadOfKey(text, offset, separator) {
     return true;
   return text[offset - 1] === "$" && separator.trim().startsWith(":");
 }
-function isShellReference(value) {
+function isShellReference(value, depth = 0) {
+  if (depth > SHELL_NESTING_LIMIT)
+    return false;
   const unquoted = value.length > 1 && value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value;
   if (SHELL_VARIABLE_REFERENCE.test(unquoted))
     return true;
-  if (!unquoted.startsWith("${") && !unquoted.startsWith("$("))
+  if (!unquoted.startsWith("${") || shellWordEnd(unquoted, 2, "}") !== unquoted.length - 1)
     return false;
-  const close = unquoted[1] === "{" ? "}" : ")";
-  if (shellWordEnd(unquoted, 2, close) !== unquoted.length - 1)
-    return false;
-  if (close === ")")
-    return true;
-  const inner = new RegExp(String.raw`^(?:\([^()\s]*\))?[#!^=~]*${SHELL_NAME_PATTERN}(?<rest>.*)$`, "s").exec(unquoted.slice(2, -1));
-  const rest = inner?.groups?.rest;
+  const rest = SHELL_EXPANSION_INNER.exec(unquoted.slice(2, -1))?.groups?.rest;
   if (rest === undefined)
     return false;
   if (rest === "" || /^:?\?/.test(rest) || /^(?::[a-zA-Z0-9]+)+$/.test(rest))
     return true;
   const word = /^:?[-=+](?<word>.*)$/s.exec(rest)?.groups?.word;
-  return word !== undefined && (word === "" || isPlaceholder(word) || isShellReference(word));
+  return word !== undefined && (word === "" || isPlaceholder(word) || isShellReference(word, depth + 1));
 }
 function startsWithShellReference(text, start) {
   if (text[start] !== "$")
@@ -1550,7 +1562,13 @@ function startsWithShellReference(text, start) {
   }
   if (end < text.length && !/[\s;&|)]/.test(text[end]))
     return false;
-  return isShellReference(text.slice(start, end));
+  const value = text.slice(start, end);
+  if (!value.startsWith("$("))
+    return isShellReference(value);
+  if (value.startsWith("$(("))
+    return false;
+  const command = value.slice(2, -1);
+  return redactText(command, "secrets") === command;
 }
 function redactText(input, mode = DEFAULT_REDACTION_MODE) {
   if (mode === "none")
@@ -1637,16 +1655,17 @@ function isLikelyCreditCard(value) {
   }
   return sum % 10 === 0;
 }
-var DEFAULT_REDACTION_MODE = "secrets", REDACTION_MODES, KEY_NAME_PATTERN, QUOTED_SECRET_REGEX, BARE_ASSIGNMENT_SECRET_REGEX, SHELL_NAME_PATTERN, SHELL_EXPANSION_OPEN, SHELL_DEFAULT_REGEX, SHELL_EXPANSION_KEY_PREFIX, SHELL_DIRECTORY_NAMES, SHELL_VARIABLE_REFERENCE, AUTHORIZATION_HEADER_REGEX, PEM_PRIVATE_KEY_REGEX, URL_CREDENTIALS_REGEX, BARE_BEARER_TOKEN_REGEX, TOKEN_PATTERNS, EMAIL_REGEX, PHONE_REGEX, SSN_REGEX, CREDIT_CARD_CANDIDATE_REGEX, PLACEHOLDER_REGEX, COMPACT_SENSITIVE_KEYS;
+var DEFAULT_REDACTION_MODE = "secrets", REDACTION_MODES, KEY_NAME_PATTERN, QUOTED_SECRET_REGEX, BARE_ASSIGNMENT_SECRET_REGEX, SHELL_NAME_PATTERN, SHELL_EXPANSION_OPEN, SHELL_DEFAULT_REGEX, SHELL_EXPANSION_KEY_PREFIX, SHELL_EXPANSION_INNER, SHELL_DIRECTORY_NAMES, SHELL_VARIABLE_REFERENCE, SHELL_NESTING_LIMIT = 16, AUTHORIZATION_HEADER_REGEX, PEM_PRIVATE_KEY_REGEX, URL_CREDENTIALS_REGEX, BARE_BEARER_TOKEN_REGEX, TOKEN_PATTERNS, EMAIL_REGEX, PHONE_REGEX, SSN_REGEX, CREDIT_CARD_CANDIDATE_REGEX, PLACEHOLDER_REGEX, COMPACT_SENSITIVE_KEYS;
 var init_redaction = __esm(() => {
   REDACTION_MODES = ["none", "secrets", "secrets+pii"];
   KEY_NAME_PATTERN = String.raw`[A-Za-z0-9_][A-Za-z0-9_-]*`;
   QUOTED_SECRET_REGEX = new RegExp(String.raw`(?:(?<keyQuote>["'])|\b)(?<key>${KEY_NAME_PATTERN})\k<keyQuote>` + String.raw`(?<separator>\s*[:=]\s*)(?<valueQuote>["'])(?<value>(?:\\[^\r\n]|(?!\k<valueQuote>)[^\\\r\n])+)\k<valueQuote>`, "g");
   BARE_ASSIGNMENT_SECRET_REGEX = new RegExp(String.raw`\b(${KEY_NAME_PATTERN})(\s*[:=]\s*)([^\s"',;` + "`" + String.raw`]+)`, "g");
   SHELL_NAME_PATTERN = String.raw`[A-Za-z_][A-Za-z0-9_]*`;
-  SHELL_EXPANSION_OPEN = String.raw`\$\{(?:\([^()\s]*\))?[!^=~]*`;
+  SHELL_EXPANSION_OPEN = String.raw`\$\{(?:\([^()\s]*\))?[#!^=~]*`;
   SHELL_DEFAULT_REGEX = new RegExp(String.raw`(${SHELL_EXPANSION_OPEN})(${SHELL_NAME_PATTERN})(:?[-=+])`, "g");
-  SHELL_EXPANSION_KEY_PREFIX = new RegExp(String.raw`\$\{(?:\([^()\s]*\))?[#!^=~]*$`);
+  SHELL_EXPANSION_KEY_PREFIX = new RegExp(`${SHELL_EXPANSION_OPEN}$`);
+  SHELL_EXPANSION_INNER = new RegExp(String.raw`^(?:\([^()\s]*\))?[#!^=~]*${SHELL_NAME_PATTERN}(?<rest>.*)$`, "s");
   SHELL_DIRECTORY_NAMES = new Set(["PWD", "OLDPWD"]);
   SHELL_VARIABLE_REFERENCE = new RegExp(String.raw`^\$(?:[A-Z_][A-Z0-9_]*)$`);
   AUTHORIZATION_HEADER_REGEX = /\b(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)([^\s"',;`]+)/gi;
@@ -4937,8 +4956,7 @@ function addedPlaceholderLines(patch) {
     if (line.startsWith("diff --git ")) {
       file = undefined;
     } else if (line.startsWith("+++ ")) {
-      const target = line.slice(4);
-      file = target === "/dev/null" ? undefined : target.replace(/^b\//, "");
+      file = patchHeaderPath(line.slice(4));
     } else {
       const hunk = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
       if (hunk) {
@@ -4949,6 +4967,36 @@ function addedPlaceholderLines(patch) {
     }
   }
   return found;
+}
+function patchHeaderPath(header) {
+  const target = header.endsWith("\t") ? header.slice(0, -1) : header;
+  if (target === "/dev/null")
+    return;
+  const name = target.length > 1 && target.startsWith('"') && target.endsWith('"') ? unquoteGitPath(target.slice(1, -1)) : target;
+  return name.replace(/^b\//, "");
+}
+function unquoteGitPath(quoted) {
+  const parts = [];
+  let literal = "";
+  for (let index = 0;index < quoted.length; index += 1) {
+    if (quoted[index] !== "\\" || index + 1 === quoted.length) {
+      literal += quoted[index];
+      continue;
+    }
+    parts.push(Buffer.from(literal, "utf8"));
+    literal = "";
+    const octal = /^[0-3][0-7]{2}/.exec(quoted.slice(index + 1))?.[0];
+    if (octal) {
+      parts.push(Buffer.from([Number.parseInt(octal, 8)]));
+      index += 3;
+    } else {
+      const next = quoted[index + 1];
+      parts.push(GIT_PATH_ESCAPES[next] === undefined ? Buffer.from(next, "utf8") : Buffer.from([GIT_PATH_ESCAPES[next]]));
+      index += 1;
+    }
+  }
+  parts.push(Buffer.from(literal, "utf8"));
+  return Buffer.concat(parts).toString("utf8");
 }
 function placeholderSection(lines) {
   if (!lines.length)
@@ -5114,7 +5162,7 @@ function decideReview(review, verdict, reason) {
   review.state = verdict;
   logSidecarEvent("review-decision", { id: review.record.id, verdict });
 }
-var REVIEW_SCHEMA = 1, KEEP_CLOSED_REVIEWS = 10, ID_PATTERN, LAUNCH_GRACE_SECONDS = 60, PACKET_DIFF_OPTIONS, PLACEHOLDER_LINES_SHOWN = 200;
+var REVIEW_SCHEMA = 1, KEEP_CLOSED_REVIEWS = 10, ID_PATTERN, LAUNCH_GRACE_SECONDS = 60, PACKET_DIFF_OPTIONS, GIT_PATH_ESCAPES, PLACEHOLDER_LINES_SHOWN = 200;
 var init_review = __esm(() => {
   init_util();
   init_git();
@@ -5124,6 +5172,7 @@ var init_review = __esm(() => {
   init_redaction();
   ID_PATTERN = /^[0-9a-f]+$/;
   PACKET_DIFF_OPTIONS = ["-r", "--no-renames", "--ignore-submodules=none"];
+  GIT_PATH_ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
 });
 
 // src/sync.ts

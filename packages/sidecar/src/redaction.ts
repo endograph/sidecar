@@ -34,34 +34,41 @@ const BARE_ASSIGNMENT_SECRET_REGEX = new RegExp(
 // literal secret — the word of a default (`${DB_PASSWORD:-hunter2}`), assign
 // (`:=`), or alternate (`:+`) — is redacted here instead, keeping the braces.
 const SHELL_NAME_PATTERN = String.raw`[A-Za-z_][A-Za-z0-9_]*`;
-// `${`, then zsh's `(flags)` and the `!`/`^`/`=`/`~` prefixes, then the name.
-const SHELL_EXPANSION_OPEN = String.raw`\$\{(?:\([^()\s]*\))?[!^=~]*`;
+// `${`, then zsh's `(flags)` and the `#`/`!`/`^`/`=`/`~` prefixes. One
+// grammar for both rules: a form skipped as a read must be one whose default
+// is redacted.
+const SHELL_EXPANSION_OPEN = String.raw`\$\{(?:\([^()\s]*\))?[#!^=~]*`;
 const SHELL_DEFAULT_REGEX = new RegExp(
   String.raw`(${SHELL_EXPANSION_OPEN})(${SHELL_NAME_PATTERN})(:?[-=+])`,
   "g",
 );
-const SHELL_EXPANSION_KEY_PREFIX = new RegExp(String.raw`\$\{(?:\([^()\s]*\))?[#!^=~]*$`);
+const SHELL_EXPANSION_KEY_PREFIX = new RegExp(`${SHELL_EXPANSION_OPEN}$`);
+const SHELL_EXPANSION_INNER = new RegExp(String.raw`^(?:\([^()\s]*\))?[#!^=~]*${SHELL_NAME_PATTERN}(?<rest>.*)$`, "s");
 // The shell's working directories. In an expansion they are always the
 // variable, never an ODBC-style `PWD=` password.
 const SHELL_DIRECTORY_NAMES = new Set(["PWD", "OLDPWD"]);
 // Upper case only: in a `.env` file, `PASSWORD=$ecret` may be a literal.
 const SHELL_VARIABLE_REFERENCE = new RegExp(String.raw`^\$(?:[A-Z_][A-Z0-9_]*)$`);
+// Deeper nesting is treated as unterminated, and so redacted: hostile input
+// must not make the clean filter recurse or rescan without bound.
+const SHELL_NESTING_LIMIT = 16;
 
 function redactShellDefaults(text: string): string {
   let output = "";
   let copied = 0;
   for (const match of text.matchAll(SHELL_DEFAULT_REGEX)) {
     const [whole, open, name, operator] = match;
+    // Inside a word already redacted, or already found to be only references.
+    if (match.index < copied) continue;
+    if (SHELL_DIRECTORY_NAMES.has(name) || !isSensitiveKey(name)) continue;
     const wordStart = match.index + whole.length;
-    // A default nested in an earlier, already-redacted word is gone with it.
-    if (match.index < copied || SHELL_DIRECTORY_NAMES.has(name) || !isSensitiveKey(name)) continue;
     const end = shellWordEnd(text, wordStart, "}");
     // Unterminated on this line: there is no closing brace to keep, so the
     // rest of the line goes, as the assignment pattern would have taken it.
     const wordEnd = end === -1 ? lineEnd(text, wordStart) : end;
     const word = text.slice(wordStart, wordEnd);
-    if (!word || isShellReference(word) || isPlaceholder(word)) continue;
-    output += `${text.slice(copied, match.index)}${open}${name}${operator}${placeholderForKey(name)}`;
+    output += text.slice(copied, wordStart);
+    output += !word || isPlaceholder(word) || isShellReference(word) ? word : placeholderForKey(name);
     copied = wordEnd;
   }
   return output + text.slice(copied);
@@ -73,36 +80,48 @@ function redactShellDefaults(text: string): string {
  * quotes, backticks, and nested `${…}` and `$(…)` are skipped, so a brace
  * inside them never ends the word early and leaves part of it behind.
  */
-function shellWordEnd(text: string, start: number, close: "}" | ")"): number {
-  const closers: string[] = [close];
+function shellWordEnd(text: string, start: number, close: "}" | ")", depth = 0): number {
+  if (depth > SHELL_NESTING_LIMIT) return -1;
+  let parens = 0;
   for (let index = start; index < text.length; index += 1) {
     const char = text[index];
     if (char === "\n" || char === "\r") return -1;
     if (char === "\\") {
       index += 1;
     } else if (char === "'" || char === '"' || char === "`") {
-      const quoteEnd = closingQuote(text, index + 1, char);
-      if (quoteEnd === -1) return -1;
-      index = quoteEnd;
+      index = closingQuote(text, index + 1, char, depth + 1);
+      if (index === -1) return -1;
     } else if (char === "$" && (text[index + 1] === "{" || text[index + 1] === "(")) {
-      closers.push(text[index + 1] === "{" ? "}" : ")");
-      index += 1;
-    } else if (char === "(" && closers.at(-1) === ")") {
-      closers.push(")");
-    } else if (char === closers.at(-1)) {
-      closers.pop();
-      if (!closers.length) return index;
+      index = shellWordEnd(text, index + 2, text[index + 1] === "{" ? "}" : ")", depth + 1);
+      if (index === -1) return -1;
+    } else if (close === ")" && char === "(") {
+      parens += 1;
+    } else if (close === ")" && char === ")" && parens > 0) {
+      parens -= 1;
+    } else if (char === close) {
+      return index;
     }
   }
   return -1;
 }
 
-function closingQuote(text: string, start: number, quote: string): number {
+/** The index of the quote closing one opened before `start`; a double quote's expansions are skipped whole. */
+function closingQuote(text: string, start: number, quote: string, depth: number): number {
+  if (depth > SHELL_NESTING_LIMIT) return -1;
   for (let index = start; index < text.length; index += 1) {
     const char = text[index];
     if (char === "\n" || char === "\r") return -1;
-    if (char === "\\" && quote !== "'") index += 1;
-    else if (char === quote) return index;
+    if (char === quote) return index;
+    if (quote === "'") continue;
+    if (char === "\\") {
+      index += 1;
+    } else if (quote === '"' && char === "$" && (text[index + 1] === "{" || text[index + 1] === "(")) {
+      index = shellWordEnd(text, index + 2, text[index + 1] === "{" ? "}" : ")", depth + 1);
+      if (index === -1) return -1;
+    } else if (quote === '"' && char === "`") {
+      index = closingQuote(text, index + 1, "`", depth + 1);
+      if (index === -1) return -1;
+    }
   }
   return -1;
 }
@@ -119,27 +138,31 @@ function isShellReadOfKey(text: string, offset: number, separator: string): bool
 }
 
 /**
- * Whether a value is only a reference to something else, which is never a
- * literal secret: `$NAME`, `$(command)`, or `${NAME}` (with a modifier, an
- * error message, or a default that is itself a reference or a placeholder).
- * One pair of double quotes around it is allowed.
+ * Whether a value only names another variable, which is never a literal
+ * secret: `$NAME`, or `${NAME}` with a modifier, an error message, or a
+ * default that is itself a reference or a placeholder. One pair of double
+ * quotes around it is allowed. A command is not a reference: its arguments
+ * can be literals.
  */
-function isShellReference(value: string): boolean {
+function isShellReference(value: string, depth = 0): boolean {
+  if (depth > SHELL_NESTING_LIMIT) return false;
   const unquoted = value.length > 1 && value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value;
   if (SHELL_VARIABLE_REFERENCE.test(unquoted)) return true;
-  if (!unquoted.startsWith("${") && !unquoted.startsWith("$(")) return false;
-  const close = unquoted[1] === "{" ? "}" : ")";
-  if (shellWordEnd(unquoted, 2, close) !== unquoted.length - 1) return false;
-  if (close === ")") return true;
-  const inner = new RegExp(String.raw`^(?:\([^()\s]*\))?[#!^=~]*${SHELL_NAME_PATTERN}(?<rest>.*)$`, "s").exec(unquoted.slice(2, -1));
-  const rest = inner?.groups?.rest;
+  if (!unquoted.startsWith("${") || shellWordEnd(unquoted, 2, "}") !== unquoted.length - 1) return false;
+  const rest = SHELL_EXPANSION_INNER.exec(unquoted.slice(2, -1))?.groups?.rest;
   if (rest === undefined) return false;
   if (rest === "" || /^:?\?/.test(rest) || /^(?::[a-zA-Z0-9]+)+$/.test(rest)) return true;
   const word = /^:?[-=+](?<word>.*)$/s.exec(rest)?.groups?.word;
-  return word !== undefined && (word === "" || isPlaceholder(word) || isShellReference(word));
+  return word !== undefined && (word === "" || isPlaceholder(word) || isShellReference(word, depth + 1));
 }
 
-/** Whether the bare value starting at `start` is wholly a reference: `KEY=$(gh auth token)`. */
+/**
+ * Whether the unquoted value starting at `start` is wholly a reference, or a
+ * command substitution with nothing inside to redact: `KEY=$(gh auth token)`.
+ * Redacting either would leave a line that no longer parses, and the old
+ * pattern only ever caught a command's first word. Quoted, a command is
+ * still redacted: `KEY="<TOKEN>"` parses, and the quotes may hold a literal.
+ */
 function startsWithShellReference(text: string, start: number): boolean {
   if (text[start] !== "$") return false;
   let end: number;
@@ -151,7 +174,12 @@ function startsWithShellReference(text: string, start: number): boolean {
     end = start + 1 + (/^[A-Za-z0-9_]*/.exec(text.slice(start + 1))?.[0].length ?? 0);
   }
   if (end < text.length && !/[\s;&|)]/.test(text[end])) return false;
-  return isShellReference(text.slice(start, end));
+  const value = text.slice(start, end);
+  if (!value.startsWith("$(")) return isShellReference(value);
+  // Arithmetic is a literal number, not a command.
+  if (value.startsWith("$((")) return false;
+  const command = value.slice(2, -1);
+  return redactText(command, "secrets") === command;
 }
 
 const AUTHORIZATION_HEADER_REGEX = /\b(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)([^\s"',;`]+)/gi;

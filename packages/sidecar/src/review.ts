@@ -453,8 +453,7 @@ export function addedPlaceholderLines(patch: string): PlaceholderLine[] {
     if (line.startsWith("diff --git ")) {
       file = undefined;
     } else if (line.startsWith("+++ ")) {
-      const target = line.slice(4);
-      file = target === "/dev/null" ? undefined : target.replace(/^b\//, "");
+      file = patchHeaderPath(line.slice(4));
     } else {
       const hunk = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
       if (hunk) {
@@ -465,6 +464,45 @@ export function addedPlaceholderLines(patch: string): PlaceholderLine[] {
     }
   }
   return found;
+}
+
+/**
+ * The new path a `+++ ` header names, or undefined for a deletion. Git
+ * C-quotes a path with unusual bytes, and ends one containing a space with a
+ * tab.
+ */
+function patchHeaderPath(header: string): string | undefined {
+  const target = header.endsWith("\t") ? header.slice(0, -1) : header;
+  if (target === "/dev/null") return undefined;
+  const name = target.length > 1 && target.startsWith('"') && target.endsWith('"') ? unquoteGitPath(target.slice(1, -1)) : target;
+  return name.replace(/^b\//, "");
+}
+
+const GIT_PATH_ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/** Undoes git's C-style quoting; octal escapes are raw bytes of a UTF-8 path. */
+function unquoteGitPath(quoted: string): string {
+  const parts: Buffer[] = [];
+  let literal = "";
+  for (let index = 0; index < quoted.length; index += 1) {
+    if (quoted[index] !== "\\" || index + 1 === quoted.length) {
+      literal += quoted[index];
+      continue;
+    }
+    parts.push(Buffer.from(literal, "utf8"));
+    literal = "";
+    const octal = /^[0-3][0-7]{2}/.exec(quoted.slice(index + 1))?.[0];
+    if (octal) {
+      parts.push(Buffer.from([Number.parseInt(octal, 8)]));
+      index += 3;
+    } else {
+      const next = quoted[index + 1];
+      parts.push(GIT_PATH_ESCAPES[next] === undefined ? Buffer.from(next, "utf8") : Buffer.from([GIT_PATH_ESCAPES[next]]));
+      index += 1;
+    }
+  }
+  parts.push(Buffer.from(literal, "utf8"));
+  return Buffer.concat(parts).toString("utf8");
 }
 
 /** Past this many, the list points into the diff instead of growing. */
