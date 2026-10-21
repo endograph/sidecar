@@ -16,7 +16,7 @@ const QUOTED_SECRET_REGEX = new RegExp(
     // The escape branch is the only one that can consume a backslash, so the
     // alternation is unambiguous — an unterminated value can't trigger
     // exponential backtracking.
-    String.raw`(?<separator>\s*[:=]\s*)(?<valueQuote>["'])(?:\\[^\r\n]|(?!\k<valueQuote>)[^\\\r\n])+\k<valueQuote>`,
+    String.raw`(?<separator>\s*[:=]\s*)(?<valueQuote>["'])(?<value>(?:\\[^\r\n]|(?!\k<valueQuote>)[^\\\r\n])+)\k<valueQuote>`,
   "g",
 );
 
@@ -24,6 +24,162 @@ const BARE_ASSIGNMENT_SECRET_REGEX = new RegExp(
   String.raw`\b(${KEY_NAME_PATTERN})(\s*[:=]\s*)([^\s"',;` + "`" + String.raw`]+)`,
   "g",
 );
+
+// Shell parameter expansion reads a variable; it never assigns one. `${PWD:t}`
+// (zsh's tail modifier), `${PASSWORD:0:3}`, and `$TOKEN:foo` look like
+// `key: value` to the assignment patterns above, and redacting the "value"
+// eats the closing brace: the published file no longer parses, and every
+// other machine receives it as its working copy. So a key read through `$` or
+// `${` is skipped there, and the one part of an expansion that can carry a
+// literal secret — the word of a default (`${DB_PASSWORD:-hunter2}`), assign
+// (`:=`), or alternate (`:+`) — is redacted here instead, keeping the braces.
+const SHELL_NAME_PATTERN = String.raw`[A-Za-z_][A-Za-z0-9_]*`;
+// `${`, then zsh's `(flags)` and the `#`/`!`/`^`/`=`/`~` prefixes. One
+// grammar for both rules: a form skipped as a read must be one whose default
+// is redacted.
+const SHELL_EXPANSION_OPEN = String.raw`\$\{(?:\([^()\s]*\))?[#!^=~]*`;
+const SHELL_DEFAULT_REGEX = new RegExp(
+  String.raw`(${SHELL_EXPANSION_OPEN})(${SHELL_NAME_PATTERN})(:?[-=+])`,
+  "g",
+);
+const SHELL_EXPANSION_KEY_PREFIX = new RegExp(`${SHELL_EXPANSION_OPEN}$`);
+const SHELL_EXPANSION_INNER = new RegExp(String.raw`^(?:\([^()\s]*\))?[#!^=~]*${SHELL_NAME_PATTERN}(?<rest>.*)$`, "s");
+// The shell's working directories. In an expansion they are always the
+// variable, never an ODBC-style `PWD=` password.
+const SHELL_DIRECTORY_NAMES = new Set(["PWD", "OLDPWD"]);
+// Upper case only: in a `.env` file, `PASSWORD=$ecret` may be a literal.
+const SHELL_VARIABLE_REFERENCE = new RegExp(String.raw`^\$(?:[A-Z_][A-Z0-9_]*)$`);
+// Deeper nesting is treated as unterminated, and so redacted: hostile input
+// must not make the clean filter recurse or rescan without bound.
+const SHELL_NESTING_LIMIT = 16;
+
+function redactShellDefaults(text: string): string {
+  let output = "";
+  let copied = 0;
+  for (const match of text.matchAll(SHELL_DEFAULT_REGEX)) {
+    const [whole, open, name, operator] = match;
+    // Inside a word already redacted, or already found to be only references.
+    if (match.index < copied) continue;
+    if (SHELL_DIRECTORY_NAMES.has(name) || !isSensitiveKey(name)) continue;
+    const wordStart = match.index + whole.length;
+    const end = shellWordEnd(text, wordStart, "}");
+    // Unterminated on this line: there is no closing brace to keep, so the
+    // rest of the line goes, as the assignment pattern would have taken it.
+    const wordEnd = end === -1 ? lineEnd(text, wordStart) : end;
+    const word = text.slice(wordStart, wordEnd);
+    output += text.slice(copied, wordStart);
+    output += !word || isPlaceholder(word) || isShellReference(word) ? word : placeholderForKey(name);
+    copied = wordEnd;
+  }
+  return output + text.slice(copied);
+}
+
+/**
+ * Where the word starting at `start` ends: the index of the `close` that
+ * ends its expansion, or -1 if the line ends first. Backslash escapes,
+ * quotes, backticks, and nested `${…}` and `$(…)` are skipped, so a brace
+ * inside them never ends the word early and leaves part of it behind.
+ */
+function shellWordEnd(text: string, start: number, close: "}" | ")", depth = 0): number {
+  if (depth > SHELL_NESTING_LIMIT) return -1;
+  let parens = 0;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "\n" || char === "\r") return -1;
+    if (char === "\\") {
+      index += 1;
+    } else if (char === "'" || char === '"' || char === "`") {
+      index = closingQuote(text, index + 1, char, depth + 1);
+      if (index === -1) return -1;
+    } else if (char === "$" && (text[index + 1] === "{" || text[index + 1] === "(")) {
+      index = shellWordEnd(text, index + 2, text[index + 1] === "{" ? "}" : ")", depth + 1);
+      if (index === -1) return -1;
+    } else if (close === ")" && char === "(") {
+      parens += 1;
+    } else if (close === ")" && char === ")" && parens > 0) {
+      parens -= 1;
+    } else if (char === close) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+/** The index of the quote closing one opened before `start`; a double quote's expansions are skipped whole. */
+function closingQuote(text: string, start: number, quote: string, depth: number): number {
+  if (depth > SHELL_NESTING_LIMIT) return -1;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "\n" || char === "\r") return -1;
+    if (char === quote) return index;
+    if (quote === "'") continue;
+    if (char === "\\") {
+      index += 1;
+    } else if (quote === '"' && char === "$" && (text[index + 1] === "{" || text[index + 1] === "(")) {
+      index = shellWordEnd(text, index + 2, text[index + 1] === "{" ? "}" : ")", depth + 1);
+      if (index === -1) return -1;
+    } else if (quote === '"' && char === "`") {
+      index = closingQuote(text, index + 1, "`", depth + 1);
+      if (index === -1) return -1;
+    }
+  }
+  return -1;
+}
+
+function lineEnd(text: string, start: number): number {
+  const match = /[\r\n]/.exec(text.slice(start));
+  return match ? start + match.index : text.length;
+}
+
+/** Whether the key at `offset` is read by `${KEY…}`, or by `$KEY` before a `:`. `$key = value` is an assignment (PHP, PowerShell). */
+function isShellReadOfKey(text: string, offset: number, separator: string): boolean {
+  if (SHELL_EXPANSION_KEY_PREFIX.test(text.slice(Math.max(0, offset - 64), offset))) return true;
+  return text[offset - 1] === "$" && separator.trim().startsWith(":");
+}
+
+/**
+ * Whether a value only names another variable, which is never a literal
+ * secret: `$NAME`, or `${NAME}` with a modifier, an error message, or a
+ * default that is itself a reference or a placeholder. One pair of double
+ * quotes around it is allowed. A command is not a reference: its arguments
+ * can be literals.
+ */
+function isShellReference(value: string, depth = 0): boolean {
+  if (depth > SHELL_NESTING_LIMIT) return false;
+  const unquoted = value.length > 1 && value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value;
+  if (SHELL_VARIABLE_REFERENCE.test(unquoted)) return true;
+  if (!unquoted.startsWith("${") || shellWordEnd(unquoted, 2, "}") !== unquoted.length - 1) return false;
+  const rest = SHELL_EXPANSION_INNER.exec(unquoted.slice(2, -1))?.groups?.rest;
+  if (rest === undefined) return false;
+  if (rest === "" || /^:?\?/.test(rest) || /^(?::[a-zA-Z0-9]+)+$/.test(rest)) return true;
+  const word = /^:?[-=+](?<word>.*)$/s.exec(rest)?.groups?.word;
+  return word !== undefined && (word === "" || isPlaceholder(word) || isShellReference(word, depth + 1));
+}
+
+// `$(gh auth token)`: an unquoted value that opens a command substitution
+// with a plain command name. The value pattern stops at whitespace, so the
+// name is all it would replace, leaving `<TOKEN> auth token)`: no secret
+// removed, and a line that no longer parses. Anything less plain
+// (`$(cat<<<x)`, `$(echo${IFS}x)`, `$((1234))`) is redacted. A name the
+// token patterns later replace must still pass as their placeholder, or the
+// next pass would redact differently.
+const SHELL_COMMAND_NAME_VALUE = /^\$\((?:[A-Za-z0-9_./+-]+|<(?:API_KEY|TOKEN|SECRET|PRIVATEKEY|EMAIL|PHONENUMBER|SSN|CREDITCARD)>)\)?$/;
+
+/** Whether the unquoted value starting at `start` only refers to something else: `$NAME`, `${NAME}`, or a command. */
+function startsWithShellReference(text: string, start: number, value: string): boolean {
+  if (SHELL_COMMAND_NAME_VALUE.test(value)) return true;
+  if (text[start] !== "$") return false;
+  let end: number;
+  if (text[start + 1] === "{") {
+    end = shellWordEnd(text, start + 2, "}");
+    if (end === -1) return false;
+    end += 1;
+  } else {
+    end = start + 1 + (/^[A-Za-z0-9_]*/.exec(text.slice(start + 1))?.[0].length ?? 0);
+  }
+  if (end < text.length && !/[\s;&|)]/.test(text[end])) return false;
+  return isShellReference(text.slice(start, end));
+}
 
 const AUTHORIZATION_HEADER_REGEX = /\b(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)([^\s"',;`]+)/gi;
 const PEM_PRIVATE_KEY_REGEX =
@@ -50,25 +206,32 @@ const CREDIT_CARD_CANDIDATE_REGEX = /\b(?:\d[ -]*?){13,19}\b/g;
 
 export function redactText(input: string, mode: RedactionMode = DEFAULT_REDACTION_MODE): string {
   if (mode === "none") return input;
-  let output = input
+  let output = redactShellDefaults(input)
     .replace(PEM_PRIVATE_KEY_REGEX, "<PRIVATEKEY>")
     .replace(AUTHORIZATION_HEADER_REGEX, (_match, prefix: string) => `${prefix}<TOKEN>`)
     .replace(BARE_BEARER_TOKEN_REGEX, (_match, prefix: string) => `${prefix}<TOKEN>`)
     .replace(URL_CREDENTIALS_REGEX, (_match, prefix: string) => `${prefix}:<SECRET>@`)
     .replace(QUOTED_SECRET_REGEX, (match, ...args) => {
-      const { keyQuote = "", key, separator, valueQuote } = args.at(-1) as {
+      const { keyQuote = "", key, separator, valueQuote, value } = args.at(-1) as {
         keyQuote?: string;
         key: string;
         separator: string;
         valueQuote: string;
+        value: string;
       };
-      if (!isSensitiveKey(key)) return match;
+      const offset = args.at(-3) as number;
+      const text = args.at(-2) as string;
+      if (!isSensitiveKey(key) || isShellReadOfKey(text, offset + keyQuote.length, separator)) return match;
+      if (valueQuote === '"' && isShellReference(value)) return match;
       return `${keyQuote}${key}${keyQuote}${separator}${valueQuote}${placeholderForKey(key)}${valueQuote}`;
     })
     .replace(
       BARE_ASSIGNMENT_SECRET_REGEX,
-      (match, key: string, separator: string) =>
-        isSensitiveKey(key) ? `${key}${separator}${placeholderForKey(key)}` : match,
+      (match, key: string, separator: string, value: string, offset: number, text: string) => {
+        if (!isSensitiveKey(key) || isShellReadOfKey(text, offset, separator)) return match;
+        if (startsWithShellReference(text, offset + key.length + separator.length, value)) return match;
+        return `${key}${separator}${placeholderForKey(key)}`;
+      },
     );
 
   for (const [pattern, replacement] of TOKEN_PATTERNS) {
@@ -86,6 +249,15 @@ export function redactText(input: string, mode: RedactionMode = DEFAULT_REDACTIO
 }
 
 const PLACEHOLDER_REGEX = /<(?:API_KEY|TOKEN|SECRET|PRIVATEKEY|EMAIL|PHONENUMBER|SSN|CREDITCARD)>/g;
+
+function isPlaceholder(text: string): boolean {
+  return /^<(?:API_KEY|TOKEN|SECRET|PRIVATEKEY|EMAIL|PHONENUMBER|SSN|CREDITCARD)>$/.test(text);
+}
+
+/** Whether a line carries a redaction placeholder. */
+export function hasRedactionPlaceholder(text: string): boolean {
+  return countRedactionPlaceholders(text) > 0;
+}
 
 export function countRedactionPlaceholders(text: string): number {
   return text.match(PLACEHOLDER_REGEX)?.length ?? 0;

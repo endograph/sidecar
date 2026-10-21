@@ -1449,21 +1449,154 @@ var init_git = __esm(() => {
 });
 
 // src/redaction.ts
+function redactShellDefaults(text) {
+  let output = "";
+  let copied = 0;
+  for (const match of text.matchAll(SHELL_DEFAULT_REGEX)) {
+    const [whole, open, name, operator] = match;
+    if (match.index < copied)
+      continue;
+    if (SHELL_DIRECTORY_NAMES.has(name) || !isSensitiveKey(name))
+      continue;
+    const wordStart = match.index + whole.length;
+    const end = shellWordEnd(text, wordStart, "}");
+    const wordEnd = end === -1 ? lineEnd(text, wordStart) : end;
+    const word = text.slice(wordStart, wordEnd);
+    output += text.slice(copied, wordStart);
+    output += !word || isPlaceholder(word) || isShellReference(word) ? word : placeholderForKey(name);
+    copied = wordEnd;
+  }
+  return output + text.slice(copied);
+}
+function shellWordEnd(text, start, close, depth = 0) {
+  if (depth > SHELL_NESTING_LIMIT)
+    return -1;
+  let parens = 0;
+  for (let index = start;index < text.length; index += 1) {
+    const char = text[index];
+    if (char === `
+` || char === "\r")
+      return -1;
+    if (char === "\\") {
+      index += 1;
+    } else if (char === "'" || char === '"' || char === "`") {
+      index = closingQuote(text, index + 1, char, depth + 1);
+      if (index === -1)
+        return -1;
+    } else if (char === "$" && (text[index + 1] === "{" || text[index + 1] === "(")) {
+      index = shellWordEnd(text, index + 2, text[index + 1] === "{" ? "}" : ")", depth + 1);
+      if (index === -1)
+        return -1;
+    } else if (close === ")" && char === "(") {
+      parens += 1;
+    } else if (close === ")" && char === ")" && parens > 0) {
+      parens -= 1;
+    } else if (char === close) {
+      return index;
+    }
+  }
+  return -1;
+}
+function closingQuote(text, start, quote, depth) {
+  if (depth > SHELL_NESTING_LIMIT)
+    return -1;
+  for (let index = start;index < text.length; index += 1) {
+    const char = text[index];
+    if (char === `
+` || char === "\r")
+      return -1;
+    if (char === quote)
+      return index;
+    if (quote === "'")
+      continue;
+    if (char === "\\") {
+      index += 1;
+    } else if (quote === '"' && char === "$" && (text[index + 1] === "{" || text[index + 1] === "(")) {
+      index = shellWordEnd(text, index + 2, text[index + 1] === "{" ? "}" : ")", depth + 1);
+      if (index === -1)
+        return -1;
+    } else if (quote === '"' && char === "`") {
+      index = closingQuote(text, index + 1, "`", depth + 1);
+      if (index === -1)
+        return -1;
+    }
+  }
+  return -1;
+}
+function lineEnd(text, start) {
+  const match = /[\r\n]/.exec(text.slice(start));
+  return match ? start + match.index : text.length;
+}
+function isShellReadOfKey(text, offset, separator) {
+  if (SHELL_EXPANSION_KEY_PREFIX.test(text.slice(Math.max(0, offset - 64), offset)))
+    return true;
+  return text[offset - 1] === "$" && separator.trim().startsWith(":");
+}
+function isShellReference(value, depth = 0) {
+  if (depth > SHELL_NESTING_LIMIT)
+    return false;
+  const unquoted = value.length > 1 && value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value;
+  if (SHELL_VARIABLE_REFERENCE.test(unquoted))
+    return true;
+  if (!unquoted.startsWith("${") || shellWordEnd(unquoted, 2, "}") !== unquoted.length - 1)
+    return false;
+  const rest = SHELL_EXPANSION_INNER.exec(unquoted.slice(2, -1))?.groups?.rest;
+  if (rest === undefined)
+    return false;
+  if (rest === "" || /^:?\?/.test(rest) || /^(?::[a-zA-Z0-9]+)+$/.test(rest))
+    return true;
+  const word = /^:?[-=+](?<word>.*)$/s.exec(rest)?.groups?.word;
+  return word !== undefined && (word === "" || isPlaceholder(word) || isShellReference(word, depth + 1));
+}
+function startsWithShellReference(text, start, value) {
+  if (SHELL_COMMAND_NAME_VALUE.test(value))
+    return true;
+  if (text[start] !== "$")
+    return false;
+  let end;
+  if (text[start + 1] === "{") {
+    end = shellWordEnd(text, start + 2, "}");
+    if (end === -1)
+      return false;
+    end += 1;
+  } else {
+    end = start + 1 + (/^[A-Za-z0-9_]*/.exec(text.slice(start + 1))?.[0].length ?? 0);
+  }
+  if (end < text.length && !/[\s;&|)]/.test(text[end]))
+    return false;
+  return isShellReference(text.slice(start, end));
+}
 function redactText(input, mode = DEFAULT_REDACTION_MODE) {
   if (mode === "none")
     return input;
-  let output = input.replace(PEM_PRIVATE_KEY_REGEX, "<PRIVATEKEY>").replace(AUTHORIZATION_HEADER_REGEX, (_match, prefix) => `${prefix}<TOKEN>`).replace(BARE_BEARER_TOKEN_REGEX, (_match, prefix) => `${prefix}<TOKEN>`).replace(URL_CREDENTIALS_REGEX, (_match, prefix) => `${prefix}:<SECRET>@`).replace(QUOTED_SECRET_REGEX, (match, ...args) => {
-    const { keyQuote = "", key, separator, valueQuote } = args.at(-1);
-    if (!isSensitiveKey(key))
+  let output = redactShellDefaults(input).replace(PEM_PRIVATE_KEY_REGEX, "<PRIVATEKEY>").replace(AUTHORIZATION_HEADER_REGEX, (_match, prefix) => `${prefix}<TOKEN>`).replace(BARE_BEARER_TOKEN_REGEX, (_match, prefix) => `${prefix}<TOKEN>`).replace(URL_CREDENTIALS_REGEX, (_match, prefix) => `${prefix}:<SECRET>@`).replace(QUOTED_SECRET_REGEX, (match, ...args) => {
+    const { keyQuote = "", key, separator, valueQuote, value } = args.at(-1);
+    const offset = args.at(-3);
+    const text = args.at(-2);
+    if (!isSensitiveKey(key) || isShellReadOfKey(text, offset + keyQuote.length, separator))
+      return match;
+    if (valueQuote === '"' && isShellReference(value))
       return match;
     return `${keyQuote}${key}${keyQuote}${separator}${valueQuote}${placeholderForKey(key)}${valueQuote}`;
-  }).replace(BARE_ASSIGNMENT_SECRET_REGEX, (match, key, separator) => isSensitiveKey(key) ? `${key}${separator}${placeholderForKey(key)}` : match);
+  }).replace(BARE_ASSIGNMENT_SECRET_REGEX, (match, key, separator, value, offset, text) => {
+    if (!isSensitiveKey(key) || isShellReadOfKey(text, offset, separator))
+      return match;
+    if (startsWithShellReference(text, offset + key.length + separator.length, value))
+      return match;
+    return `${key}${separator}${placeholderForKey(key)}`;
+  });
   for (const [pattern, replacement] of TOKEN_PATTERNS) {
     output = output.replace(pattern, replacement);
   }
   if (mode === "secrets")
     return output;
   return output.replace(EMAIL_REGEX, "<EMAIL>").replace(PHONE_REGEX, "<PHONENUMBER>").replace(SSN_REGEX, "<SSN>").replace(CREDIT_CARD_CANDIDATE_REGEX, (candidate) => isLikelyCreditCard(candidate) ? "<CREDITCARD>" : candidate);
+}
+function isPlaceholder(text) {
+  return /^<(?:API_KEY|TOKEN|SECRET|PRIVATEKEY|EMAIL|PHONENUMBER|SSN|CREDITCARD)>$/.test(text);
+}
+function hasRedactionPlaceholder(text) {
+  return countRedactionPlaceholders(text) > 0;
 }
 function countRedactionPlaceholders(text) {
   return text.match(PLACEHOLDER_REGEX)?.length ?? 0;
@@ -1518,12 +1651,20 @@ function isLikelyCreditCard(value) {
   }
   return sum % 10 === 0;
 }
-var DEFAULT_REDACTION_MODE = "secrets", REDACTION_MODES, KEY_NAME_PATTERN, QUOTED_SECRET_REGEX, BARE_ASSIGNMENT_SECRET_REGEX, AUTHORIZATION_HEADER_REGEX, PEM_PRIVATE_KEY_REGEX, URL_CREDENTIALS_REGEX, BARE_BEARER_TOKEN_REGEX, TOKEN_PATTERNS, EMAIL_REGEX, PHONE_REGEX, SSN_REGEX, CREDIT_CARD_CANDIDATE_REGEX, PLACEHOLDER_REGEX, COMPACT_SENSITIVE_KEYS;
+var DEFAULT_REDACTION_MODE = "secrets", REDACTION_MODES, KEY_NAME_PATTERN, QUOTED_SECRET_REGEX, BARE_ASSIGNMENT_SECRET_REGEX, SHELL_NAME_PATTERN, SHELL_EXPANSION_OPEN, SHELL_DEFAULT_REGEX, SHELL_EXPANSION_KEY_PREFIX, SHELL_EXPANSION_INNER, SHELL_DIRECTORY_NAMES, SHELL_VARIABLE_REFERENCE, SHELL_NESTING_LIMIT = 16, SHELL_COMMAND_NAME_VALUE, AUTHORIZATION_HEADER_REGEX, PEM_PRIVATE_KEY_REGEX, URL_CREDENTIALS_REGEX, BARE_BEARER_TOKEN_REGEX, TOKEN_PATTERNS, EMAIL_REGEX, PHONE_REGEX, SSN_REGEX, CREDIT_CARD_CANDIDATE_REGEX, PLACEHOLDER_REGEX, COMPACT_SENSITIVE_KEYS;
 var init_redaction = __esm(() => {
   REDACTION_MODES = ["none", "secrets", "secrets+pii"];
   KEY_NAME_PATTERN = String.raw`[A-Za-z0-9_][A-Za-z0-9_-]*`;
-  QUOTED_SECRET_REGEX = new RegExp(String.raw`(?:(?<keyQuote>["'])|\b)(?<key>${KEY_NAME_PATTERN})\k<keyQuote>` + String.raw`(?<separator>\s*[:=]\s*)(?<valueQuote>["'])(?:\\[^\r\n]|(?!\k<valueQuote>)[^\\\r\n])+\k<valueQuote>`, "g");
+  QUOTED_SECRET_REGEX = new RegExp(String.raw`(?:(?<keyQuote>["'])|\b)(?<key>${KEY_NAME_PATTERN})\k<keyQuote>` + String.raw`(?<separator>\s*[:=]\s*)(?<valueQuote>["'])(?<value>(?:\\[^\r\n]|(?!\k<valueQuote>)[^\\\r\n])+)\k<valueQuote>`, "g");
   BARE_ASSIGNMENT_SECRET_REGEX = new RegExp(String.raw`\b(${KEY_NAME_PATTERN})(\s*[:=]\s*)([^\s"',;` + "`" + String.raw`]+)`, "g");
+  SHELL_NAME_PATTERN = String.raw`[A-Za-z_][A-Za-z0-9_]*`;
+  SHELL_EXPANSION_OPEN = String.raw`\$\{(?:\([^()\s]*\))?[#!^=~]*`;
+  SHELL_DEFAULT_REGEX = new RegExp(String.raw`(${SHELL_EXPANSION_OPEN})(${SHELL_NAME_PATTERN})(:?[-=+])`, "g");
+  SHELL_EXPANSION_KEY_PREFIX = new RegExp(`${SHELL_EXPANSION_OPEN}$`);
+  SHELL_EXPANSION_INNER = new RegExp(String.raw`^(?:\([^()\s]*\))?[#!^=~]*${SHELL_NAME_PATTERN}(?<rest>.*)$`, "s");
+  SHELL_DIRECTORY_NAMES = new Set(["PWD", "OLDPWD"]);
+  SHELL_VARIABLE_REFERENCE = new RegExp(String.raw`^\$(?:[A-Z_][A-Z0-9_]*)$`);
+  SHELL_COMMAND_NAME_VALUE = /^\$\((?:[A-Za-z0-9_./+-]+|<(?:API_KEY|TOKEN|SECRET|PRIVATEKEY|EMAIL|PHONENUMBER|SSN|CREDITCARD)>)\)?$/;
   AUTHORIZATION_HEADER_REGEX = /\b(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)([^\s"',;`]+)/gi;
   PEM_PRIVATE_KEY_REGEX = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g;
   URL_CREDENTIALS_REGEX = /(\/\/[^\s/:@"'`]+):([^\s/@"'`]+)@/g;
@@ -4726,7 +4867,7 @@ function createReview(options) {
   if (guidelines)
     writePrivateFile(path8.join(dir, "guidelines.md"), `${guidelines}
 `);
-  writePrivateFile(path8.join(dir, "instructions.md"), reviewInstructions(record, config, guidelines));
+  writePrivateFile(path8.join(dir, "instructions.md"), reviewInstructions(record, config, guidelines, addedPlaceholderLines(diff)));
   writePrivateJson(path8.join(dir, "review.json"), record);
   logSidecarEvent("review-open", { id, root, peer: config.peer, files: files.length });
   pruneClosedReviews(sidecarPath);
@@ -4785,6 +4926,102 @@ function pruneOrphanedReviews() {
       fs8.rmSync(review.dir, { recursive: true, force: true });
   }
 }
+function addedPlaceholderLines(patch) {
+  const found = [];
+  let file;
+  let oldLeft = 0;
+  let newLeft = 0;
+  let newLine = 0;
+  for (const raw of patch.split(`
+`)) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    if (oldLeft > 0 || newLeft > 0) {
+      if (line.startsWith("+")) {
+        if (file && hasRedactionPlaceholder(line))
+          found.push({ file, line: newLine, text: line.slice(1) });
+        newLeft -= 1;
+        newLine += 1;
+      } else if (line.startsWith("-")) {
+        oldLeft -= 1;
+      } else if (!line.startsWith("\\")) {
+        oldLeft -= 1;
+        newLeft -= 1;
+        newLine += 1;
+      }
+      continue;
+    }
+    if (line.startsWith("diff --git ")) {
+      file = undefined;
+    } else if (line.startsWith("+++ ")) {
+      file = patchHeaderPath(line.slice(4));
+    } else {
+      const hunk = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (hunk) {
+        oldLeft = Number(hunk[1] ?? 1);
+        newLine = Number(hunk[2]);
+        newLeft = Number(hunk[3] ?? 1);
+      }
+    }
+  }
+  return found;
+}
+function patchHeaderPath(header) {
+  const target = header.endsWith("\t") ? header.slice(0, -1) : header;
+  if (target === "/dev/null")
+    return;
+  const name = target.length > 1 && target.startsWith('"') && target.endsWith('"') ? unquoteGitPath(target.slice(1, -1)) : target;
+  return name.replace(/^b\//, "");
+}
+function unquoteGitPath(quoted) {
+  const parts = [];
+  let literal = "";
+  for (let index = 0;index < quoted.length; index += 1) {
+    if (quoted[index] !== "\\" || index + 1 === quoted.length) {
+      literal += quoted[index];
+      continue;
+    }
+    parts.push(Buffer.from(literal, "utf8"));
+    literal = "";
+    const octal = /^[0-3][0-7]{2}/.exec(quoted.slice(index + 1))?.[0];
+    if (octal) {
+      parts.push(Buffer.from([Number.parseInt(octal, 8)]));
+      index += 3;
+    } else {
+      const next = quoted[index + 1];
+      parts.push(GIT_PATH_ESCAPES[next] === undefined ? Buffer.from(next, "utf8") : Buffer.from([GIT_PATH_ESCAPES[next]]));
+      index += 1;
+    }
+  }
+  parts.push(Buffer.from(literal, "utf8"));
+  return Buffer.concat(parts).toString("utf8");
+}
+function placeholderSection(lines) {
+  if (!lines.length)
+    return "";
+  const shown = lines.slice(0, PLACEHOLDER_LINES_SHOWN);
+  const more = lines.length - shown.length;
+  return `
+## Redaction placeholders
+
+These lines in the change carry a placeholder (numbered as in the new file).
+For each one, check that the placeholder stands where a credential's value
+was, and only there. Reject, naming the line, if it replaced something that is
+not a credential — part of a shell expansion such as \`\${PWD:t}\`, a path, a
+command, ordinary words — or if the text around it no longer holds together
+(a script that no longer parses, a broken config file). That holds even when
+it did replace a real credential: the other machines still receive a broken
+file, and the credential belongs outside the synced file. Some placeholders
+may have been typed by hand or come from content already published; judge
+them the same way.
+
+${shown.map((entry) => `- ${entry.file}:${entry.line}
+
+      ${entry.text}
+`).join(`
+`)}${more ? `
+…and ${more} more; find them in \`diff.patch\`.
+` : ""}`;
+}
 function opaqueSection(record) {
   const opaque = record.files.filter((file) => file.artifact);
   if (!opaque.length)
@@ -4799,7 +5036,7 @@ ${opaque.map((file) => `- \`${file.artifact}\` — ${file.path}`).join(`
 `)}
 `;
 }
-function reviewInstructions(record, config, guidelines) {
+function reviewInstructions(record, config, guidelines, placeholders) {
   return `# Sidecar publish review ${record.id}
 
 A sidecar is a scratchpad repository that syncs automatically to a shared Git
@@ -4807,8 +5044,9 @@ remote (${redactText(config.remote)}). This machine wants to publish the change 
 \`diff.patch\`. Everyone with access to that remote can read what you approve,
 and it stays in the remote's history.
 
-Decide whether anything in the change should not leave this machine. This is
-not a code review: ignore quality, style, and correctness.
+Decide whether anything in the change should not leave this machine, and
+whether redaction damaged it. This is not a code review: ignore the quality,
+style, and correctness of what the author wrote.
 
 Secret redaction has already run. Values it caught appear as placeholders such
 as \`<API_KEY>\`, \`<TOKEN>\`, or \`<SECRET>\`; they are not leaks. Look for what
@@ -4819,6 +5057,11 @@ pattern matching misses:
 - confidential material: customer names and data, unreleased plans, internal-only details
 - anything the repository's guidelines below rule out
 
+Pattern matching also has false positives, and they are not harmless. A
+placeholder replaces the original text in the published file; every other
+machine that syncs this repository gets the placeholder in its own copy, while
+this machine keeps the original, so the author never sees the damage.
+${placeholderSection(placeholders)}
 ## Files
 
 All in this directory (\`$SIDECAR_REVIEW_DIR\`):
@@ -4916,7 +5159,7 @@ function decideReview(review, verdict, reason) {
   review.state = verdict;
   logSidecarEvent("review-decision", { id: review.record.id, verdict });
 }
-var REVIEW_SCHEMA = 1, KEEP_CLOSED_REVIEWS = 10, ID_PATTERN, LAUNCH_GRACE_SECONDS = 60, PACKET_DIFF_OPTIONS;
+var REVIEW_SCHEMA = 1, KEEP_CLOSED_REVIEWS = 10, ID_PATTERN, LAUNCH_GRACE_SECONDS = 60, PACKET_DIFF_OPTIONS, GIT_PATH_ESCAPES, PLACEHOLDER_LINES_SHOWN = 200;
 var init_review = __esm(() => {
   init_util();
   init_git();
@@ -4926,6 +5169,7 @@ var init_review = __esm(() => {
   init_redaction();
   ID_PATTERN = /^[0-9a-f]+$/;
   PACKET_DIFF_OPTIONS = ["-r", "--no-renames", "--ignore-submodules=none"];
+  GIT_PATH_ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
 });
 
 // src/sync.ts
@@ -6274,7 +6518,7 @@ function pendingInboxBranches(repo, config) {
   });
   return [...local, ...remote].sort();
 }
-var REVIEW_POLICY_KEY = "sidecar.review", WRITTEN_TRAILER = "written:", WRITTEN_TRAILER_LIMIT = 500, REDACTION_FILTER_NAME = "sidecar-redact", REDACTION_FILTER_REVISION = "2", REDACTION_POLICY_FILE = "sidecar-redaction-policy";
+var REVIEW_POLICY_KEY = "sidecar.review", WRITTEN_TRAILER = "written:", WRITTEN_TRAILER_LIMIT = 500, REDACTION_FILTER_NAME = "sidecar-redact", REDACTION_FILTER_REVISION = "3", REDACTION_POLICY_FILE = "sidecar-redaction-policy";
 var init_sync = __esm(() => {
   init_color();
   init_util();

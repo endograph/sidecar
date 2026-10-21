@@ -1626,8 +1626,10 @@ export function fileRedactionDelta(
 
 const REDACTION_FILTER_NAME = "sidecar-redact";
 // Bump when filter semantics change without changing the command, so Git's
-// cached blobs are reprocessed too. Revision 2 adds per-path peer rules.
-const REDACTION_FILTER_REVISION = "2";
+// cached blobs are reprocessed too. Revision 2 adds per-path peer rules;
+// revision 3 stops reading shell expansions (`${PWD:t}`) as assignments, so
+// files an earlier filter mangled are committed again from their originals.
+const REDACTION_FILTER_REVISION = "3";
 const REDACTION_POLICY_FILE = "sidecar-redaction-policy";
 export type RedactionPolicy = { rules?: SidecarRules; rulesPath?: string };
 

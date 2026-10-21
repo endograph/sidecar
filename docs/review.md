@@ -67,8 +67,12 @@ binary, text that isn't UTF-8, or one whose attributes turn diffs off — has
 its complete new content under `opaque/`, and the instructions list each one:
 nothing publishes that isn't in the packet. The diff is of committed content,
 so it is already redacted: secrets redaction caught appear as `<API_KEY>`
-placeholders, never as values. Packets live in sidecar's state dir and only
-your user can read them.
+placeholders, never as values. The instructions list every added line that
+carries a placeholder and ask the reviewer to reject any placeholder that
+replaced something other than a credential, or that leaves the file broken:
+a redaction false positive replaces that text on every other machine
+([redaction](redaction.md#false-positives-break-other-machines-not-yours)).
+Packets live in sidecar's state dir and only your user can read them.
 
 ## Deciding
 
@@ -236,7 +240,8 @@ changes no file and is never pushed.
   reviewer can be wrong in either direction.
 - **The reviewer sees the redacted diff, not your working tree.** That keeps
   caught secrets away from it. It also means what redaction rewrote shows up
-  as placeholders.
+  only as placeholders: the reviewer can judge where each one landed and
+  whether the line still makes sense, but never sees what it replaced.
 - **Turning review off publishes local history.** A clone a gated peer has used
   remembers it, and sync refuses until you confirm with
   `git -C <checkout> config --unset sidecar.review`. The next sync then pushes

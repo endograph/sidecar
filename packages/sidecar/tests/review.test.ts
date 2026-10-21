@@ -20,6 +20,7 @@ import { logSidecarEvent, readSettings, writeSettings } from "../src/state.js";
 import type { SidecarConfig } from "../src/config.js";
 import {
   type Review,
+  addedPlaceholderLines,
   createReview,
   decideReview,
   findReview,
@@ -39,10 +40,12 @@ const config: SidecarConfig = {
 let directory: string;
 let root: string;
 let numstat = "";
+let patch = "";
 
 beforeEach(() => {
   vi.resetAllMocks();
   numstat = "1\t0\tnotes.md\0";
+  patch = "diff --git a/notes.md b/notes.md\n+a new line\n";
   directory = fs.mkdtempSync(path.join(os.tmpdir(), "sidecar-review-"));
   root = path.join(directory, "repo");
   fs.mkdirSync(path.join(root, "sidecar", ".git"), { recursive: true });
@@ -54,7 +57,7 @@ beforeEach(() => {
     let stdout = "";
     if (args[0] === "diff-tree" && args.includes("--name-status")) stdout = "M\0notes.md\0A\0plans/q3.md\0";
     else if (args[0] === "diff-tree" && args.includes("--numstat")) stdout = numstat;
-    else if (args[0] === "diff-tree") stdout = "diff --git a/notes.md b/notes.md\n+a new line\n";
+    else if (args[0] === "diff-tree") stdout = patch;
     else if (args[0] === "ls-tree") stdout = ["100644 blob aaa\tnotes.md", "100644 blob bbb\tplans/q3.md", "160000 commit ccc\tvendor/lib"].join("\x00");
     return { status: 0, stdout, stderr: "" };
   });
@@ -131,6 +134,71 @@ describe("opening a review", () => {
     const review = open();
     expect(review.record.files.find((file) => file.path === "plans/q3.md")!.artifact).toBe(path.join("opaque", "0001"));
     expect(review.record.files.find((file) => file.path === "notes.md")!.artifact).toBeUndefined();
+  });
+
+  test("points the reviewer at every line where a placeholder lands, and what a false positive costs", () => {
+    patch = [
+      "diff --git a/home/.zshrc_mods b/home/.zshrc_mods",
+      "index 1111111..2222222 100644",
+      "--- a/home/.zshrc_mods",
+      "+++ b/home/.zshrc_mods",
+      "@@ -10,2 +10,3 @@ prompt() {",
+      "   local where",
+      '+  [[ -n "$sub" && "${PWD:<SECRET>" != "$sub" ]] && where+=" %F{cyan}${${PWD:<SECRET>"',
+      "   print $where",
+      "",
+    ].join("\n");
+    const instructions = fs.readFileSync(path.join(open().dir, "instructions.md"), "utf8");
+    expect(instructions).toContain("## Redaction placeholders");
+    expect(instructions).toContain('- home/.zshrc_mods:11\n\n        [[ -n "$sub" && "${PWD:<SECRET>"');
+    expect(instructions).toContain("every other\nmachine that syncs this repository gets the placeholder");
+  });
+
+  test("leaves the placeholder section out when the change adds none", () => {
+    expect(fs.readFileSync(path.join(open().dir, "instructions.md"), "utf8")).not.toContain("## Redaction placeholders");
+  });
+
+  test("numbers placeholder lines by hunk, so added lines that look like headers stay content", () => {
+    const lines = addedPlaceholderLines([
+      "diff --git a/a.md b/a.md",
+      "--- a/a.md",
+      "+++ b/a.md",
+      "@@ -1,2 +1,4 @@",
+      "-token: <TOKEN>",
+      "+++ b/fake.md <TOKEN>",
+      "+@@ -1 +1 @@",
+      " context",
+      "+password: <SECRET>",
+      "\\ No newline at end of file",
+      "diff --git a/gone.md b/gone.md",
+      "--- a/gone.md",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-token: <TOKEN>",
+      "diff --git a/new.md b/new.md",
+      "--- /dev/null",
+      "+++ b/new.md",
+      "@@ -0,0 +1 @@",
+      "+key: <API_KEY>",
+      "diff --git a/my notes.md b/my notes.md",
+      "--- a/my notes.md\t",
+      "+++ b/my notes.md\t",
+      "@@ -0,0 +1 @@",
+      "+token: <TOKEN>",
+      'diff --git "a/caf\\303\\251\\tx.md" "b/caf\\303\\251\\tx.md"',
+      '--- "a/caf\\303\\251\\tx.md"',
+      '+++ "b/caf\\303\\251\\tx.md"',
+      "@@ -0,0 +1 @@",
+      "+token: <TOKEN>",
+      "",
+    ].join("\n"));
+    expect(lines).toEqual([
+      { file: "a.md", line: 1, text: "++ b/fake.md <TOKEN>" },
+      { file: "a.md", line: 4, text: "password: <SECRET>" },
+      { file: "new.md", line: 1, text: "key: <API_KEY>" },
+      { file: "my notes.md", line: 1, text: "token: <TOKEN>" },
+      { file: "café\tx.md", line: 1, text: "token: <TOKEN>" },
+    ]);
   });
 
   test("says so when the repository has no guidelines", () => {
