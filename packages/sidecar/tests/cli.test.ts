@@ -669,6 +669,72 @@ describe("redaction", () => {
     expect(redacted).toContain("2FA_TOKEN=<TOKEN>");
   });
 
+  // The line that broke every interactive shell on two machines: `PWD` names
+  // a password key, and `${PWD:t}` read as the assignment `PWD: t}`.
+  const ZSHRC_MODS_LINE = '[[ -n "$sub" && "${PWD:t}" != "$sub" ]] && where+=" %F{cyan}${${PWD:t}//\\%/%%}%f"';
+
+  test("publishes a zsh line using ${PWD:t} unchanged", () => {
+    const file = `typeset where\n${ZSHRC_MODS_LINE}\n`;
+    for (const mode of ["secrets", "secrets+pii"] as const) {
+      expect(redactText(ZSHRC_MODS_LINE, mode)).toBe(ZSHRC_MODS_LINE);
+      expect(redactBuffer(Buffer.from(file), mode).toString("utf8")).toBe(file);
+    }
+  });
+
+  test.each([
+    "echo ${PASSWORD:0:3}",
+    'echo "${GITHUB_TOKEN:?set GITHUB_TOKEN first}"',
+    "echo $TOKEN:foo",
+    "echo $PWD:t",
+    "echo ${(L)PWD:t}",
+    "echo ${#API_KEY}",
+    "cd ${PWD:-/tmp}",
+    'cd "${OLDPWD:-$HOME}"',
+    "echo ${PWD/#$HOME/~}",
+    "x=${SECRET_DIR:-/tmp/s}",
+    "f=${TOKEN_FILE:h}",
+    "echo ${DB_PASSWORD:-$FALLBACK_PASSWORD}",
+    "echo ${DB_PASSWORD:-$(security find-generic-password -s db -w)}",
+    "export GITHUB_TOKEN=$(gh auth token)",
+    'export GITHUB_TOKEN="$(gh auth token)"',
+    "export OPENAI_API_KEY=$(security find-generic-password -s openai -w); echo ok",
+    "export GITHUB_TOKEN=$GH_TOKEN",
+    "export GITHUB_TOKEN=${GH_TOKEN}",
+    'password: "${DB_PASSWORD}"',
+  ])("leaves shell expansions that only read a variable alone: %s", (line) => {
+    expect(redactText(line)).toBe(line);
+  });
+
+  test.each([
+    // Literal defaults are redacted inside the braces, which survive.
+    ['psql "${DB_PASSWORD:-hunter2}"', 'psql "${DB_PASSWORD:-<SECRET>}"'],
+    ["x=${DB_PASSWORD:-hunter2}", "x=${DB_PASSWORD:-<SECRET>}"],
+    ['psql "${DB_PASSWORD:-hunter2$SUFFIX}"', 'psql "${DB_PASSWORD:-<SECRET>}"'],
+    ['export PGPASSWORD="${DB_PASSWORD:+hunter2}"', 'export PGPASSWORD="${DB_PASSWORD:+<SECRET>}"'],
+    ["echo ${(U)DB_PASSWORD:-hunter2}", "echo ${(U)DB_PASSWORD:-<SECRET>}"],
+    ['echo "${DB_PASSWORD:-hunter2\\}suffix}"', 'echo "${DB_PASSWORD:-<SECRET>}"'],
+    [": ${API_KEY:=notarealkey}", ": ${API_KEY:=<API_KEY>}"],
+    ["url=${TOKEN-abc}def", "url=${TOKEN-<TOKEN>}def"],
+    ["POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}", "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-<SECRET>}"],
+    // Unterminated: nothing to keep, so the rest of the line goes.
+    ["echo ${DB_PASSWORD:-hunter2", "echo ${DB_PASSWORD:-<SECRET>"],
+    // A `$` before a key read by `=` is an assignment (PHP, PowerShell).
+    ["$password = 'hunter2';", "$password = '<SECRET>';"],
+    ['$password = "hunter2";', '$password = "<SECRET>";'],
+    // A lower-case `$word` may be a literal in a .env file.
+    ["GITHUB_TOKEN=$ecretvalue", "GITHUB_TOKEN=<TOKEN>"],
+    ["GITHUB_TOKEN=${GH_TOKEN:-hunter2}", "GITHUB_TOKEN=${GH_TOKEN:-<TOKEN>}"],
+    // A default under a name that is not sensitive is caught by the outer key.
+    ["GITHUB_TOKEN=${FALLBACK:-hunter2}", "GITHUB_TOKEN=<TOKEN>"],
+    // PWD outside an expansion stays a password key: ODBC connection strings.
+    ["Driver={ODBC};UID=sa;PWD=hunter2;", "Driver={ODBC};UID=sa;PWD=<SECRET>;"],
+    ["pwd=hunter2", "pwd=<SECRET>"],
+    ["DB_PWD=hunter2", "DB_PWD=<SECRET>"],
+  ])("still redacts secrets in and around shell syntax: %s", (line, expected) => {
+    expect(redactText(line)).toBe(expected);
+    expect(redactText(expected)).toBe(expected);
+  });
+
   integrationTest("redacts files containing the former bypass marker", () => {
     const repo = initRepo();
     const content = "sidecar:no-redact\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890\n";

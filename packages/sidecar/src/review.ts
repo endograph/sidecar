@@ -38,7 +38,7 @@ import {
   reviewTimeoutSeconds,
 } from "./config.js";
 import { logSidecarEvent, readSettings, sidecarStateDir } from "./state.js";
-import { redactText } from "./redaction.js";
+import { hasRedactionPlaceholder, redactText } from "./redaction.js";
 
 const REVIEW_SCHEMA = 1;
 /** Closed reviews kept per family, newest first; older packets are deleted. */
@@ -330,7 +330,7 @@ export function createReview(options: { root: string; config: SidecarConfig; sid
   };
   writePrivateFile(path.join(dir, "diff.patch"), diff);
   if (guidelines) writePrivateFile(path.join(dir, "guidelines.md"), `${guidelines}\n`);
-  writePrivateFile(path.join(dir, "instructions.md"), reviewInstructions(record, config, guidelines));
+  writePrivateFile(path.join(dir, "instructions.md"), reviewInstructions(record, config, guidelines, addedPlaceholderLines(diff)));
   // The record last: a directory without one is not yet a review, so a crash
   // mid-packet leaves nothing a sync would wait on.
   writePrivateJson(path.join(dir, "review.json"), record);
@@ -418,6 +418,79 @@ export function pruneOrphanedReviews(): void {
   }
 }
 
+type PlaceholderLine = { file: string; line: number; text: string };
+
+/**
+ * The lines a patch adds that carry a redaction placeholder, numbered as in
+ * the new file. From the published diff alone: it says where a placeholder
+ * will land, not whether redaction or a person put it there, and it never
+ * needs the original text.
+ */
+export function addedPlaceholderLines(patch: string): PlaceholderLine[] {
+  const found: PlaceholderLine[] = [];
+  let file: string | undefined;
+  let oldLeft = 0;
+  let newLeft = 0;
+  let newLine = 0;
+  for (const raw of patch.split("\n")) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    // Inside a hunk, the header's counts say where it ends: an added line
+    // can itself begin with `+++ ` or `@@ `.
+    if (oldLeft > 0 || newLeft > 0) {
+      if (line.startsWith("+")) {
+        if (file && hasRedactionPlaceholder(line)) found.push({ file, line: newLine, text: line.slice(1) });
+        newLeft -= 1;
+        newLine += 1;
+      } else if (line.startsWith("-")) {
+        oldLeft -= 1;
+      } else if (!line.startsWith("\\")) {
+        oldLeft -= 1;
+        newLeft -= 1;
+        newLine += 1;
+      }
+      continue;
+    }
+    if (line.startsWith("diff --git ")) {
+      file = undefined;
+    } else if (line.startsWith("+++ ")) {
+      const target = line.slice(4);
+      file = target === "/dev/null" ? undefined : target.replace(/^b\//, "");
+    } else {
+      const hunk = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (hunk) {
+        oldLeft = Number(hunk[1] ?? 1);
+        newLine = Number(hunk[2]);
+        newLeft = Number(hunk[3] ?? 1);
+      }
+    }
+  }
+  return found;
+}
+
+/** Past this many, the list points into the diff instead of growing. */
+const PLACEHOLDER_LINES_SHOWN = 200;
+
+function placeholderSection(lines: PlaceholderLine[]): string {
+  if (!lines.length) return "";
+  const shown = lines.slice(0, PLACEHOLDER_LINES_SHOWN);
+  const more = lines.length - shown.length;
+  return `
+## Redaction placeholders
+
+These lines in the change carry a placeholder (numbered as in the new file).
+For each one, check that the placeholder stands where a credential's value
+was, and only there. Reject, naming the line, if it replaced something that is
+not a credential — part of a shell expansion such as \`\${PWD:t}\`, a path, a
+command, ordinary words — or if the text around it no longer holds together
+(a script that no longer parses, a broken config file). That holds even when
+it did replace a real credential: the other machines still receive a broken
+file, and the credential belongs outside the synced file. Some placeholders
+may have been typed by hand or come from content already published; judge
+them the same way.
+
+${shown.map((entry) => `- ${entry.file}:${entry.line}\n\n      ${entry.text}\n`).join("\n")}${more ? `\n…and ${more} more; find them in \`diff.patch\`.\n` : ""}`;
+}
+
 function opaqueSection(record: ReviewRecord): string {
   const opaque = record.files.filter((file) => file.artifact);
   if (!opaque.length) return "";
@@ -431,7 +504,7 @@ ${opaque.map((file) => `- \`${file.artifact}\` — ${file.path}`).join("\n")}
 `;
 }
 
-function reviewInstructions(record: ReviewRecord, config: SidecarConfig, guidelines: string | undefined): string {
+function reviewInstructions(record: ReviewRecord, config: SidecarConfig, guidelines: string | undefined, placeholders: PlaceholderLine[]): string {
   return `# Sidecar publish review ${record.id}
 
 A sidecar is a scratchpad repository that syncs automatically to a shared Git
@@ -439,8 +512,9 @@ remote (${redactText(config.remote)}). This machine wants to publish the change 
 \`diff.patch\`. Everyone with access to that remote can read what you approve,
 and it stays in the remote's history.
 
-Decide whether anything in the change should not leave this machine. This is
-not a code review: ignore quality, style, and correctness.
+Decide whether anything in the change should not leave this machine, and
+whether redaction damaged it. This is not a code review: ignore the quality,
+style, and correctness of what the author wrote.
 
 Secret redaction has already run. Values it caught appear as placeholders such
 as \`<API_KEY>\`, \`<TOKEN>\`, or \`<SECRET>\`; they are not leaks. Look for what
@@ -451,6 +525,11 @@ pattern matching misses:
 - confidential material: customer names and data, unreleased plans, internal-only details
 - anything the repository's guidelines below rule out
 
+Pattern matching also has false positives, and they are not harmless. A
+placeholder replaces the original text in the published file; every other
+machine that syncs this repository gets the placeholder in its own copy, while
+this machine keeps the original, so the author never sees the damage.
+${placeholderSection(placeholders)}
 ## Files
 
 All in this directory (\`$SIDECAR_REVIEW_DIR\`):

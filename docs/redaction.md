@@ -29,8 +29,31 @@ pass through untouched.
 What it catches: known token formats (OpenAI, Anthropic, GitHub, AWS, Slack,
 JWTs), PEM private key blocks, `Authorization` headers, URL credentials
 (`postgres://user:secret@host`), assignments to sensitive-looking keys
-(`password`, `*_TOKEN`, `api_key`, ...), and — depending on the mode below —
-emails, phone numbers, SSNs, and credit card numbers.
+(`password`, `pwd`, `*_TOKEN`, `api_key`, ...), and — depending on the mode
+below — emails, phone numbers, SSNs, and credit card numbers.
+
+### Shell expansions
+
+A shell expansion reads a variable; it doesn't assign one. `${PWD:t}`,
+`${PASSWORD:0:3}`, `${TOKEN:?unset}`, and `$TOKEN:foo` are left alone, even
+though the name looks sensitive and the `:` looks like `key: value`. So is an
+assignment whose whole value refers to something else — `$GH_TOKEN`,
+`${GH_TOKEN}`, or a command such as `$(gh auth token)`. The value is
+fetched when the line runs, and isn't written in the file to strip.
+
+The one part of an expansion that can hold a literal secret is the word of a
+default, assign, or alternate (`:-`, `:=`, `:+`, and the forms without `:`).
+Under a sensitive name, that word is replaced and the braces kept:
+
+```
+local file:    psql "${DB_PASSWORD:-hunter2}"
+pushed file:   psql "${DB_PASSWORD:-<SECRET>}"
+```
+
+A word that is itself a reference (`${DB_PASSWORD:-$FALLBACK}`) passes
+through. `$PWD` and `$OLDPWD` are the shell's working directory, so their
+defaults always pass through. Outside an expansion, `PWD` is still a password
+key: ODBC connection strings write `UID=sa;PWD=...;`.
 
 ## Reviewing what gets redacted
 
@@ -43,6 +66,10 @@ Pattern-based detection has false positives, so redaction is never silent:
   files, so it is always exact and current.
 - A `redaction` event with counts (never content) lands in the machine log
   (`sidecar tail`).
+- On a peer with [`review = "required"`](review.md), the review packet lists
+  every added line that carries a placeholder. The reviewer is asked to reject
+  any placeholder that replaced something other than a credential, or that
+  leaves the file broken.
 
 ## Modes
 
@@ -59,9 +86,9 @@ Comments and in-file markers do not override redaction policy.
 Changing the mode re-runs every tracked file through the filter on the next
 sync, so the whole tree converges to the new mode — `none → secrets+pii`
 re-redacts everything, `secrets+pii → none` re-commits your originals.
-Upgrading from a version with an in-file redaction bypass also reprocesses
-tracked files on the next snapshot, including files whose contents did not
-change.
+Upgrading to a version whose filter behaves differently (the in-file bypass
+removal, or the shell expansion fix) also reprocesses tracked files on the
+next snapshot, including files whose contents did not change.
 
 The mode governs your files. Two things sidecar generates about itself are
 always redacted at the `secrets` level whatever the mode says: the machine-level
@@ -69,6 +96,40 @@ log (`sidecar tail`) and the failure messages in a
 [health heartbeat](commands.md#fleet-health). Both quote git verbatim, and git
 quotes remote URLs — which carry tokens. Turning redaction off is a decision
 about your notes, not an instruction to publish your own credentials.
+
+## False positives break other machines, not yours
+
+A false positive is more than a cosmetic placeholder. The machine that wrote
+the file keeps its original, so its author sees nothing wrong. Every other
+machine receives the published blob, placeholder included, as its working
+copy, so the file is damaged there:
+
+```
+on the author's machine:
+  [[ -n "$sub" && "${PWD:t}" != "$sub" ]] && where+=" %F{cyan}${${PWD:t}//\%/%%}%f"
+pushed, and so on every other machine:
+  [[ -n "$sub" && "${PWD:<SECRET>" != "$sub" ]] && where+=" %F{cyan}${${PWD:<SECRET>"
+```
+
+That was a real incident in a dotfiles sidecar (before the
+[shell expansion](#shell-expansions) fix): the line stopped parsing, so every
+interactive shell on the other machines errored out. A review approved it,
+because the reviewer saw `<SECRET>` and took it for redaction doing its job.
+The same is true of real secrets in shell files: `export GITHUB_TOKEN=<TOKEN>`
+doesn't parse either.
+
+To limit the damage:
+
+- Run `sidecar redactions` after adding or editing config, scripts, or
+  dotfiles. It shows exactly what other machines will get.
+- When a redaction is wrong, rewrite the line, or turn redaction off for that
+  path with a [rule](rules.md) (`redaction = "none"`). Only do that for
+  content you would publish verbatim. Fix it on the author's machine: once it
+  publishes the corrected file, the others get it on their next sync, and
+  editing a damaged copy elsewhere only adds a competing version.
+- Upgrade every machine together after a redaction fix. An older filter on
+  another machine still applies the old patterns when it commits the file
+  again.
 
 ## Limits worth knowing
 
