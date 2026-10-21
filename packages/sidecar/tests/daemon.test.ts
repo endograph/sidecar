@@ -262,22 +262,34 @@ describe("reviewDueAt", () => {
 
   test("books a due time still ahead as is, whoever asks", () => {
     for (const when of ["start", "change", "after-sync"] as const) {
-      expect(reviewDueAt(now + 30_000, when, now, 60_000)).toBe(now + 30_000);
+      for (const comingBack of [false, true]) {
+        expect(reviewDueAt(now + 30_000, when, now, 60_000, comingBack)).toBe(now + 30_000);
+      }
     }
   });
 
   test("leaves a peer without a due review alone", () => {
-    expect(reviewDueAt(undefined, "start", now, 60_000)).toBeUndefined();
+    expect(reviewDueAt(undefined, "start", now, 60_000, false)).toBeUndefined();
+    expect(reviewDueAt(undefined, "change", now, 60_000, false)).toBeUndefined();
   });
 
-  test("an overdue review goes now at start, and never on another peer's change", () => {
-    expect(reviewDueAt(now - 1, "start", now, 60_000)).toBe(now);
-    // Booking it here would override a retry already booked for this peer.
-    expect(reviewDueAt(now - 1, "change", now, 60_000)).toBeUndefined();
+  test("an overdue review goes now at start", () => {
+    expect(reviewDueAt(now - 1, "start", now, 60_000, false)).toBe(now);
+  });
+
+  test("a change goes now for an overdue review nothing else will come back for", () => {
+    // An approval writes its due time moments ahead; the debounced scan reads
+    // it after it has passed, with no retry booked to catch it.
+    expect(reviewDueAt(now - 400, "change", now, 60_000, false)).toBe(now);
+  });
+
+  test("a change leaves an overdue review to whatever already brings the peer back", () => {
+    // Booking now would override a booked retry or cut a backoff short.
+    expect(reviewDueAt(now - 1, "change", now, 60_000, true)).toBeUndefined();
   });
 
   test("an overdue review a sync left behind waits a debounce, and never less than the settle window", () => {
-    expect(reviewDueAt(now - 1, "after-sync", now, 60_000)).toBe(now + 60_000);
-    expect(reviewDueAt(now - 1, "after-sync", now, 0)).toBe(now + 5000);
+    expect(reviewDueAt(now - 1, "after-sync", now, 60_000, false)).toBe(now + 60_000);
+    expect(reviewDueAt(now - 1, "after-sync", now, 0, false)).toBe(now + 5000);
   });
 });

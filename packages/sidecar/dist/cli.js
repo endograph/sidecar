@@ -8957,11 +8957,14 @@ function armRemoteAt(state, key, at, trigger) {
   state.remoteTimers.set(key, { timer, at });
 }
 function armReviewDue(state, key, when) {
-  const at = reviewDueAt(readReviewDue(key), when, Date.now(), scheduleFor(key, state.options).debounceSeconds * 1000);
+  const at = reviewDueAt(readReviewDue(key), when, Date.now(), scheduleFor(key, state.options).debounceSeconds * 1000, comingBack(state, key));
   if (at !== undefined)
     armRemoteAt(state, key, at, "review-due");
 }
-function reviewDueAt(due, when, now, debounceMs) {
+function comingBack(state, key) {
+  return state.syncing.has(key) || state.remoteTimers.has(key) || state.cycleCount < (state.skipUntilCycle.get(key) ?? 0);
+}
+function reviewDueAt(due, when, now, debounceMs, comingBack2) {
   if (due === undefined)
     return;
   if (due > now)
@@ -8970,7 +8973,7 @@ function reviewDueAt(due, when, now, debounceMs) {
     return now;
   if (when === "after-sync")
     return now + Math.max(SETTLE_WINDOW_MS, debounceMs);
-  return;
+  return comingBack2 ? undefined : now;
 }
 function remoteIsDue(state, key) {
   const last = state.lastRemoteSyncAt.get(key) ?? 0;

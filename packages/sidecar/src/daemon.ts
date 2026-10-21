@@ -645,8 +645,17 @@ function armRemoteAt(state: DaemonState, key: PeerKey, at: number, trigger: stri
  * `when` says what is asking; see reviewDueAt.
  */
 function armReviewDue(state: DaemonState, key: PeerKey, when: ReviewDueCheck): void {
-  const at = reviewDueAt(readReviewDue(key), when, Date.now(), scheduleFor(key, state.options).debounceSeconds * 1000);
+  const at = reviewDueAt(readReviewDue(key), when, Date.now(), scheduleFor(key, state.options).debounceSeconds * 1000, comingBack(state, key));
   if (at !== undefined) armRemoteAt(state, key, at, "review-due");
+}
+
+/**
+ * Whether something already brings this peer back to the remote: a sync in
+ * flight (its end checks again), a round trip booked, or a backoff the
+ * interval poll ends.
+ */
+function comingBack(state: DaemonState, key: PeerKey): boolean {
+  return state.syncing.has(key) || state.remoteTimers.has(key) || state.cycleCount < (state.skipUntilCycle.get(key) ?? 0);
 }
 
 export type ReviewDueCheck = "start" | "change" | "after-sync";
@@ -662,15 +671,18 @@ export type ReviewDueCheck = "start" | "change" | "after-sync";
  *   that sync never reached the gate (it lost the lock to another) or ran a
  *   CLI too old to clear it. Ask again a debounce later, never under the
  *   settle window, so neither case costs more than the cadence the peer keeps.
- * - "change": another peer's record changed. Nothing new is known about this
- *   one, and booking it now would override the retry already booked for it.
+ * - "change": a record changed, this one or another peer's. If something
+ *   already brings this peer back (`comingBack`), leave it: booking now would
+ *   override that retry or cut a backoff short. Otherwise go now — a record
+ *   written moments ahead (an approval's) is already past by the time the
+ *   change is read, and nothing else would come for it before the poll.
  */
-export function reviewDueAt(due: number | undefined, when: ReviewDueCheck, now: number, debounceMs: number): number | undefined {
+export function reviewDueAt(due: number | undefined, when: ReviewDueCheck, now: number, debounceMs: number, comingBack: boolean): number | undefined {
   if (due === undefined) return undefined;
   if (due > now) return due;
   if (when === "start") return now;
   if (when === "after-sync") return now + Math.max(SETTLE_WINDOW_MS, debounceMs);
-  return undefined;
+  return comingBack ? undefined : now;
 }
 
 /**
